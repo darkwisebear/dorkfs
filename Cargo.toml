@@ -6,4 +6,4 @@ authors = ["Markus Hosch <markus.hosch@gmx.net>"]
 [dependencies]
 clap = "2.30"
 failure = "0.1"
-failure_derive = "0.1"
+fuse_mt = "0.4"
