@@ -1,0 +1,9 @@
+[package]
+name = "dorkfs"
+version = "0.1.0"
+authors = ["Markus Hosch <markus.hosch@gmx.net>"]
+
+[dependencies]
+clap = "2.30"
+failure = "0.1"
+failure_derive = "0.1"
