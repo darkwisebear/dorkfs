@@ -1,6 +1,9 @@
 extern crate clap;
 extern crate failure;
 extern crate fuse_mt;
+extern crate libc;
+#[macro_use] extern crate log;
+extern crate env_logger;
 
 mod core;
 
@@ -20,6 +23,8 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
 }
 
 fn main() {
+    env_logger::init();
+
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
