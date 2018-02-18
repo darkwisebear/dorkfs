@@ -2,6 +2,7 @@ extern crate clap;
 extern crate failure;
 extern crate fuse_mt;
 extern crate libc;
+extern crate time;
 #[macro_use] extern crate log;
 extern crate env_logger;
 
