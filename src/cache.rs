@@ -61,9 +61,8 @@ impl CacheRef {
 
 impl Display for CacheRef {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        use std::fmt::LowerHex;
         for b in self.0.iter() {
-            <u8 as LowerHex>::fmt(b, f)?;
+            write!(f, "{:02x}", b)?;
         }
         Ok(())
     }
