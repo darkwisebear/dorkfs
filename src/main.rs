@@ -1,7 +1,6 @@
 extern crate clap;
 #[macro_use] extern crate failure;
 #[macro_use] extern crate failure_derive;
-extern crate fuse_mt;
 extern crate libc;
 extern crate time;
 #[macro_use] extern crate log;
@@ -12,6 +11,10 @@ extern crate serde_json;
 extern crate rand;
 extern crate tiny_keccak;
 
+#[cfg(feature = "fuse")]
+extern crate fuse_mt;
+
+#[cfg(feature = "fuse")]
 mod fuse;
 mod cache;
 
@@ -31,6 +34,12 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .required(true)
             .help("Mountpoint that shows the checked out contents"))
         .get_matches()
+}
+
+#[cfg(feature = "fuse")]
+fn mount_fuse(mountpoint: &str, cache: cache::HashFileCache, head_ref: cache::CacheRef) {
+    let dorkfs = fuse::DorkFS::with_cache(cache, head_ref).unwrap();
+    dorkfs.mount(mountpoint).unwrap();
 }
 
 fn main() {
@@ -71,6 +80,6 @@ fn main() {
     let head_ref = cache.add(cache::CacheObject::Commit(commit))
         .expect("Unable to add commit");
 
-    let dorkfs = fuse::DorkFS::with_cache(cache, head_ref).unwrap();
-    dorkfs.mount(mountpoint).unwrap();
+    #[cfg(feature = "fuse")]
+    mount_fuse(mountpoint, cache, head_ref);
 }
