@@ -589,7 +589,7 @@ impl HashFileCache {
         let rel_path = HashFileCache::generate_staging_path();
         let full_path = self.base_path.join(&rel_path);
 
-        info!("Creating staging file {:?}", full_path);
+        info!("Creating staging file {}", full_path.display());
         let mut file = fs::OpenOptions::new()
             .create(true)
             .read(true)

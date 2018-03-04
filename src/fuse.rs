@@ -43,6 +43,43 @@ impl<T: Debug> OpenHandleSet<T> {
     }
 }
 
+enum StandardDirEntries {
+    CurDir,
+    ParentDir,
+    Done
+}
+
+impl StandardDirEntries {
+    fn new() -> Self {
+        StandardDirEntries::CurDir
+    }
+}
+
+impl Iterator for StandardDirEntries {
+    type Item = ::fuse_mt::DirectoryEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = match *self {
+            StandardDirEntries::CurDir => {
+                *self = StandardDirEntries::ParentDir;
+                Some(".")
+            }
+
+            StandardDirEntries::ParentDir => {
+                *self = StandardDirEntries::Done;
+                Some("..")
+            }
+
+            StandardDirEntries::Done => None
+        };
+
+        entry.map(|name| ::fuse_mt::DirectoryEntry {
+            name: OsString::from(name),
+            kind: FileType::Directory
+        })
+    }
+}
+
 pub struct DorkFS {
     cache: HashFileCache,
     head_commit: CacheRef,
@@ -55,12 +92,12 @@ impl FilesystemMT for DorkFS {
     }
 
     fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
-        let directory_entry = match self.resolve_object(path) {
+        let cache_ref = match self.resolve_object_ref(path) {
             Ok(entry) => entry,
             Err(_) => return Err(libc::ENOENT)
         };
 
-        let metadata = self.cache.metadata(&directory_entry.cache_ref)
+        let metadata = self.cache.metadata(&cache_ref)
             .map_err(|err| {
                 warn!("Error querying cache object metadata {}", err);
                 libc::EIO
@@ -101,9 +138,7 @@ impl FilesystemMT for DorkFS {
     }
 
     fn opendir(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
-        match self.resolve_object(path)
-            .and_then(|::cache::DirectoryEntry { cache_ref, .. }|
-                self.cache.get(&cache_ref).map_err(Error::from)) {
+        match self.resolve_object(path) {
             Ok(cache_obj) => {
                 match cache_obj {
                     dir @ CacheObject::Directory(..) => {
@@ -132,7 +167,10 @@ impl FilesystemMT for DorkFS {
             self.open_handles.read().unwrap();
         if let Some(cache_obj) = open_handles.get(fh) {
             if let CacheObject::Directory(ref dir) = *cache_obj {
-                Ok(dir.iter().map(Self::cache_dir_entry_to_fuse_dir_entry).collect())
+                Ok(dir.iter()
+                    .map(Self::cache_dir_entry_to_fuse_dir_entry)
+                    .chain(StandardDirEntries::new())
+                    .collect())
             } else {
                 Err(libc::EBADF)
             }
@@ -169,31 +207,49 @@ impl DorkFS {
             .map_err(|e| Error::from(e))
     }
 
-    fn resolve_object(&self, path: &Path) -> Result<::cache::DirectoryEntry, Error> {
-        let file_name = path.file_name()
-            .ok_or(format_err!("Path doesn't end with an object name"))?;
+    fn resolve_object(&self, path: &Path) -> Result<HashCacheObject, Error> {
+        self.resolve_object_ref(path)
+            .and_then(|cache_ref| self.cache.get(&cache_ref).map_err(Error::from))
+    }
+
+    fn resolve_object_ref(&self, path: &Path) -> Result<CacheRef, Error> {
+        use std::path::Component;
+
         let commit = self.cache.get(&self.head_commit)?.into_commit()?;
-        let mut current_dir = self.cache.get(&commit.tree)?.into_directory()?;
+        let mut objs = Vec::new();
 
         fn find_entry<'a, 'b, D: Directory>(dir: &'a D, component: &'b OsStr)
-            -> Option<::cache::DirectoryEntry> {
+                                            -> Option<::cache::DirectoryEntry> {
             dir.iter().find(|entry| Some(entry.name.as_str()) == component.to_str())
         }
 
-        if let Some(parent) = path.parent() {
-            for component in parent.iter() {
-                if component != "/" {
-                    let dir_entry = find_entry(&current_dir, component)
-                        .ok_or(format_err!("Couldn't find dir entry {}",
-                            component.to_str().unwrap_or("(unprintable)")))?;
-                    current_dir = self.cache.get(&dir_entry.cache_ref)?.into_directory()?;
+        for component in path.components() {
+            match component {
+                Component::Prefix(..) => panic!("A prefix is not allowed to appear in a cache path"),
+                Component::RootDir => {
+                    objs.clear();
+                    objs.push(commit.tree.clone());
+                }
+                Component::CurDir => (),
+                Component::ParentDir => {
+                    objs.pop().ok_or(format_err!("Outside path due to too many parent dirs!"))?;
+                }
+                Component::Normal(entry) => {
+                    let cache_ref = {
+                        let cur_dir_ref = objs.last()
+                            .expect("Non-directory ref in directory stack");
+                        let cur_dir =
+                            self.cache.get(cur_dir_ref)?.into_directory()?;
+                        let dir_entry = find_entry(&cur_dir, entry)
+                            .ok_or(format_err!("Couldn't resolve path {}", path.display()))?;
+                        dir_entry.cache_ref
+                    };
+                    objs.push(cache_ref);
                 }
             }
         }
 
-        find_entry(&current_dir, file_name)
-            .ok_or(format_err!("Couldn't find object entry {}",
-                file_name.to_str().unwrap_or("(unprintable)")))
+        objs.last().cloned().ok_or(format_err!("No object not found in {}", path.display()))
     }
 
     fn object_type_to_file_type(obj_type: ObjectType) -> Result<FileType, Error> {
