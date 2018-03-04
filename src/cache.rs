@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::result;
 use std::error::Error;
 use serde_json;
+use failure;
+use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
+use serde::de::Visitor;
 use std::string::ToString;
 use tiny_keccak::Keccak;
 
@@ -28,6 +31,9 @@ pub enum CacheError {
 
     #[fail(display = "JSON error: {}", _0)]
     JsonError(serde_json::Error),
+
+    #[fail(display = "Unparsable reference {}: {}", _0, _1)]
+    UnparsableCacheRef(String, failure::Error)
 }
 
 impl From<io::Error> for CacheError {
@@ -44,7 +50,7 @@ impl From<serde_json::Error> for CacheError {
 
 pub type Result<T> = result::Result<T, CacheError>;
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy, Default)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
 pub struct CacheRef([u8; 32]);
 
 impl CacheRef {
@@ -60,6 +66,91 @@ impl Display for CacheRef {
             <u8 as LowerHex>::fmt(b, f)?;
         }
         Ok(())
+    }
+}
+
+impl Serialize for CacheRef {
+    fn serialize<S>(&self, serializer: S) -> result::Result<S::Ok, S::Error> where S: Serializer {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+struct HexCharIterator<'a> {
+    hex: &'a str
+}
+
+impl<'a> HexCharIterator<'a> {
+    fn new(hex: &'a str) -> HexCharIterator<'a> {
+        HexCharIterator {
+            hex
+        }
+    }
+}
+
+impl<'a> Iterator for HexCharIterator<'a> {
+    type Item = Result<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (byte, rest) = {
+            let (byte_str, rest) = self.hex.split_at(2);
+            if byte_str.len() > 0 {
+                let byte = u8::from_str_radix(byte_str, 16)
+                    .map_err(|e| {
+                        CacheError::UnparsableCacheRef(self.hex.to_string(), e.into())
+                    });
+                (Some(byte), rest)
+            } else {
+                (None, rest)
+            }
+        };
+
+        self.hex = rest;
+        byte
+    }
+}
+
+struct StringVisitor;
+
+impl<'de> Visitor<'de> for StringVisitor {
+    type Value = CacheRef;
+
+    fn expecting(&self, fmt: &mut Formatter) -> fmt::Result {
+        fmt.write_str("Expecting a string of 64 hex characters")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> result::Result<Self::Value, E> {
+        let mut index = 0;
+        let mut result: [u8; 32] = unsafe { ::std::mem::uninitialized() };
+
+        for byte_result in HexCharIterator::new(v) {
+            if index >= 32 {
+                return Err(E::custom(format!("Given hex string {} too large", v.to_string())));
+            }
+
+            match byte_result {
+                Ok(byte) => {
+                    result[index] = byte;
+                    index += 1;
+                }
+
+                Err(e) => {
+                    return Err(E::custom(e));
+                }
+            }
+        }
+
+        if index == 32 {
+            Ok(CacheRef(result))
+        } else {
+            return Err(E::custom(format!("Given hex string {} too small", v.to_string())));
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheRef {
+    fn deserialize<D>(deserializer: D) -> result::Result<Self, D::Error>
+        where D: Deserializer<'de> {
+        deserializer.deserialize_str(StringVisitor)
     }
 }
 
