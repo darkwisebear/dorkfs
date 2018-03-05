@@ -90,21 +90,20 @@ impl<'a> Iterator for HexCharIterator<'a> {
     type Item = Result<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (byte, rest) = {
-            let (byte_str, rest) = self.hex.split_at(2);
-            if byte_str.len() > 0 {
-                let byte = u8::from_str_radix(byte_str, 16)
-                    .map_err(|e| {
-                        CacheError::UnparsableCacheRef(self.hex.to_string(), e.into())
-                    });
-                (Some(byte), rest)
-            } else {
-                (None, rest)
-            }
-        };
+        let (byte_str, rest) =
+            self.hex.split_at(usize::min(self.hex.len(), 2));
 
-        self.hex = rest;
-        byte
+        if byte_str.len() > 0 {
+            self.hex = rest;
+
+            let byte = u8::from_str_radix(byte_str, 16)
+                .map_err(|e| {
+                    CacheError::UnparsableCacheRef(self.hex.to_string(), e.into())
+                });
+            Some(byte)
+        } else {
+            None
+        }
     }
 }
 
@@ -656,5 +655,18 @@ impl Write for HashWriter {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.hasher.update(buf);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn hex_char_iterator() {
+        use super::HexCharIterator;
+        use super::Result;
+
+        let iter = HexCharIterator::new("123456789abcdef");
+        let bytes: Result<Vec<u8>> = iter.collect();
+        assert_eq!(vec![0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf], bytes.unwrap());
     }
 }
