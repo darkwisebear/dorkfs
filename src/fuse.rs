@@ -52,6 +52,10 @@ impl<T: Debug> OpenHandleSet<T> {
         self.open_objects.get(&handle)
     }
 
+    fn get_mut(&mut self, handle: u64) -> Option<&mut T> {
+        self.open_objects.get_mut(&handle)
+    }
+
     fn remove(&mut self, handle: u64) -> Option<T> {
         self.open_objects.remove(&handle)
     }
@@ -160,6 +164,68 @@ impl FilesystemMT for DorkFS {
         let mut open_handles =
             self.open_handles.write().unwrap();
         open_handles.remove(fh);
+        Ok(())
+    }
+
+    fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
+        if flags as i32 == libc::O_RDONLY {
+            self.resolve_object_ref(path)
+                .and_then(|cache_ref|
+                    self.cache.metadata(&cache_ref)
+                        .map(|metadata| (metadata, cache_ref))
+                        .map_err(Error::from)
+                )
+                .and_then(|(metadata, cache_ref)| {
+                    if let ObjectType::File = metadata.object_type {
+                        self.cache.get(&cache_ref)
+                            .map(|cache_obj|
+                                (self.open_handles.write().unwrap().push(cache_obj), 0)
+                            )
+                            .map_err(Error::from)
+                    } else {
+                        Err(format_err!("Cache object not a file"))
+                    }
+                })
+                .map_err(|err| {
+                    warn!("Error opening file: {}", err);
+                    libc::EIO
+                })
+        } else {
+            Err(libc::EROFS)
+        }
+    }
+
+    fn read(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, size: u32) -> ResultData {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut open_handles =
+            self.open_handles.write().unwrap();
+        let file_obj =
+            open_handles.get_mut(fh).ok_or(libc::EBADF)?;
+        if let CacheObject::File(ref mut file) = *file_obj {
+            let mut result = Vec::with_capacity(size as usize);
+            unsafe { result.set_len(size as usize); }
+            let count = file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read(result.as_mut_slice()))
+                .map_err(|e| {
+                    error!("Couldn't read from file: {}", e);
+                    libc::EIO
+                })?;
+            result.truncate(count);
+            Ok(result)
+        } else {
+            Err(libc::EBADF)
+        }
+    }
+
+    fn release(&self,
+               _req: RequestInfo,
+               _path: &Path,
+               fh: u64,
+               _flags: u32,
+               _lock_owner: u64,
+               _flush: bool) -> ResultEmpty {
+        self.open_handles.write().unwrap().remove(fh).ok_or(libc::EBADF)?;
         Ok(())
     }
 }
