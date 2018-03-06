@@ -11,6 +11,20 @@ use libc;
 
 use cache::*;
 
+lazy_static! {
+    static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
+        ::fuse_mt::DirectoryEntry {
+            name: OsString::from("."),
+            kind: FileType::Directory
+        },
+
+        ::fuse_mt::DirectoryEntry {
+            name: OsString::from(".."),
+            kind: FileType::Directory
+        }
+    ];
+}
+
 #[derive(Debug)]
 struct OpenHandleSet<T: Debug> {
     next_handle: u64,
@@ -40,43 +54,6 @@ impl<T: Debug> OpenHandleSet<T> {
 
     fn remove(&mut self, handle: u64) -> Option<T> {
         self.open_objects.remove(&handle)
-    }
-}
-
-enum StandardDirEntries {
-    CurDir,
-    ParentDir,
-    Done
-}
-
-impl StandardDirEntries {
-    fn new() -> Self {
-        StandardDirEntries::CurDir
-    }
-}
-
-impl Iterator for StandardDirEntries {
-    type Item = ::fuse_mt::DirectoryEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let entry = match *self {
-            StandardDirEntries::CurDir => {
-                *self = StandardDirEntries::ParentDir;
-                Some(".")
-            }
-
-            StandardDirEntries::ParentDir => {
-                *self = StandardDirEntries::Done;
-                Some("..")
-            }
-
-            StandardDirEntries::Done => None
-        };
-
-        entry.map(|name| ::fuse_mt::DirectoryEntry {
-            name: OsString::from(name),
-            kind: FileType::Directory
-        })
     }
 }
 
@@ -169,7 +146,7 @@ impl FilesystemMT for DorkFS {
             if let CacheObject::Directory(ref dir) = *cache_obj {
                 Ok(dir.iter()
                     .map(Self::cache_dir_entry_to_fuse_dir_entry)
-                    .chain(StandardDirEntries::new())
+                    .chain(STANDARD_DIR_ENTRIES.iter().cloned())
                     .collect())
             } else {
                 Err(libc::EBADF)

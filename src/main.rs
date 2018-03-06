@@ -10,6 +10,7 @@ extern crate serde;
 extern crate serde_json;
 extern crate rand;
 extern crate tiny_keccak;
+#[macro_use] extern crate lazy_static;
 
 #[cfg(feature = "fuse")]
 extern crate fuse_mt;
