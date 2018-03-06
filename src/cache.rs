@@ -481,7 +481,9 @@ impl CacheLayer for HashFileCache {
 
         let target_path = self.base_path.join(rel_target_path);
         info!("Adding object {} to {}", cache_ref, target_path.display());
-        fs::hard_link(&staging_path, target_path)?;
+        if !target_path.exists() {
+            fs::hard_link(&staging_path, target_path)?;
+        }
 
         debug!("Removing staging file {}", staging_path.display());
         if let Err(err) = fs::remove_file(&staging_path) {
