@@ -167,32 +167,28 @@ impl FilesystemMT for DorkFS {
         Ok(())
     }
 
-    fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
-        if flags as i32 == libc::O_RDONLY {
-            self.resolve_object_ref(path)
-                .and_then(|cache_ref|
-                    self.cache.metadata(&cache_ref)
-                        .map(|metadata| (metadata, cache_ref))
+    fn open(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
+        self.resolve_object_ref(path)
+            .and_then(|cache_ref|
+                self.cache.metadata(&cache_ref)
+                    .map(|metadata| (metadata, cache_ref))
+                    .map_err(Error::from)
+            )
+            .and_then(|(metadata, cache_ref)| {
+                if let ObjectType::File = metadata.object_type {
+                    self.cache.get(&cache_ref)
+                        .map(|cache_obj|
+                            (self.open_handles.write().unwrap().push(cache_obj), 0)
+                        )
                         .map_err(Error::from)
-                )
-                .and_then(|(metadata, cache_ref)| {
-                    if let ObjectType::File = metadata.object_type {
-                        self.cache.get(&cache_ref)
-                            .map(|cache_obj|
-                                (self.open_handles.write().unwrap().push(cache_obj), 0)
-                            )
-                            .map_err(Error::from)
-                    } else {
-                        Err(format_err!("Cache object not a file"))
-                    }
-                })
-                .map_err(|err| {
-                    warn!("Error opening file: {}", err);
-                    libc::EIO
-                })
-        } else {
-            Err(libc::EROFS)
-        }
+                } else {
+                    Err(format_err!("Cache object not a file"))
+                }
+            })
+            .map_err(|err| {
+                warn!("Error opening file: {}", err);
+                libc::EIO
+            })
     }
 
     fn read(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, size: u32) -> ResultData {
