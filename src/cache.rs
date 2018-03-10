@@ -276,6 +276,14 @@ impl<F: File, D: Directory> CacheObject<F, D> {
             Err(CacheError::UnexpectedObjectType(ObjectType::from(&self)))
         }
     }
+
+    pub fn into_file(self) -> Result<F> {
+        if let CacheObject::File(file) = self {
+            Ok(file)
+        } else {
+            Err(CacheError::UnexpectedObjectType(ObjectType::from(&self)))
+        }
+    }
 }
 
 pub trait CacheLayer {
@@ -620,9 +628,6 @@ impl HashFileCache {
         ObjectType::from_identifier(&objtype_identifier)
     }
 }
-
-pub type HashCacheObject =
-    CacheObject<<HashFileCache as CacheLayer>::File, <HashFileCache as CacheLayer>::Directory>;
 
 struct HashWriter {
     hasher: Keccak

@@ -9,6 +9,7 @@ use time::get_time;
 use fuse_mt::*;
 use libc;
 
+use cache;
 use cache::*;
 
 lazy_static! {
@@ -61,10 +62,21 @@ impl<T: Debug> OpenHandleSet<T> {
     }
 }
 
+type Cache = HashFileCache;
+type CacheFile = <Cache as CacheLayer>::File;
+type CacheDirectory = <Cache as CacheLayer>::Directory;
+type CacheObject = cache::CacheObject<CacheFile, CacheDirectory>;
+
+#[derive(Debug)]
+enum OpenObject {
+    File(CacheFile),
+    Directory(CacheDirectory)
+}
+
 pub struct DorkFS {
-    cache: HashFileCache,
+    cache: Cache,
     head_commit: CacheRef,
-    open_handles: RwLock<OpenHandleSet<HashCacheObject>>
+    open_handles: RwLock<OpenHandleSet<OpenObject>>
 }
 
 impl FilesystemMT for DorkFS {
@@ -122,10 +134,10 @@ impl FilesystemMT for DorkFS {
         match self.resolve_object(path) {
             Ok(cache_obj) => {
                 match cache_obj {
-                    dir @ CacheObject::Directory(..) => {
+                    cache::CacheObject::Directory(dir) => {
                         let mut open_handles =
                             self.open_handles.write().unwrap();
-                        let dir_handle = open_handles.push(dir);
+                        let dir_handle = open_handles.push(OpenObject::Directory(dir));
                         Ok((dir_handle, 0))
                     }
 
@@ -146,8 +158,8 @@ impl FilesystemMT for DorkFS {
     fn readdir(&self, _req: RequestInfo, _path: &Path, fh: u64) -> ResultReaddir {
         let open_handles =
             self.open_handles.read().unwrap();
-        if let Some(cache_obj) = open_handles.get(fh) {
-            if let CacheObject::Directory(ref dir) = *cache_obj {
+        if let Some(open_obj) = open_handles.get(fh) {
+            if let OpenObject::Directory(ref dir) = *open_obj {
                 Ok(dir.iter()
                     .map(Self::cache_dir_entry_to_fuse_dir_entry)
                     .chain(STANDARD_DIR_ENTRIES.iter().cloned())
@@ -177,8 +189,9 @@ impl FilesystemMT for DorkFS {
             .and_then(|(metadata, cache_ref)| {
                 if let ObjectType::File = metadata.object_type {
                     self.cache.get(&cache_ref)
-                        .map(|cache_obj|
-                            (self.open_handles.write().unwrap().push(cache_obj), 0)
+                        .map(|cache_obj| cache_obj.into_file().unwrap())
+                        .map(|file|
+                            (self.open_handles.write().unwrap().push(OpenObject::File(file)), 0)
                         )
                         .map_err(Error::from)
                 } else {
@@ -198,7 +211,7 @@ impl FilesystemMT for DorkFS {
             self.open_handles.write().unwrap();
         let file_obj =
             open_handles.get_mut(fh).ok_or(libc::EBADF)?;
-        if let CacheObject::File(ref mut file) = *file_obj {
+        if let OpenObject::File(ref mut file) = *file_obj {
             let mut result = Vec::with_capacity(size as usize);
             unsafe { result.set_len(size as usize); }
             let count = file.seek(SeekFrom::Start(offset))
@@ -228,11 +241,11 @@ impl FilesystemMT for DorkFS {
 
 impl DorkFS {
     pub fn with_path<P: AsRef<Path>>(cachedir: P, head_commit: CacheRef) -> Result<Self, Error> {
-        let cache = HashFileCache::new(&cachedir)?;
+        let cache = Cache::new(&cachedir)?;
         Self::with_cache(cache, head_commit)
     }
 
-    pub fn with_cache(cache: HashFileCache, head_commit: CacheRef) -> Result<Self, Error> {
+    pub fn with_cache(cache: Cache, head_commit: CacheRef) -> Result<Self, Error> {
         let fs = DorkFS {
             cache,
             head_commit,
@@ -246,7 +259,7 @@ impl DorkFS {
             .map_err(|e| Error::from(e))
     }
 
-    fn resolve_object(&self, path: &Path) -> Result<HashCacheObject, Error> {
+    fn resolve_object(&self, path: &Path) -> Result<CacheObject, Error> {
         self.resolve_object_ref(path)
             .and_then(|cache_ref| self.cache.get(&cache_ref).map_err(Error::from))
     }
@@ -258,7 +271,7 @@ impl DorkFS {
         let mut objs = Vec::new();
 
         fn find_entry<'a, 'b, D: Directory>(dir: &'a D, component: &'b OsStr)
-                                            -> Option<::cache::DirectoryEntry> {
+                                            -> Option<cache::DirectoryEntry> {
             dir.iter().find(|entry| Some(entry.name.as_str()) == component.to_str())
         }
 
@@ -299,7 +312,7 @@ impl DorkFS {
         }
     }
 
-    fn cache_dir_entry_to_fuse_dir_entry(dir_entry: ::cache::DirectoryEntry)
+    fn cache_dir_entry_to_fuse_dir_entry(dir_entry: cache::DirectoryEntry)
         -> ::fuse_mt::DirectoryEntry {
         let kind = match Self::object_type_to_file_type(dir_entry.object_type) {
             Ok(ft) => ft,
