@@ -11,6 +11,7 @@ extern crate serde_json;
 extern crate rand;
 extern crate tiny_keccak;
 #[macro_use] extern crate lazy_static;
+extern crate tempfile;
 
 #[cfg(feature = "fuse")]
 extern crate fuse_mt;
@@ -19,8 +20,8 @@ extern crate fuse_mt;
 mod fuse;
 mod cache;
 
-use cache::{WritableFile, WritableDirectory, CacheLayer};
 use std::io::Write;
+use cache::CacheLayer;
 
 fn parse_arguments() -> clap::ArgMatches<'static> {
     use clap::{App, Arg};
@@ -53,24 +54,25 @@ fn main() {
     let mut cache = cache::HashFileCache::new(&cachedir)
         .expect("Unable to initialize cache");
 
-    let mut test_file = cache.create_file()
+    let mut test_file = tempfile::tempfile()
         .expect("Unable to create demo file");
     write!(test_file, "What a test!")
         .expect("Couldn't write to test file");
-    let test_file_ref = test_file.finish()
+    let test_file_ref = cache.create_file(test_file)
         .and_then(|file| cache.add(cache::CacheObject::File(file)))
         .expect("Unable to add test file to cache");
 
-    let mut test_dir = cache.create_directory()
+    let dir_entries = vec![
+        cache::DirectoryEntry {
+            cache_ref: test_file_ref,
+            object_type: cache::ObjectType::File,
+            name: "test.txt".to_string()
+        }
+    ];
+
+    let test_dir = cache.create_directory(dir_entries.into_iter())
         .expect("Unable to create root dir");
-    let dir_entry = cache::DirectoryEntry {
-        cache_ref: test_file_ref,
-        object_type: cache::ObjectType::File,
-        name: "test.txt".to_string()
-    };
-    test_dir.add_entry(dir_entry).expect("Unable to add test file to root directory");
-    let root_dir_ref = test_dir.finish()
-        .and_then(|dir| cache.add(cache::CacheObject::directory(dir)))
+    let root_dir_ref = cache.add(cache::CacheObject::directory(test_dir))
         .expect("Couldn't add root dir to cache");
 
     let commit = cache::Commit {

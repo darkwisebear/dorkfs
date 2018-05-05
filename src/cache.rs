@@ -5,11 +5,13 @@ use std::fs;
 use std::sync::Arc;
 use std::result;
 use std::error::Error;
+use std::iter::FromIterator;
+use std::vec;
+use std::string::ToString;
 use serde_json;
 use failure;
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
-use std::string::ToString;
 use tiny_keccak::Keccak;
 
 #[derive(Fail, Debug)]
@@ -152,16 +154,8 @@ impl<'de> Deserialize<'de> for CacheRef {
     }
 }
 
-pub trait File: Read+Seek+Sized {
-    type Writable: WritableFile<ReadOnly=Self>;
-
-    fn to_writable(&self) -> Result<Self::Writable>;
-}
-
-pub trait WritableFile: Read+Write+Seek+Sized {
-    type ReadOnly: File<Writable=Self>;
-
-    fn finish(self) -> Result<Self::ReadOnly>;
+pub trait ReadonlyFile {
+    fn metadata(&self) -> Result<fs::Metadata>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +172,16 @@ impl Display for ObjectType {
             ObjectType::Directory => write!(f, "directory"),
             ObjectType::Commit => write!(f, "commit"),
         }.map_err(|_| fmt::Error)
+    }
+}
+
+impl<'a, F: ReadonlyFile, D: Directory> From<&'a CacheObject<F, D>> for ObjectType {
+    fn from(obj: &'a CacheObject<F, D>) -> Self {
+        match obj {
+            &CacheObject::File(..) => ObjectType::File,
+            &CacheObject::Directory(..) => ObjectType::Directory,
+            &CacheObject::Commit(..) => ObjectType::Commit
+        }
     }
 }
 
@@ -200,16 +204,6 @@ impl ObjectType {
     }
 }
 
-impl<'a, F: File, D: Directory> From<&'a CacheObject<F, D>> for ObjectType {
-    fn from(cache_object: &'a CacheObject<F, D>) -> ObjectType {
-        match cache_object {
-            &CacheObject::File(_) => ObjectType::File,
-            &CacheObject::Directory(_) => ObjectType::Directory,
-            &CacheObject::Commit(_) => ObjectType::Commit
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -217,22 +211,7 @@ pub struct DirectoryEntry {
     pub object_type: ObjectType
 }
 
-pub trait Directory: Sized {
-    type Writable: WritableDirectory<ReadOnly=Self>;
-    type Iter: Iterator<Item=DirectoryEntry>;
-
-    fn to_writable(&self) -> Result<Self::Writable>;
-    fn iter(&self) -> Self::Iter;
-}
-
-pub trait WritableDirectory: Sized {
-    type ReadOnly: Directory<Writable=Self>;
-    type Iter: Iterator<Item=<<Self::ReadOnly as Directory>::Iter as Iterator>::Item>;
-
-    fn add_entry(&mut self, entry: DirectoryEntry) -> Result<()>;
-    fn finish(self) -> Result<Self::ReadOnly>;
-    fn iter(&self) -> Self::Iter;
-}
+pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone { }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Commit {
@@ -242,13 +221,13 @@ pub struct Commit {
 }
 
 #[derive(Debug)]
-pub enum CacheObject<F: File, D: Directory> {
+pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     File(F),
     Directory(D),
     Commit(Commit),
 }
 
-impl<F: File, D: Directory> CacheObject<F, D> {
+impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     pub fn directory(dir: D) -> Self {
         CacheObject::Directory(dir)
     }
@@ -260,7 +239,7 @@ pub struct CacheObjectMetadata {
     pub object_type: ObjectType
 }
 
-impl<F: File, D: Directory> CacheObject<F, D> {
+impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     pub fn into_commit(self) -> Result<Commit> {
         if let CacheObject::Commit(commit) = self {
             Ok(commit)
@@ -287,46 +266,25 @@ impl<F: File, D: Directory> CacheObject<F, D> {
 }
 
 pub trait CacheLayer {
-    type File: File;
+    type File: ReadonlyFile;
     type Directory: Directory;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;
     fn add(&mut self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef>;
-    fn delete(&mut self, cache_ref: &CacheRef) -> Result<()>;
-    fn create_file(&self) -> Result<<Self::File as File>::Writable>;
-    fn create_directory(&self) -> Result<<Self::Directory as Directory>::Writable>;
+    fn create_file(&self, source_file: fs::File) -> Result<Self::File>;
+    fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I)
+        -> Result<Self::Directory>;
 }
 
 #[derive(Debug)]
 pub struct HashFile {
-    file: fs::File,
-    base_path: Arc<PathBuf>,
-    rel_path: PathBuf
+    file: fs::File
 }
 
-impl File for HashFile {
-    type Writable = WritableHashFile;
-
-    fn to_writable(&self) -> Result<Self::Writable> {
-        let rel_path = HashFileCache::generate_staging_path();
-        let full_path = self.base_path.join(&rel_path);
-
-        fs::copy(&self.base_path.join(&self.rel_path), &full_path)?;
-
-        let file = fs::OpenOptions::new()
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(full_path)?;
-
-        let hash_file = HashFile {
-            file,
-            base_path: Arc::clone(&self.base_path),
-            rel_path
-        };
-
-        Ok(WritableHashFile(hash_file))
+impl ReadonlyFile for HashFile {
+    fn metadata(&self) -> Result<fs::Metadata> {
+        self.file.metadata().map_err(|err| CacheError::from(err))
     }
 }
 
@@ -346,81 +304,23 @@ impl Seek for HashFile {
     }
 }
 
-#[derive(Debug)]
-pub struct WritableHashFile(HashFile);
-
-impl WritableFile for WritableHashFile {
-    type ReadOnly = HashFile;
-
-    fn finish(self) -> Result<Self::ReadOnly> {
-        Ok(self.0)
-    }
-}
-
-impl Read for WritableHashFile {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.file.read(buf)
-    }
-}
-
-impl Seek for WritableHashFile {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        if let SeekFrom::Start(p) = pos {
-            self.0.file.seek(SeekFrom::Start(p + 1))
-        } else {
-            self.0.file.seek(pos)
-        }
-    }
-}
-impl Write for WritableHashFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.file.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.file.flush()
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HashDirectory {
     entries: Vec<DirectoryEntry>
 }
 
+impl IntoIterator for HashDirectory {
+    type Item = DirectoryEntry;
+    type IntoIter = vec::IntoIter<DirectoryEntry>;
+
+    fn into_iter(self) -> <Self as IntoIterator>::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl Directory for HashDirectory {}
+
 #[derive(Debug)]
-pub struct WritableHashDirectory(HashDirectory);
-
-impl Directory for HashDirectory {
-    type Writable = WritableHashDirectory;
-    type Iter = ::std::vec::IntoIter<DirectoryEntry>;
-
-    fn to_writable(&self) -> Result<Self::Writable> {
-        Ok(WritableHashDirectory(self.clone()))
-    }
-
-    fn iter(&self) -> Self::Iter {
-        self.entries.clone().into_iter()
-    }
-}
-
-impl WritableDirectory for WritableHashDirectory {
-    type ReadOnly = HashDirectory;
-    type Iter = ::std::vec::IntoIter<DirectoryEntry>;
-
-    fn add_entry(&mut self, entry: DirectoryEntry) -> Result<()> {
-        self.0.entries.push(entry);
-        Ok(())
-    }
-
-    fn finish(self) -> Result<Self::ReadOnly> {
-        Ok(self.0)
-    }
-
-    fn iter(&self) -> Self::Iter {
-        self.0.entries.clone().into_iter()
-    }
-}
-
 pub struct HashFileCache {
     base_path: Arc<PathBuf>
 }
@@ -431,15 +331,12 @@ impl CacheLayer for HashFileCache {
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let mut file = self.open_object_file(cache_ref)?;
-        let rel_path = Self::rel_path_from_ref(cache_ref);
         let objtype = Self::identify_object_type(&mut file)?;
 
         let cache_object = match objtype {
             ObjectType::File => {
                 let hash_file = HashFile {
-                    file,
-                    base_path: Arc::clone(&self.base_path),
-                    rel_path
+                    file
                 };
 
                 CacheObject::File(hash_file)
@@ -460,73 +357,65 @@ impl CacheLayer for HashFileCache {
     }
 
     fn add(&mut self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef> {
-        let (file, staging_path) = match object {
-            CacheObject::File(hash_file) => {
-                (hash_file.file, hash_file.base_path.join(hash_file.rel_path))
+        let obj_type = ObjectType::from(&object);
+        let (mut target_file, rel_path) = self.create_staging_file(obj_type)?;
+
+        match object {
+            CacheObject::File(mut hash_file) => {
+                hash_file.file.seek(SeekFrom::Start(0))?;
+                // TODO: Use CoW if possible
+                let copied = io::copy(&mut hash_file.file, &mut target_file)?;
+                debug!("Bytes copied to staging file: {}", copied);
             }
 
             CacheObject::Directory(hash_dir, ..) => {
-                let (mut dir_file, staging_path) = self.create_staging_file(ObjectType::Directory)?;
-                serde_json::to_writer(&mut dir_file, &hash_dir)?;
-                dir_file.seek(SeekFrom::Start(0))?;
-                (dir_file, self.base_path.join(staging_path))
+                serde_json::to_writer(&mut target_file, &hash_dir)?;
             }
 
             CacheObject::Commit(commit) => {
-                let (mut commit_file, staging_path) = self.create_staging_file(ObjectType::Commit)?;
-                serde_json::to_writer(&mut commit_file, &commit)?;
-                commit_file.seek(SeekFrom::Start(0))?;
-                (commit_file, self.base_path.join(staging_path))
+                serde_json::to_writer(&mut target_file, &commit)?;
             }
         };
 
-        let cache_ref = Self::build_cache_ref(file)?;
+        target_file.seek(SeekFrom::Start(0))?;
+
+        let cache_ref = Self::build_cache_ref(target_file)?;
         let rel_target_path = Self::rel_path_from_ref(&cache_ref);
 
         let parent_path = rel_target_path.parent()
             .ok_or(CacheError::ObjectNotFound(cache_ref))?.to_owned();
         self.ensure_path(parent_path)?;
 
+        let source_path = self.base_path.join(rel_path);
         let target_path = self.base_path.join(rel_target_path);
         info!("Adding object {} to {}", cache_ref, target_path.display());
         if !target_path.exists() {
-            fs::hard_link(&staging_path, target_path)?;
+            fs::hard_link(&source_path, target_path)?;
         }
 
-        debug!("Removing staging file {}", staging_path.display());
-        if let Err(err) = fs::remove_file(&staging_path) {
-            warn!("Unable to remove staging file {}: {}", staging_path.display(), err.description());
+        debug!("Removing staging file {}", source_path.display());
+        if let Err(err) = fs::remove_file(&source_path) {
+            warn!("Unable to remove staging file {}: {}", source_path.display(), err.description());
         }
 
         Ok(cache_ref)
     }
 
-    fn delete(&mut self, cache_ref: &CacheRef) -> Result<()> {
-        let path = self.base_path.join(Self::rel_path_from_ref(cache_ref));
-        if path.exists() {
-            Ok(fs::remove_file(path)?)
-        } else {
-            Err(CacheError::ObjectNotFound(cache_ref.clone()))
-        }
-    }
-
-    fn create_file(&self) -> Result<<Self::File as File>::Writable> {
-        let (file, rel_path) = self.create_staging_file(ObjectType::File)?;
+    fn create_file(&self, source_file: fs::File) -> Result<Self::File> {
         let hash_file = HashFile {
-            file,
-            base_path: Arc::clone(&self.base_path),
-            rel_path
+            file: source_file
         };
 
-        Ok(WritableHashFile(hash_file))
+        Ok(hash_file)
     }
 
-    fn create_directory(&self) -> Result<<Self::Directory as Directory>::Writable> {
+    fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, entries: I)
+        -> Result<Self::Directory> {
         let dir = HashDirectory {
-            entries: Vec::new()
+            entries: Vec::from_iter(entries)
         };
 
-        Ok(WritableHashDirectory(dir))
+        Ok(dir)
     }
 
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
