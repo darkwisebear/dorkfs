@@ -31,7 +31,6 @@ lazy_static! {
 fn system_time_to_timespec(systime: SystemTime) -> Timespec {
     use std::time::UNIX_EPOCH;
 
-
     let duration = systime.duration_since(UNIX_EPOCH)
         .expect("Time before epoch!");
 
@@ -329,42 +328,9 @@ impl DorkFS {
     }
 
     fn resolve_object_ref(&self, path: &Path) -> Result<CacheRef, Error> {
-        use std::path::Component;
-
         let commit = self.cache.get(&self.head_commit)?.into_commit()?;
-        let mut objs = Vec::new();
-
-        fn find_entry<D: Directory>(dir: D, component: &OsStr) -> Option<cache::DirectoryEntry> {
-            dir.into_iter().find(|entry| Some(entry.name.as_str()) == component.to_str())
-        }
-
-        for component in path.components() {
-            match component {
-                Component::Prefix(..) => panic!("A prefix is not allowed to appear in a cache path"),
-                Component::RootDir => {
-                    objs.clear();
-                    objs.push(commit.tree.clone());
-                }
-                Component::CurDir => (),
-                Component::ParentDir => {
-                    objs.pop().ok_or(format_err!("Outside path due to too many parent dirs!"))?;
-                }
-                Component::Normal(entry) => {
-                    let cache_ref = {
-                        let cur_dir_ref = objs.last()
-                            .expect("Non-directory ref in directory stack");
-                        let cur_dir =
-                            self.cache.get(cur_dir_ref)?.into_directory()?;
-                        let dir_entry = find_entry(cur_dir, entry)
-                            .ok_or(format_err!("Couldn't resolve path {}", path.display()))?;
-                        dir_entry.cache_ref
-                    };
-                    objs.push(cache_ref);
-                }
-            }
-        }
-
-        objs.last().cloned().ok_or(format_err!("No object not found in {}", path.display()))
+        cache::resolve_object_ref(commit, path)
+            .and_then(|obj_ref| obj_ref.ok_or(CacheError::ObjectNotFound(self.head_commit)))
     }
 
     fn object_type_to_file_type(obj_type: ObjectType) -> Result<FileType, Error> {

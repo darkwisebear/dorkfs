@@ -19,9 +19,12 @@ extern crate fuse_mt;
 #[cfg(feature = "fuse")]
 mod fuse;
 mod cache;
+mod overlay;
 
 use std::io::Write;
-use cache::CacheLayer;
+use std::path::PathBuf;
+use cache::{CacheLayer, CacheRef};
+use overlay::Overlay;
 
 fn parse_arguments() -> clap::ArgMatches<'static> {
     use clap::{App, Arg};
@@ -44,44 +47,33 @@ fn mount_fuse(mountpoint: &str, cache: cache::HashFileCache, head_ref: cache::Ca
     dorkfs.mount(mountpoint).unwrap();
 }
 
+pub fn init_logging() {
+    static INIT_LOGGING: std::sync::Once = std::sync::ONCE_INIT;
+    INIT_LOGGING.call_once(|| env_logger::init());
+}
+
 fn main() {
-    env_logger::init();
+    init_logging();
 
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
 
-    let mut cache = cache::HashFileCache::new(&cachedir)
+    let base_dir = PathBuf::from(cachedir.to_owned());
+
+    let cache = cache::HashFileCache::new(&base_dir.join("cache"))
         .expect("Unable to initialize cache");
 
-    let mut test_file = tempfile::tempfile()
-        .expect("Unable to create demo file");
-    write!(test_file, "What a test!")
-        .expect("Couldn't write to test file");
-    let test_file_ref = cache.create_file(test_file)
-        .and_then(|file| cache.add(cache::CacheObject::File(file)))
-        .expect("Unable to add test file to cache");
+    let mut overlay =
+        Overlay::new(cache,
+                     &base_dir.join("overlay"))
+            .expect("Unable to instantiate overlay");
+    let mut test_file = overlay.open_file("test.txt", true)
+        .expect("Unable to create file");
+    write!(test_file, "What a test!").expect("Couldn't write to test file");
+    drop(test_file);
 
-    let dir_entries = vec![
-        cache::DirectoryEntry {
-            cache_ref: test_file_ref,
-            object_type: cache::ObjectType::File,
-            name: "test.txt".to_string()
-        }
-    ];
-
-    let test_dir = cache.create_directory(dir_entries.into_iter())
-        .expect("Unable to create root dir");
-    let root_dir_ref = cache.add(cache::CacheObject::directory(test_dir))
-        .expect("Couldn't add root dir to cache");
-
-    let commit = cache::Commit {
-        tree: root_dir_ref,
-        message: "A test commit".to_string(),
-        parents: vec![cache::CacheRef::root()]
-    };
-    let head_ref = cache.add(cache::CacheObject::Commit(commit))
-        .expect("Unable to add commit");
+    let head_ref = overlay.commit("A test commit").expect("Unable to commit");
 
     #[cfg(feature = "fuse")]
     mount_fuse(mountpoint, cache, head_ref);

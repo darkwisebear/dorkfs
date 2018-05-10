@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::ffi::OsStr;
 use std::io::{Read, Write, Seek, SeekFrom, self};
 use std::fmt::{Display, Formatter, self};
 use std::fs;
@@ -8,6 +9,8 @@ use std::error::Error;
 use std::iter::FromIterator;
 use std::vec;
 use std::string::ToString;
+use std::str::FromStr;
+use std::hash::{Hash, Hasher};
 use serde_json;
 use failure;
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
@@ -59,6 +62,10 @@ impl CacheRef {
     pub fn root() -> Self {
         Self::default()
     }
+
+    pub fn is_root(&self) -> bool {
+        self.eq(&Self::root())
+    }
 }
 
 impl Display for CacheRef {
@@ -67,6 +74,34 @@ impl Display for CacheRef {
             write!(f, "{:02x}", b)?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for CacheRef {
+    type Err = CacheError;
+
+    fn from_str(v: &str) -> Result<Self> {
+        let mut last_index = 0;
+        let mut result: [u8; 32] = unsafe { ::std::mem::uninitialized() };
+
+        for (index, byte_result ) in HexCharIterator::new(v).enumerate() {
+            if index < 32 {
+                result[index] = byte_result?;
+                last_index = index;
+            } else {
+                return Err(CacheError::UnparsableCacheRef(
+                    v.to_string(),
+                    format_err!("Given hex string {} too large", v.to_string())));
+            }
+        }
+
+        if last_index == 31 {
+            Ok(CacheRef(result))
+        } else {
+            return Err(CacheError::UnparsableCacheRef(
+                v.to_string(),
+                format_err!("Given hex string {} too small", v.to_string())));
+        }
     }
 }
 
@@ -119,31 +154,7 @@ impl<'de> Visitor<'de> for StringVisitor {
     }
 
     fn visit_str<E: serde::de::Error>(self, v: &str) -> result::Result<Self::Value, E> {
-        let mut index = 0;
-        let mut result: [u8; 32] = unsafe { ::std::mem::uninitialized() };
-
-        for byte_result in HexCharIterator::new(v) {
-            if index >= 32 {
-                return Err(E::custom(format!("Given hex string {} too large", v.to_string())));
-            }
-
-            match byte_result {
-                Ok(byte) => {
-                    result[index] = byte;
-                    index += 1;
-                }
-
-                Err(e) => {
-                    return Err(E::custom(e));
-                }
-            }
-        }
-
-        if index == 32 {
-            Ok(CacheRef(result))
-        } else {
-            return Err(E::custom(format!("Given hex string {} too small", v.to_string())));
-        }
+        v.parse().map_err(E::custom)
     }
 }
 
@@ -154,7 +165,7 @@ impl<'de> Deserialize<'de> for CacheRef {
     }
 }
 
-pub trait ReadonlyFile {
+pub trait ReadonlyFile: io::Read+io::Seek {
     fn metadata(&self) -> Result<fs::Metadata>;
 }
 
@@ -211,9 +222,23 @@ pub struct DirectoryEntry {
     pub object_type: ObjectType
 }
 
+impl PartialEq for DirectoryEntry {
+    fn eq(&self, other: &DirectoryEntry) -> bool {
+        self.name.eq(&other.name)
+    }
+}
+
+impl Eq for DirectoryEntry {}
+
+impl Hash for DirectoryEntry {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state)
+    }
+}
+
 pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone { }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Commit {
     pub tree: CacheRef,
     pub parents: Vec<CacheRef>,
@@ -225,12 +250,6 @@ pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     File(F),
     Directory(D),
     Commit(Commit),
-}
-
-impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
-    pub fn directory(dir: D) -> Self {
-        CacheObject::Directory(dir)
-    }
 }
 
 #[derive(Debug)]
@@ -552,6 +571,46 @@ impl Write for HashWriter {
         self.hasher.update(buf);
         Ok(())
     }
+}
+
+pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
+    -> result::Result<Option<CacheRef>, failure::Error> where C: CacheLayer,
+                                                              P: AsRef<Path> {
+    let mut objs = vec![commit.tree.clone()];
+    let path = path.as_ref();
+
+    fn find_entry<D: Directory>(dir: D, component: &OsStr) -> Option<DirectoryEntry> {
+        dir.into_iter().find(|entry| Some(entry.name.as_str()) == component.to_str())
+    }
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(..) => panic!("A prefix is not allowed to appear in a cache path"),
+            Component::RootDir => {
+                objs.clear();
+                objs.push(commit.tree.clone());
+            }
+            Component::CurDir => (),
+            Component::ParentDir => {
+                objs.pop().ok_or(format_err!("Outside path due to too many parent dirs!"))?;
+            }
+            Component::Normal(entry) => {
+                let cache_ref = {
+                    let cur_dir_ref = objs.last()
+                        .expect("Non-directory ref in directory stack");
+                    let cur_dir =
+                        cache.get(cur_dir_ref)?.into_directory()?;
+                    match find_entry(cur_dir, entry) {
+                        Some(dir_entry) => dir_entry.cache_ref,
+                        None => return Ok(None)
+                    }
+                };
+                objs.push(cache_ref);
+            }
+        }
+    }
+
+    Ok(objs.last().cloned())
 }
 
 #[cfg(test)]
