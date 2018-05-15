@@ -1,7 +1,10 @@
-use std::fs;
+use std::fs::{self, DirEntry, File};
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::collections::HashSet;
+use std::iter::FromIterator;
+use std::hash::Hash;
+use std::ffi::OsString;
 
 use failure::Error;
 
@@ -9,11 +12,11 @@ use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReadonlyFile, Ca
             CacheError};
 
 pub enum OverlayFile<C: CacheLayer> {
-    FsFile(fs::File),
+    FsFile(File),
     CacheFile(C::File)
 }
 
-impl<C: CacheLayer> io::Read for OverlayFile<C> {
+impl<C: CacheLayer> Read for OverlayFile<C> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
             OverlayFile::FsFile(ref mut read) => read.read(buf),
@@ -22,11 +25,11 @@ impl<C: CacheLayer> io::Read for OverlayFile<C> {
     }
 }
 
-impl<C: CacheLayer> io::Write for OverlayFile<C> {
+impl<C: CacheLayer> Write for OverlayFile<C> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         match *self {
             OverlayFile::FsFile(ref mut write) => write.write(buf),
-            OverlayFile::CacheFile(ref mut read) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            OverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
         }
     }
 
@@ -39,7 +42,7 @@ impl<C: CacheLayer> io::Write for OverlayFile<C> {
     }
 }
 
-impl<C: CacheLayer> io::Seek for OverlayFile<C> {
+impl<C: CacheLayer> Seek for OverlayFile<C> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
             OverlayFile::FsFile(ref mut seek) => seek.seek(pos),
@@ -68,7 +71,13 @@ impl<C: CacheLayer> Overlay<C> {
         let meta_path = Self::meta_path(base_path.as_ref());
         fs::create_dir_all(&meta_path)?;
 
-        let head = match fs::File::open(meta_path.join("HEAD")) {
+        let new_head_file_path = meta_path.join("NEW_HEAD");
+        if new_head_file_path.exists() {
+            unimplemented!("TODO: Recover from a previous crash during commit");
+        }
+
+        let head_path = meta_path.join("HEAD");
+        let head = match File::open(&head_path) {
             Ok(mut file) => {
                 let mut head = String::new();
                 file.read_to_string(&mut head)?;
@@ -78,7 +87,7 @@ impl<C: CacheLayer> Overlay<C> {
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
                     let head = CacheRef::default();
-                    let mut new_head_file = fs::File::create(meta_path.join("HEAD"))?;
+                    let mut new_head_file = File::create(&head_path)?;
                     new_head_file.write(head.to_string().as_bytes())?;
                     head
                 } else {
@@ -94,7 +103,7 @@ impl<C: CacheLayer> Overlay<C> {
         })
     }
 
-    fn resolve_object_ref<P: AsRef<Path>>(&mut self, path: P) -> Result<Option<CacheRef>, Error> {
+    fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>, Error> {
         if !self.head.is_root() {
             let commit = self.cache.get(&self.head)?.into_commit()
                 .expect("Head ref is not a commit");
@@ -133,6 +142,10 @@ impl<C: CacheLayer> Overlay<C> {
                     };
 
                     if writable {
+                        if let Some(parent_path) = overlay_path.parent() {
+                            fs::create_dir_all(parent_path)?;
+                        }
+
                         let mut new_file = fs::OpenOptions::new()
                             .create(true)
                             .read(true)
@@ -157,25 +170,23 @@ impl<C: CacheLayer> Overlay<C> {
         }
     }
 
-    fn dir_entry_to_directory_entry(&mut self,
-                                    dir_entry: fs::DirEntry,
-                                    file_path: &Path) -> Result<cache::DirectoryEntry, Error> {
+    fn dir_entry_to_directory_entry(&self, dir_entry: DirEntry, file_path: &Path)
+        -> Result<cache::DirectoryEntry, Error> {
         let file_type = dir_entry.file_type()?;
 
         let (cache_ref, object_type) = if file_type.is_dir() {
             let cache_ref  = self.generate_tree(dir_entry.path(), file_path)?;
             (cache_ref, cache::ObjectType::Directory)
         } else if file_type.is_file() {
-            let file = fs::File::open(dir_entry.path())?;
+            let file = File::open(dir_entry.path())?;
             let cache_file  = self.cache.create_file(file)?;
             let cache_ref = self.cache.add(CacheObject::File(cache_file))?;
             (cache_ref, cache::ObjectType::File)
         } else {
-            unimplemented!()
+            unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
         };
 
-        let name = dir_entry.file_name().into_string()
-            .map_err(|entry| format_err!("Unable to convert {} to UTF-8", entry.to_string_lossy()))?;
+        let name = Self::os_string_to_string(dir_entry.file_name())?;
         Ok(cache::DirectoryEntry {
             cache_ref,
             object_type,
@@ -183,34 +194,79 @@ impl<C: CacheLayer> Overlay<C> {
         })
     }
 
-    fn generate_tree<P, Q>(&mut self, abs_path: P, file_path: Q) -> Result<CacheRef, Error>
+    fn iter_directory<I,T,P,F,G>(&self, path: P, mut from_directory_entry: F, mut from_dir_entry: G)
+        -> Result<I, Error>
+        where I: FromIterator<T>,
+              T: Eq+Hash,
+              P: AsRef<Path>,
+              F: FnMut(DirectoryEntry) -> Result<T, Error>,
+              G: FnMut(DirEntry) -> Result<T, Error> {
+        // Get the directory contents from the cache if it's already there
+        let dir_entries_result: Result<HashSet<T>, Error> =
+            if let Some(cache_dir_ref) = self.resolve_object_ref(path.as_ref())? {
+                let dir = self.cache.get(&cache_dir_ref)?.into_directory()?;
+                dir.into_iter().map(|e| from_directory_entry(e)).collect()
+            } else {
+                Ok(HashSet::new())
+            };
+        let mut dir_entries = dir_entries_result?;
+
+        // Now merge the staged content into the directory
+        let abs_path = Self::file_path(&self.base_path).join(path.as_ref());
+        for dir_entry in fs::read_dir(abs_path)? {
+            let entry = from_dir_entry(dir_entry?)?;
+            dir_entries.insert(entry);
+        }
+
+        Ok(I::from_iter(dir_entries.into_iter()))
+    }
+
+    fn os_string_to_string(s: OsString) -> Result<String, Error> {
+        s.into_string()
+            .map_err(|s| {
+                format_err!("Unable to convert {} into UTF-8", s.to_string_lossy())
+            })
+    }
+
+    pub fn list_directory<I,P>(&self, path: P) -> Result<I, Error> where I: FromIterator<String>,
+                                                                         P: AsRef<Path> {
+        self.iter_directory(path,
+                            |e| Ok(e.name),
+                            |e| Self::os_string_to_string(e.file_name()))
+    }
+
+    fn generate_tree<P, Q>(&self, abs_path: P, file_path: Q) -> Result<CacheRef, Error>
         where P: AsRef<Path>,
               Q: AsRef<Path> {
         let rel_path = abs_path.as_ref().strip_prefix(file_path.as_ref())
             .expect("Path outside base path");
 
-        // Get the directory contents from the cache if it's already there
-        let mut dir_entries: HashSet<DirectoryEntry> =
-            if let Some(cache_dir_ref) = self.resolve_object_ref(rel_path)? {
-                let dir = self.cache.get(&cache_dir_ref)?.into_directory()?;
-                dir.into_iter().collect()
-            } else {
-                HashSet::new()
-            };
-
-        // Now merge the staged content into the directory
-        for dir_entry in fs::read_dir(abs_path.as_ref())? {
-            let entry = self.dir_entry_to_directory_entry(dir_entry?, file_path.as_ref())?;
-            dir_entries.insert(entry);
-        }
-
+        let dir_entries: HashSet<DirectoryEntry> = self.iter_directory(
+            rel_path,
+            |e| Ok(e),
+            |e| self.dir_entry_to_directory_entry(e, file_path.as_ref()))?;
         let directory = self.cache.create_directory(dir_entries.into_iter())?;
 
         Ok(self.cache.add(CacheObject::Directory(directory))?)
     }
 
+    fn create_new_head_commit(&mut self, commit_ref: &CacheRef) -> Result<PathBuf, Error> {
+        self.head = commit_ref.clone();
+
+        let meta_path = Self::meta_path(&self.base_path);
+        let new_head_file_path = meta_path.join("NEW_HEAD");
+
+        let mut new_head_file = File::create(&new_head_file_path)?;
+        new_head_file.write(commit_ref.to_string().as_bytes())?;
+        new_head_file.flush()?;
+        new_head_file.sync_all()?;
+
+        Ok(new_head_file_path)
+    }
+
     pub fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
         let file_path = Self::file_path(&self.base_path);
+        let meta_path = Self::meta_path(&self.base_path);
 
         let tree = self.generate_tree(&file_path, &file_path)?;
         let commit = Commit {
@@ -220,12 +276,26 @@ impl<C: CacheLayer> Overlay<C> {
         };
 
         let new_commit_ref = self.cache.add(CacheObject::Commit(commit))?;
-        self.head = new_commit_ref;
 
+        // Stage 1: create file "NEW_HEAD"
+        let new_head_path = self.create_new_head_commit(&new_commit_ref)?;
+
+        let head_file_path = meta_path.join("HEAD");
+
+        // Stage 2: Cleanup overlay content
         fs::remove_dir_all(&file_path)?;
         fs::create_dir(&file_path)?;
+        fs::remove_file(&head_file_path)?;
+
+        // Stage 3: Replace old HEAD with NEW_HEAD
+        fs::rename(new_head_path, head_file_path)?;
 
         Ok(new_commit_ref)
+    }
+
+    pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+        fs::create_dir_all(Self::file_path(&self.base_path).join(path))
+            .map_err(|e| e.into())
     }
 }
 
@@ -236,6 +306,7 @@ mod test {
     use overlay::*;
     use std::path::Path;
     use std::io::{Read, Write, Seek, SeekFrom};
+    use std::collections::HashSet;
 
     fn open_working_copy<P: AsRef<Path>>(path: P) -> Overlay<HashFileCache> {
         let cache_dir = path.as_ref().join("cache");
@@ -316,5 +387,60 @@ mod test {
         first_file.read_to_string(&mut content)
             .expect("Unable to read from first file");
         assert_eq!("What a test!", content.as_str());
+    }
+
+    #[test]
+    fn reopen_workspace() {
+        ::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        let mut test_file = overlay.open_file("test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        drop(overlay);
+
+        let mut overlay = open_working_copy(tempdir.path());
+
+        let mut committed_file = overlay.open_file("test.txt", false)
+            .expect("Unable to open committed file!");
+        let mut contents = String::new();
+        committed_file.read_to_string(&mut contents).expect("Unable to read from file");
+        assert_eq!(contents.as_str(), "What a test!");
+    }
+
+    #[test]
+    fn commit_directories() {
+        ::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+        overlay.ensure_directory("a/nested/dir")
+            .expect("Failed to create a nested directory");
+
+        let mut test_file = overlay.open_file("a/nested/dir/test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        overlay.commit("A test commit").expect("Unable to commit");
+
+        for writable in &[true, false] {
+            let mut committed_file = overlay.open_file("a/nested/dir/test.txt", *writable)
+                .expect(format!("Unable to open committed file as {}",
+                        if *writable { "writable" } else { "readonly" }).as_str());
+            let mut contents = String::new();
+            committed_file.read_to_string(&mut contents)
+                .expect("Unable to read from committed file");
+            drop(committed_file);
+            assert_eq!("What a test!", contents.as_str());
+        }
+
+        let dir_entries: HashSet<String> = overlay.list_directory("a/nested/dir")
+            .expect("Unable to get directory contents of a/nested/dir");
+        assert_eq!(HashSet::from_iter(["test.txt"].iter().map(|s| String::from(*s))), dir_entries);
     }
 }

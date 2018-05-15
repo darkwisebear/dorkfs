@@ -290,7 +290,7 @@ pub trait CacheLayer {
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;
-    fn add(&mut self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef>;
+    fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef>;
     fn create_file(&self, source_file: fs::File) -> Result<Self::File>;
     fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I)
         -> Result<Self::Directory>;
@@ -375,7 +375,7 @@ impl CacheLayer for HashFileCache {
         Ok(cache_object)
     }
 
-    fn add(&mut self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef> {
+    fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef> {
         let obj_type = ObjectType::from(&object);
         let (mut target_file, rel_path) = self.create_staging_file(obj_type)?;
 
