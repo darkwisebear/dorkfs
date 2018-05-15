@@ -51,6 +51,61 @@ impl<C: CacheLayer> Seek for OverlayFile<C> {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum ObjectType {
+    File,
+    Directory,
+    Symlink
+}
+
+impl ObjectType {
+    fn from_file_type(file_type: fs::FileType) -> Result<ObjectType, Error> {
+        if file_type.is_file() {
+            Ok(ObjectType::File)
+        } else if file_type.is_dir() {
+            Ok(ObjectType::Directory)
+        } else if file_type.is_symlink() {
+            Ok(ObjectType::Symlink)
+        } else {
+            Err(format_err!("Unknown fs::FileType"))
+        }
+    }
+
+    fn from_cache_object_type(obj_type: cache::ObjectType) -> Result<ObjectType, Error> {
+        match obj_type {
+            cache::ObjectType::File => Ok(ObjectType::File),
+            cache::ObjectType::Directory => Ok(ObjectType::Directory),
+            _ => Err(format_err!("Unmappable object type from cache!"))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Metadata {
+    pub size: u64,
+    pub object_type: ObjectType
+}
+
+impl Metadata {
+    fn from_fs_metadata(fs_metadata: fs::Metadata) -> Result<Metadata, Error> {
+        let metadata = Metadata {
+            size: fs_metadata.len(),
+            object_type: ObjectType::from_file_type(fs_metadata.file_type())?
+        };
+
+        Ok(metadata)
+    }
+
+    fn from_cache_metadata(cache_metadata: cache::CacheObjectMetadata) -> Result<Metadata, Error> {
+        let metadata = Metadata {
+            size: cache_metadata.size,
+            object_type: ObjectType::from_cache_object_type(cache_metadata.object_type)?
+        };
+
+        Ok(metadata)
+    }
+}
+
 pub struct Overlay<C: CacheLayer> {
     cache: C,
     head: CacheRef,
@@ -297,6 +352,22 @@ impl<C: CacheLayer> Overlay<C> {
         fs::create_dir_all(Self::file_path(&self.base_path).join(path))
             .map_err(|e| e.into())
     }
+
+    pub fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
+        let file_path = Self::file_path(&self.base_path).join(path.as_ref());
+
+        if file_path.exists() {
+            fs::symlink_metadata(file_path)
+                .map_err(|e| e.into())
+                .and_then(Metadata::from_fs_metadata)
+        } else {
+            self.resolve_object_ref(path)
+                .and_then(|cache_ref| cache_ref.ok_or(format_err!("File not found!")))
+                .and_then(|cache_ref| self.cache.metadata(&cache_ref)
+                    .map_err(|e| e.into()))
+                .and_then(Metadata::from_cache_metadata)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +416,11 @@ mod test {
         assert_eq!(contents.as_str(), "What a test!");
         drop(committed_file);
 
+        let metadata = overlay.metadata("test.txt")
+            .expect("Unable to fetch metadata");
+        assert_eq!("What a test!".len() as u64, metadata.size);
+        assert_eq!(super::ObjectType::File, metadata.object_type);
+
         let mut editable_file = overlay.open_file("test.txt", true)
             .expect("Unable to open file for writing!");
         editable_file.seek(SeekFrom::End(0)).expect("Unable to seek to end!");
@@ -358,6 +434,11 @@ mod test {
         changed_file.read_to_string(&mut contents).expect("Unable to read from file");
         assert_eq!(contents.as_str(), "What a test!Yay!");
         drop(changed_file);
+
+        let metadata = overlay.metadata("test.txt")
+            .expect("Unable to fetch metadata");
+        assert_eq!("What a test!Yay!".len() as u64, metadata.size);
+        assert_eq!(super::ObjectType::File, metadata.object_type);
     }
 
     #[test]
