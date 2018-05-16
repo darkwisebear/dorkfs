@@ -22,7 +22,7 @@ mod cache;
 mod overlay;
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use failure::Error;
 
@@ -69,8 +69,15 @@ fn main() {
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
 
-    let fs = new_overlay(cachedir)
+    let mut fs = new_overlay(cachedir)
         .expect("Unable to create workspace");
+    let mut test_file = fs.open_file("test.txt", true)
+        .expect("Unable to open test.txt");
+    test_file.write("What a test!".as_bytes())
+        .expect("Unable to write to test.txt");
+    drop(test_file);
+    fs.commit("Test commit")
+        .expect("Commit failed!");
 
     #[cfg(feature = "fuse")]
     mount_fuse(mountpoint, fs);
