@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::io::{Read, Seek, SeekFrom};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt::Debug;
 use std::sync::RwLock;
 use std::result::Result;
@@ -12,7 +12,6 @@ use time::{get_time, Timespec};
 use fuse_mt::*;
 use libc;
 
-use cache;
 use cache::*;
 
 use overlay;

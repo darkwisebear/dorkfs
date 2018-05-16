@@ -1,6 +1,6 @@
 use std::fs::{self, DirEntry, File};
 use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::hash::{Hash, Hasher};
@@ -9,8 +9,7 @@ use std::fmt::Debug;
 
 use failure::Error;
 
-use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReadonlyFile, CacheObject,
-            CacheError};
+use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, CacheObject};
 
 fn os_string_to_string(s: OsString) -> Result<String, Error> {
     s.into_string()
@@ -218,10 +217,6 @@ impl<C: CacheLayer+Debug> Overlay<C> {
         } else {
             Ok(None)
         }
-    }
-
-    pub fn get_cache_layer_mut(&mut self) -> &mut C {
-        &mut self.cache
     }
 
     pub fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool)
@@ -467,7 +462,7 @@ mod test {
         assert_eq!(contents.as_str(), "What a test!");
         drop(staged_file);
 
-        let head_ref = overlay.commit("A test commit").expect("Unable to commit");
+        overlay.commit("A test commit").expect("Unable to commit");
 
         let mut committed_file = overlay.open_file("test.txt", false)
             .expect("Unable to open committed file!");
@@ -535,7 +530,7 @@ mod test {
         ::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
-        let mut overlay = open_working_copy(tempdir.path());
+        let overlay = open_working_copy(tempdir.path());
 
         let mut test_file = overlay.open_file("test.txt", true)
             .expect("Unable to create file");
@@ -544,7 +539,7 @@ mod test {
 
         drop(overlay);
 
-        let mut overlay = open_working_copy(tempdir.path());
+        let overlay = open_working_copy(tempdir.path());
 
         let mut committed_file = overlay.open_file("test.txt", false)
             .expect("Unable to open committed file!");

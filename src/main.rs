@@ -26,7 +26,7 @@ use std::path::Path;
 
 use failure::Error;
 
-use cache::{CacheLayer, CacheRef, HashFileCache};
+use cache::HashFileCache;
 use overlay::Overlay;
 
 fn parse_arguments() -> clap::ArgMatches<'static> {
