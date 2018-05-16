@@ -110,6 +110,8 @@ impl FilesystemMT for DorkFS {
     }
 
     fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
+
         let metadata = match self.overlay.metadata(path) {
             Ok(metadata) => metadata,
             Err(err) => {
@@ -153,6 +155,8 @@ impl FilesystemMT for DorkFS {
     }
 
     fn opendir(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
+
         match self.overlay.list_directory(path) {
             Ok(dir) => {
                 let mut open_handles =
@@ -195,6 +199,8 @@ impl FilesystemMT for DorkFS {
     }
 
     fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
+
         let is_writable =
             ((flags as libc::c_int & libc::O_RDWR) != 0) ||
             ((flags as libc::c_int & libc::O_WRONLY) != 0);
