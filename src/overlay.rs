@@ -3,13 +3,20 @@ use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::ffi::OsString;
 
 use failure::Error;
 
 use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReadonlyFile, CacheObject,
             CacheError};
+
+fn os_string_to_string(s: OsString) -> Result<String, Error> {
+    s.into_string()
+        .map_err(|s| {
+            format_err!("Unable to convert {} into UTF-8", s.to_string_lossy())
+        })
+}
 
 pub enum OverlayFile<C: CacheLayer> {
     FsFile(File),
@@ -103,6 +110,49 @@ impl Metadata {
         };
 
         Ok(metadata)
+    }
+}
+
+#[derive(Debug)]
+pub struct OverlayDirEntry {
+    pub name: String,
+    pub metadata: Metadata
+}
+
+impl PartialEq for OverlayDirEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.eq(&other.name)
+    }
+}
+
+impl Eq for OverlayDirEntry {}
+
+impl Hash for OverlayDirEntry {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.name.hash(hasher);
+    }
+}
+
+impl OverlayDirEntry {
+    fn from_directory_entry<F>(dir_entry: DirectoryEntry, get_metadata: F)
+        -> Result<OverlayDirEntry, Error>
+        where F: Fn(&DirectoryEntry) -> Result<cache::CacheObjectMetadata, Error> {
+        let metadata = Metadata::from_cache_metadata(get_metadata(&dir_entry)?)?;
+        let entry = OverlayDirEntry {
+            name: dir_entry.name,
+            metadata
+        };
+
+        Ok(entry)
+    }
+
+    fn from_dir_entry(dir_entry: fs::DirEntry) -> Result<OverlayDirEntry, Error> {
+        let entry = OverlayDirEntry {
+            name: os_string_to_string(dir_entry.file_name())?,
+            metadata: Metadata::from_fs_metadata(dir_entry.metadata()?)?
+        };
+
+        Ok(entry)
     }
 }
 
@@ -241,7 +291,7 @@ impl<C: CacheLayer> Overlay<C> {
             unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
         };
 
-        let name = Self::os_string_to_string(dir_entry.file_name())?;
+        let name = os_string_to_string(dir_entry.file_name())?;
         Ok(cache::DirectoryEntry {
             cache_ref,
             object_type,
@@ -276,18 +326,24 @@ impl<C: CacheLayer> Overlay<C> {
         Ok(I::from_iter(dir_entries.into_iter()))
     }
 
-    fn os_string_to_string(s: OsString) -> Result<String, Error> {
-        s.into_string()
-            .map_err(|s| {
-                format_err!("Unable to convert {} into UTF-8", s.to_string_lossy())
+    fn directory_entry_to_overlay_dir_entry(&self, dir_entry: DirectoryEntry)
+        -> Result<OverlayDirEntry, Error> {
+        OverlayDirEntry::from_directory_entry(
+            dir_entry,
+            |dir_entry| {
+                self.cache.metadata(&dir_entry.cache_ref).map_err(|e| e.into())
             })
     }
 
-    pub fn list_directory<I,P>(&self, path: P) -> Result<I, Error> where I: FromIterator<String>,
-                                                                         P: AsRef<Path> {
-        self.iter_directory(path,
-                            |e| Ok(e.name),
-                            |e| Self::os_string_to_string(e.file_name()))
+    pub fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
+        where I: FromIterator<OverlayDirEntry>,
+              P: AsRef<Path> {
+        self.iter_directory(
+            path,
+            |dir_entry| {
+                self.directory_entry_to_overlay_dir_entry(dir_entry)
+            },
+            OverlayDirEntry::from_dir_entry)
     }
 
     fn generate_tree<P, Q>(&self, abs_path: P, file_path: Q) -> Result<CacheRef, Error>
@@ -299,7 +355,9 @@ impl<C: CacheLayer> Overlay<C> {
         let dir_entries: HashSet<DirectoryEntry> = self.iter_directory(
             rel_path,
             |e| Ok(e),
-            |e| self.dir_entry_to_directory_entry(e, file_path.as_ref()))?;
+            |e| {
+                self.dir_entry_to_directory_entry(e, file_path.as_ref())
+            })?;
         let directory = self.cache.create_directory(dir_entries.into_iter())?;
 
         Ok(self.cache.add(CacheObject::Directory(directory))?)
@@ -520,8 +578,9 @@ mod test {
             assert_eq!("What a test!", contents.as_str());
         }
 
-        let dir_entries: HashSet<String> = overlay.list_directory("a/nested/dir")
+        let dir_entries: HashSet<OverlayDirEntry> = overlay.list_directory("a/nested/dir")
             .expect("Unable to get directory contents of a/nested/dir");
-        assert_eq!(HashSet::from_iter(["test.txt"].iter().map(|s| String::from(*s))), dir_entries);
+        assert_eq!(HashSet::<String>::from_iter(["test.txt"].iter().map(|s| s.to_string())),
+                   HashSet::<String>::from_iter(dir_entries.iter().map(|e| e.name.clone())));
     }
 }
