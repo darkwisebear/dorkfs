@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::hash::{Hash, Hasher};
 use std::ffi::OsString;
+use std::fmt::Debug;
 
 use failure::Error;
 
@@ -18,12 +19,13 @@ fn os_string_to_string(s: OsString) -> Result<String, Error> {
         })
 }
 
-pub enum OverlayFile<C: CacheLayer> {
+#[derive(Debug)]
+pub enum OverlayFile<C: CacheLayer+Debug> {
     FsFile(File),
     CacheFile(C::File)
 }
 
-impl<C: CacheLayer> Read for OverlayFile<C> {
+impl<C: CacheLayer+Debug> Read for OverlayFile<C> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
             OverlayFile::FsFile(ref mut read) => read.read(buf),
@@ -32,7 +34,7 @@ impl<C: CacheLayer> Read for OverlayFile<C> {
     }
 }
 
-impl<C: CacheLayer> Write for OverlayFile<C> {
+impl<C: CacheLayer+Debug> Write for OverlayFile<C> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         match *self {
             OverlayFile::FsFile(ref mut write) => write.write(buf),
@@ -49,7 +51,7 @@ impl<C: CacheLayer> Write for OverlayFile<C> {
     }
 }
 
-impl<C: CacheLayer> Seek for OverlayFile<C> {
+impl<C: CacheLayer+Debug> Seek for OverlayFile<C> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
             OverlayFile::FsFile(ref mut seek) => seek.seek(pos),
@@ -58,7 +60,7 @@ impl<C: CacheLayer> Seek for OverlayFile<C> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ObjectType {
     File,
     Directory,
@@ -87,7 +89,7 @@ impl ObjectType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Metadata {
     pub size: u64,
     pub object_type: ObjectType
@@ -162,7 +164,7 @@ pub struct Overlay<C: CacheLayer> {
     base_path: PathBuf
 }
 
-impl<C: CacheLayer> Overlay<C> {
+impl<C: CacheLayer+Debug> Overlay<C> {
     fn file_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("files")
     }
@@ -222,7 +224,7 @@ impl<C: CacheLayer> Overlay<C> {
         &mut self.cache
     }
 
-    pub fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool)
+    pub fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool)
         -> Result<OverlayFile<C>, Error> {
         let overlay_path = Self::file_path(&self.base_path).join(path.as_ref());
         debug!("Trying to open {} in the overlay", overlay_path.to_string_lossy());

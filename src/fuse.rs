@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::sync::RwLock;
@@ -13,6 +14,9 @@ use libc;
 
 use cache;
 use cache::*;
+
+use overlay;
+use overlay::*;
 
 lazy_static! {
     static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
@@ -89,19 +93,15 @@ impl<T: Debug> OpenHandleSet<T> {
 }
 
 type Cache = HashFileCache;
-type CacheFile = <Cache as CacheLayer>::File;
-type CacheDirectory = <Cache as CacheLayer>::Directory;
-type CacheObject = cache::CacheObject<CacheFile, CacheDirectory>;
 
 #[derive(Debug)]
 enum OpenObject {
-    File(CacheFile),
-    Directory(CacheDirectory)
+    File(OverlayFile<HashFileCache>),
+    Directory(Vec<OverlayDirEntry>)
 }
 
 pub struct DorkFS {
-    cache: Cache,
-    head_commit: CacheRef,
+    overlay: Overlay<Cache>,
     open_handles: RwLock<OpenHandleSet<OpenObject>>
 }
 
@@ -111,23 +111,20 @@ impl FilesystemMT for DorkFS {
     }
 
     fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
-        let cache_ref = match self.resolve_object_ref(path) {
-            Ok(entry) => entry,
-            Err(_) => return Err(libc::ENOENT)
+        let metadata = match self.overlay.metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                error!("Unable to get attributes for {}: {}", path.to_string_lossy(), err);
+                return Err(libc::EINVAL);
+            }
         };
 
-        let metadata = self.cache.metadata(&cache_ref)
-            .map_err(|err| {
-                warn!("Error querying cache object metadata {}", err);
-                libc::EIO
-            })?;
-
         let (kind, perm) = match metadata.object_type {
-            ObjectType::File => {
+            overlay::ObjectType::File => {
                 (FileType::RegularFile, (6 << 6) + (4 << 3) + 0)
             }
 
-            ObjectType::Directory => {
+            overlay::ObjectType::Directory => {
                 (FileType::Directory, (7 << 6) + (5 << 3) + 0)
             }
 
@@ -157,25 +154,16 @@ impl FilesystemMT for DorkFS {
     }
 
     fn opendir(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
-        match self.resolve_object(path) {
-            Ok(cache_obj) => {
-                match cache_obj {
-                    cache::CacheObject::Directory(dir) => {
-                        let mut open_handles =
-                            self.open_handles.write().unwrap();
-                        let dir_handle = open_handles.push(OpenObject::Directory(dir));
-                        Ok((dir_handle, 0))
-                    }
-
-                    _ => {
-                        warn!("Referenced object not a directory!");
-                        Err(libc::ENOENT)
-                    }
-                }
+        match self.overlay.list_directory(path) {
+            Ok(dir) => {
+                let mut open_handles =
+                    self.open_handles.write().unwrap();
+                let dir_handle = open_handles.push(OpenObject::Directory(dir));
+                Ok((dir_handle, 0))
             }
 
             Err(err) => {
-                warn!("{}", err);
+                error!("Unable to open directory {}: {}", path.to_string_lossy(), err);
                 Err(libc::ENOENT)
             }
         }
@@ -189,7 +177,7 @@ impl FilesystemMT for DorkFS {
         if let Some(open_obj) = open_handles.get(fh) {
             if let OpenObject::Directory(ref dir) = *open_obj {
                 Ok(dir.clone().into_iter()
-                    .map(Self::cache_dir_entry_to_fuse_dir_entry)
+                    .map(Self::overlay_dir_entry_to_fuse_dir_entry)
                     .chain(STANDARD_DIR_ENTRIES.iter().cloned())
                     .collect())
             } else {
@@ -207,34 +195,26 @@ impl FilesystemMT for DorkFS {
         Ok(())
     }
 
-    fn open(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
-        self.resolve_object_ref(path)
-            .and_then(|cache_ref|
-                self.cache.metadata(&cache_ref)
-                    .map(|metadata| (metadata, cache_ref))
-                    .map_err(Error::from)
-            )
-            .and_then(|(metadata, cache_ref)| {
-                if let ObjectType::File = metadata.object_type {
-                    self.cache.get(&cache_ref)
-                        .map(|cache_obj| cache_obj.into_file().unwrap())
-                        .map(|file|
-                            (self.open_handles.write().unwrap().push(OpenObject::File(file)), 0)
-                        )
-                        .map_err(Error::from)
-                } else {
-                    Err(format_err!("Cache object not a file"))
-                }
-            })
-            .map_err(|err| {
-                warn!("Error opening file: {}", err);
-                libc::EIO
-            })
+    fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
+        let is_writable =
+            ((flags as libc::c_int & libc::O_RDWR) != 0) ||
+            ((flags as libc::c_int & libc::O_WRONLY) != 0);
+        let file = self.overlay.open_file(path, is_writable);
+
+        match file {
+            Ok(file) => {
+                let handle = self.open_handles.write().unwrap().push(OpenObject::File(file));
+                Ok((handle, 0))
+            },
+
+            Err(err) => {
+                error!("Unable to open file {}: {}", path.to_string_lossy(), err);
+                Err(libc::EIO)
+            }
+        }
     }
 
     fn read(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, size: u32) -> ResultData {
-        use std::io::{Read, Seek, SeekFrom};
-
         let mut open_handles =
             self.open_handles.write().unwrap();
         let file_obj =
@@ -303,15 +283,9 @@ impl FilesystemMT for DorkFS {
 }
 
 impl DorkFS {
-    pub fn with_path<P: AsRef<Path>>(cachedir: P, head_commit: CacheRef) -> Result<Self, Error> {
-        let cache = Cache::new(&cachedir)?;
-        Self::with_cache(cache, head_commit)
-    }
-
-    pub fn with_cache(cache: Cache, head_commit: CacheRef) -> Result<Self, Error> {
+    pub fn with_overlay(overlay: Overlay<HashFileCache>) -> Result<Self, Error> {
         let fs = DorkFS {
-            cache,
-            head_commit,
+            overlay,
             open_handles: RwLock::new(OpenHandleSet::new())
         };
         Ok(fs)
@@ -322,28 +296,16 @@ impl DorkFS {
             .map_err(|e| Error::from(e))
     }
 
-    fn resolve_object(&self, path: &Path) -> Result<CacheObject, Error> {
-        self.resolve_object_ref(path)
-            .and_then(|cache_ref| self.cache.get(&cache_ref).map_err(Error::from))
-    }
-
-    fn resolve_object_ref(&self, path: &Path) -> Result<CacheRef, Error> {
-        let commit = self.cache.get(&self.head_commit)?.into_commit()?;
-        cache::resolve_object_ref(commit, path)
-            .and_then(|obj_ref| obj_ref.ok_or(CacheError::ObjectNotFound(self.head_commit)))
-    }
-
-    fn object_type_to_file_type(obj_type: ObjectType) -> Result<FileType, Error> {
+    fn object_type_to_file_type(obj_type: overlay::ObjectType) -> Result<FileType, Error> {
         match obj_type {
-            ObjectType::File => Ok(FileType::RegularFile),
-            ObjectType::Directory => Ok(FileType::Directory),
+            overlay::ObjectType::File => Ok(FileType::RegularFile),
+            overlay::ObjectType::Directory => Ok(FileType::Directory),
             _ => bail!("Unmappable object type")
         }
     }
 
-    fn cache_dir_entry_to_fuse_dir_entry(dir_entry: cache::DirectoryEntry)
-        -> ::fuse_mt::DirectoryEntry {
-        let kind = match Self::object_type_to_file_type(dir_entry.object_type) {
+    fn overlay_dir_entry_to_fuse_dir_entry(dir_entry: &OverlayDirEntry) -> ::fuse_mt::DirectoryEntry {
+        let kind = match Self::object_type_to_file_type(dir_entry.metadata.object_type) {
             Ok(ft) => ft,
             Err(err) => {
                 warn!("Unable to convert file type in dir entry: {}", err);
@@ -352,7 +314,7 @@ impl DorkFS {
         };
 
         ::fuse_mt::DirectoryEntry {
-            name: OsString::from(dir_entry.name),
+            name: OsString::from(dir_entry.name.clone()),
             kind
         }
     }

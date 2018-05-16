@@ -22,8 +22,11 @@ mod cache;
 mod overlay;
 
 use std::io::Write;
-use std::path::PathBuf;
-use cache::{CacheLayer, CacheRef};
+use std::path::{Path, PathBuf};
+
+use failure::Error;
+
+use cache::{CacheLayer, CacheRef, HashFileCache};
 use overlay::Overlay;
 
 fn parse_arguments() -> clap::ArgMatches<'static> {
@@ -42,9 +45,16 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
 }
 
 #[cfg(feature = "fuse")]
-fn mount_fuse(mountpoint: &str, cache: cache::HashFileCache, head_ref: cache::CacheRef) {
-    let dorkfs = fuse::DorkFS::with_cache(cache, head_ref).unwrap();
+fn mount_fuse(mountpoint: &str, overlay: overlay::Overlay<cache::HashFileCache>) {
+    let dorkfs = fuse::DorkFS::with_overlay(overlay).unwrap();
     dorkfs.mount(mountpoint).unwrap();
+}
+
+fn new_overlay<P: AsRef<Path>>(workspace: P) -> Result<Overlay<HashFileCache>, Error> {
+    let cachedir = workspace.as_ref().join("cache");
+    let overlaydir = workspace.as_ref().join("overlay");
+    let cache = HashFileCache::new(&cachedir)?;
+    Overlay::new(cache, overlaydir)
 }
 
 pub fn init_logging() {
@@ -59,22 +69,9 @@ fn main() {
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
 
-    let base_dir = PathBuf::from(cachedir.to_owned());
-
-    let cache = cache::HashFileCache::new(&base_dir.join("cache"))
-        .expect("Unable to initialize cache");
-
-    let mut overlay =
-        Overlay::new(cache,
-                     &base_dir.join("overlay"))
-            .expect("Unable to instantiate overlay");
-    let mut test_file = overlay.open_file("test.txt", true)
-        .expect("Unable to create file");
-    write!(test_file, "What a test!").expect("Couldn't write to test file");
-    drop(test_file);
-
-    let head_ref = overlay.commit("A test commit").expect("Unable to commit");
+    let fs = new_overlay(cachedir)
+        .expect("Unable to create workspace");
 
     #[cfg(feature = "fuse")]
-    mount_fuse(mountpoint, cache, head_ref);
+    mount_fuse(mountpoint, fs);
 }
