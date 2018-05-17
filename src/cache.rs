@@ -453,7 +453,7 @@ impl CacheLayer for HashFileCache {
 
 
 impl HashFileCache {
-    pub fn new<P: AsRef<Path>>(cache_dir: &P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(cache_dir: P) -> Result<Self> {
         let cache = HashFileCache {
             base_path: Arc::new(cache_dir.as_ref().to_owned())
         };

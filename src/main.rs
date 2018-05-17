@@ -53,7 +53,7 @@ fn mount_fuse(mountpoint: &str, overlay: overlay::Overlay<cache::HashFileCache>)
 fn new_overlay<P: AsRef<Path>>(workspace: P) -> Result<Overlay<HashFileCache>, Error> {
     let cachedir = workspace.as_ref().join("cache");
     let overlaydir = workspace.as_ref().join("overlay");
-    let cache = HashFileCache::new(&cachedir)?;
+    let cache = HashFileCache::new(cachedir)?;
     Overlay::new(cache, overlaydir)
 }
 
