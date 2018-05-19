@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::sync::RwLock;
@@ -292,6 +292,24 @@ impl FilesystemMT for DorkFS {
             .map_err(|e| {
                 error!("Unable to create file: {}", e);
                 libc::EIO
+            })
+    }
+
+    fn write(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, data: Vec<u8>, _flags: u32)
+        -> ResultWrite {
+        self.open_handles.write().unwrap().get_mut(fh).ok_or(libc::EINVAL)
+            .and_then(|handle| {
+                if let OpenObject::File(ref mut file) = *handle {
+                    file.seek(SeekFrom::Start(offset)).and(
+                file.write_all(data.as_slice())
+                        .map(|_| data.len() as u32))
+                    .map_err(|e| {
+                        error!("Unable to write to file: {}", e);
+                        libc::EIO
+                    })
+                } else {
+                    Err(libc::EINVAL)
+                }
             })
     }
 }
