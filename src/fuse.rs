@@ -312,6 +312,37 @@ impl FilesystemMT for DorkFS {
                 }
             })
     }
+
+    fn mkdir(&self, req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32) -> ResultEntry {
+        let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
+
+        info!("Creating overlay directory {}", &path);
+        self.overlay.ensure_directory(&path)
+            .map(|_| {
+                let current_time = get_time();
+
+                (Timespec::new(0, 0),
+                 FileAttr {
+                     size: 0,
+                     blocks: 1,
+                     atime: current_time,
+                     mtime: current_time,
+                     ctime: current_time,
+                     crtime: current_time,
+                     kind: FileType::Directory,
+                     perm: self.calculate_permission(7, 7, 7),
+                     nlink: 1,
+                     uid: self.uid,
+                     gid: self.gid,
+                     rdev: 0,
+                     flags: 0
+                 })
+            })
+            .map_err(|e| {
+                error!("Unable to create directory {}: {}", path.to_string_lossy(), e);
+                libc::EEXIST
+            })
+    }
 }
 
 

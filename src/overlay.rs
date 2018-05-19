@@ -315,6 +315,7 @@ impl<C: CacheLayer+Debug> Overlay<C> {
 
         // Now merge the staged content into the directory
         let abs_path = Self::file_path(&self.base_path).join(path.as_ref());
+        info!("Reading overlay path {}", abs_path.to_string_lossy());
         for dir_entry in fs::read_dir(abs_path)? {
             let entry = from_dir_entry(dir_entry?)?;
             dir_entries.insert(entry);
