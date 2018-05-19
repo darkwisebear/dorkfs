@@ -119,7 +119,7 @@ impl FilesystemMT for DorkFS {
             Ok(metadata) => metadata,
             Err(err) => {
                 error!("Unable to get attributes for {}: {}", path.to_string_lossy(), err);
-                return Err(libc::EINVAL);
+                return Err(libc::ENOENT);
             }
         };
 
