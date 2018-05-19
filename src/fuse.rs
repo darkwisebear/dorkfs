@@ -101,7 +101,10 @@ enum OpenObject {
 
 pub struct DorkFS {
     overlay: Overlay<Cache>,
-    open_handles: RwLock<OpenHandleSet<OpenObject>>
+    open_handles: RwLock<OpenHandleSet<OpenObject>>,
+    uid: u32,
+    gid: u32,
+    umask: u32
 }
 
 impl FilesystemMT for DorkFS {
@@ -122,11 +125,11 @@ impl FilesystemMT for DorkFS {
 
         let (kind, perm) = match metadata.object_type {
             overlay::ObjectType::File => {
-                (FileType::RegularFile, (6 << 6) + (4 << 3) + 0)
+                (FileType::RegularFile, self.calculate_permission(6, 6, 6))
             }
 
             overlay::ObjectType::Directory => {
-                (FileType::Directory, (7 << 6) + (5 << 3) + 0)
+                (FileType::Directory, self.calculate_permission(7, 7, 7))
             }
 
             _ => {
@@ -145,8 +148,8 @@ impl FilesystemMT for DorkFS {
             kind,
             perm,
             nlink: 1,
-            uid: 1000,
-            gid: 1000,
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             flags: 0
         };
@@ -269,10 +272,10 @@ impl FilesystemMT for DorkFS {
                         ctime: get_time(),
                         crtime: get_time(),
                         kind: FileType::RegularFile,
-                        perm: (6 << 6) + (4 << 3) + 0,
+                        perm: calculate_permission(6, 6, 6),
                         nlink: 1,
-                        uid: 1000,
-                        gid: 1000,
+                        uid: self.uid,
+                        gid: self.gid,
                         rdev: 0,
                         flags: 0
                     },
@@ -288,10 +291,20 @@ impl FilesystemMT for DorkFS {
 }
 
 impl DorkFS {
-    pub fn with_overlay(overlay: Overlay<HashFileCache>) -> Result<Self, Error> {
+    fn calculate_permission(&self, u: u32, g: u32, o: u32) -> u16 {
+        (((((u << 3) + g) << 3) + o) & (!self.umask)) as u16
+    }
+
+    pub fn with_overlay(overlay: Overlay<HashFileCache>,
+                        uid: u32,
+                        gid: u32,
+                        umask: u32) -> Result<Self, Error> {
         let fs = DorkFS {
             overlay,
-            open_handles: RwLock::new(OpenHandleSet::new())
+            open_handles: RwLock::new(OpenHandleSet::new()),
+            uid,
+            gid,
+            umask
         };
         Ok(fs)
     }
@@ -324,7 +337,7 @@ impl DorkFS {
         }
     }
 
-    fn attr_from_metadata(metadata: &fs::Metadata) -> Result<FileAttr, Error> {
+    fn attr_from_metadata(&self, metadata: &fs::Metadata) -> Result<FileAttr, Error> {
         let size = metadata.len();
 
         let atime = system_time_to_timespec(metadata.accessed()?);
@@ -332,6 +345,11 @@ impl DorkFS {
         let crtime = system_time_to_timespec(metadata.created()?);
 
         let kind = file_type_to_kind(metadata.file_type())?;
+        let perm = if let FileType::Directory = kind {
+            self.calculate_permission(7, 7, 7)
+        } else {
+            self.calculate_permission(6, 6, 6)
+        };
 
         Ok(FileAttr {
             size,
@@ -341,10 +359,10 @@ impl DorkFS {
             ctime: mtime,
             crtime,
             kind,
-            perm: 0,
+            perm,
             nlink: 1,
-            uid: 1000,
-            gid: 1000,
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             flags: 0,
         })
