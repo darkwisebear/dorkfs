@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::io::{Read, Seek, SeekFrom};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::sync::RwLock;
 use std::result::Result;
@@ -204,9 +204,7 @@ impl FilesystemMT for DorkFS {
     fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
         let path = path.strip_prefix("/").expect("Expect absolute path");
 
-        let is_writable =
-            ((flags as libc::c_int & libc::O_RDWR) != 0) ||
-            ((flags as libc::c_int & libc::O_WRONLY) != 0);
+        let is_writable = Self::is_writable(flags);
         let file = self.overlay.open_file(path, is_writable);
 
         match file {
@@ -254,43 +252,57 @@ impl FilesystemMT for DorkFS {
         Ok(())
     }
 
-    /*fn create(&self, _req: RequestInfo, _parent: &Path, _name: &OsStr, _mode: u32, _flags: u32 )
+    fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32 )
         -> ResultCreate {
-        self.cache.create_file()
+        let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
+
+        if self.overlay.exists(&path) {
+            error!("File already exists: {}", path.as_os_str().to_string_lossy());
+            return Err(libc::EEXIST)
+        }
+
+        self.overlay.open_file(path, Self::is_writable(flags))
             .map(|file| {
-                let file_attr = file.metadata;
                 let mut open_handles =
                     self.open_handles.write().unwrap();
-                let handle = open_handles.push(OpenObject::WritableFile(file));
+                let fh = open_handles.push(OpenObject::File(file));
+
+                let current_time = get_time();
                 CreatedEntry {
                     ttl: Timespec::new(0, 0),
                     attr: FileAttr {
                         size: 0,
                         blocks: 1,
-                        atime: get_time(),
-                        mtime: get_time(),
-                        ctime: get_time(),
-                        crtime: get_time(),
+                        atime: current_time,
+                        mtime: current_time,
+                        ctime: current_time,
+                        crtime: current_time,
                         kind: FileType::RegularFile,
-                        perm: calculate_permission(6, 6, 6),
+                        perm: self.calculate_permission(6, 6, 6),
                         nlink: 1,
                         uid: self.uid,
                         gid: self.gid,
                         rdev: 0,
                         flags: 0
                     },
-                    fh: handle,
+                    fh,
                     flags: 0,
                 }
             })
-            .map_err(|err| {
-                warn!("Error creating file: {}", err);
-                Err(libc::EIO)
+            .map_err(|e| {
+                error!("Unable to create file: {}", e);
+                libc::EIO
             })
-    }*/
+    }
 }
 
+
 impl DorkFS {
+    fn is_writable(flags: u32) -> bool {
+        ((flags as libc::c_int & libc::O_RDWR) != 0) ||
+            ((flags as libc::c_int & libc::O_WRONLY) != 0)
+    }
+
     fn calculate_permission(&self, u: u32, g: u32, o: u32) -> u16 {
         (((((u << 3) + g) << 3) + o) & (!self.umask)) as u16
     }

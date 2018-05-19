@@ -423,6 +423,10 @@ impl<C: CacheLayer+Debug> Overlay<C> {
                 .and_then(Metadata::from_cache_metadata)
         }
     }
+
+    pub fn exists<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.metadata(path).is_ok()
+    }
 }
 
 #[cfg(test)]
