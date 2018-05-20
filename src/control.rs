@@ -65,16 +65,19 @@ impl<O: Overlay+WorkspaceController> ControlFile<O> {
     fn execute_commit(&mut self) -> Result<(), Error> {
         match self {
             ControlFile::Commit(ref mut buf, ref control_dir) => {
+                info!("Executing commit");
                 let buf = replace(buf, Cursor::new(Vec::default()));
                 let contents = buf.get_ref().as_slice();
                 if contents.len() > 0 {
                     str::from_utf8(contents)
                         .map_err(Error::from)
                         .and_then(|commit_msg| {
+                            info!("Commit message: {}", commit_msg);
                             let mut controller = control_dir.write().unwrap();
                             controller.commit(commit_msg).map(|_| ())
                         })
                 } else {
+                    info!("No commit message set");
                     Ok(())
                 }
             }
@@ -158,8 +161,11 @@ impl<O: Overlay+WorkspaceController> Overlay for ControlDir<O> {
     fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool) -> Result<Self::File, Error> {
         if let Ok(ref dorkfile) = path.as_ref().strip_prefix(DORK_DIR_ENTRY) {
             match dorkfile.to_str() {
-                Some("commit") => Ok(ControlFile::Commit(Cursor::new(Vec::new()),
-                                                         Arc::clone(&self.overlay))),
+                Some("commit") => {
+                    info!("Open commit special file");
+                    Ok(ControlFile::Commit(Cursor::new(Vec::new()),
+                                                         Arc::clone(&self.overlay)))
+                },
                 _ => bail!("Unable to open special file {}", dorkfile.to_string_lossy())
             }
         } else {
