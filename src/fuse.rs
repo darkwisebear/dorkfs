@@ -15,7 +15,6 @@ use libc;
 use cache::*;
 use control::*;
 
-use overlay;
 use overlay::*;
 use types;
 use types::*;
@@ -179,8 +178,6 @@ impl FilesystemMT for DorkFS {
     }
 
     fn readdir(&self, _req: RequestInfo, _path: &Path, fh: u64) -> ResultReaddir {
-        use std::iter::IntoIterator;
-
         let open_handles =
             self.open_handles.read().unwrap();
         if let Some(open_obj) = open_handles.get(fh) {
@@ -329,7 +326,7 @@ impl FilesystemMT for DorkFS {
             })
     }
 
-    fn mkdir(&self, req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32) -> ResultEntry {
+    fn mkdir(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32) -> ResultEntry {
         let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
 
         info!("Creating overlay directory {}", path.to_string_lossy());

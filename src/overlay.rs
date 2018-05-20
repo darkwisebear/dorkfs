@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::hash::Hash;
-use std::ffi::OsString;
 use std::fmt::Debug;
 
 use failure::Error;

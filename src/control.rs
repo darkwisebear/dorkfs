@@ -3,7 +3,6 @@ use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
 use std::iter::FromIterator;
 use std::fmt::Debug;
 use std::collections::{HashSet, HashMap};
-use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 use std::str;
@@ -189,15 +188,13 @@ impl<O: Overlay+WorkspaceController> Overlay for ControlDir<O> {
     }
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
-        let dork_prefix = PathBuf::from(DORK_DIR_ENTRY).join("/");
-
-        if path.as_ref() == Path::new("") {
+        if path.as_ref() == Path::new(DORK_DIR_ENTRY) {
             Ok(Metadata {
                 size: 0,
                 object_type: ObjectType::Directory
             })
-        } else if path.as_ref().starts_with(&dork_prefix) {
-            let file_name = path.as_ref().strip_prefix(&dork_prefix).unwrap();
+        } else if path.as_ref().starts_with(DORK_DIR_ENTRY) {
+            let file_name = path.as_ref().strip_prefix(DORK_DIR_ENTRY).unwrap();
             file_name.to_str().ok_or(format_err!("Unable to decode to UTF-8"))
                 .and_then(|s| {
                     DORKFS_FILES.get(s).cloned().ok_or(format_err!("File entry not found!"))

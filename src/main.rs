@@ -24,7 +24,6 @@ mod types;
 mod utility;
 mod control;
 
-use std::io::Write;
 use std::path::Path;
 use std::str::FromStr;
 

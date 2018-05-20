@@ -1,4 +1,3 @@
-use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::fs;
 use std::io::{Read, Write, Seek};
@@ -8,7 +7,7 @@ use std::fmt::Debug;
 
 use failure::Error;
 
-use cache::{self, CacheError, CacheRef, DirectoryEntry};
+use cache::{self, CacheRef, DirectoryEntry};
 use utility::os_string_to_string;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
