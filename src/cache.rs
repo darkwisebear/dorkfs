@@ -11,6 +11,7 @@ use std::vec;
 use std::string::ToString;
 use std::str::FromStr;
 use std::hash::{Hash, Hasher};
+
 use serde_json;
 use failure;
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};

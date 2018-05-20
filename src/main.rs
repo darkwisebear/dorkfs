@@ -20,6 +20,8 @@ extern crate fuse_mt;
 mod fuse;
 mod cache;
 mod overlay;
+mod types;
+mod utility;
 
 use std::io::Write;
 use std::path::Path;

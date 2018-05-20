@@ -16,6 +16,8 @@ use cache::*;
 
 use overlay;
 use overlay::*;
+use types;
+use types::*;
 
 lazy_static! {
     static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
@@ -124,11 +126,11 @@ impl FilesystemMT for DorkFS {
         };
 
         let (kind, perm) = match metadata.object_type {
-            overlay::ObjectType::File => {
+            types::ObjectType::File => {
                 (FileType::RegularFile, self.calculate_permission(6, 6, 6))
             }
 
-            overlay::ObjectType::Directory => {
+            types::ObjectType::Directory => {
                 (FileType::Directory, self.calculate_permission(7, 7, 7))
             }
 
@@ -375,10 +377,10 @@ impl DorkFS {
             .map_err(|e| Error::from(e))
     }
 
-    fn object_type_to_file_type(obj_type: overlay::ObjectType) -> Result<FileType, Error> {
+    fn object_type_to_file_type(obj_type: types::ObjectType) -> Result<FileType, Error> {
         match obj_type {
-            overlay::ObjectType::File => Ok(FileType::RegularFile),
-            overlay::ObjectType::Directory => Ok(FileType::Directory),
+            types::ObjectType::File => Ok(FileType::RegularFile),
+            types::ObjectType::Directory => Ok(FileType::Directory),
             _ => bail!("Unmappable object type")
         }
     }
