@@ -13,6 +13,7 @@ use fuse_mt::*;
 use libc;
 
 use cache::*;
+use control::*;
 
 use overlay;
 use overlay::*;
@@ -97,12 +98,12 @@ type Cache = HashFileCache;
 
 #[derive(Debug)]
 enum OpenObject {
-    File(OverlayFile<HashFileCache>),
-    Directory(Vec<OverlayDirEntry>)
+    File(ControlFile<FilesystemOverlay<HashFileCache>>),
+    Directory(Vec<OverlayDirEntry>),
 }
 
 pub struct DorkFS {
-    overlay: Overlay<Cache>,
+    overlay: ControlDir<FilesystemOverlay<Cache>>,
     open_handles: RwLock<OpenHandleSet<OpenObject>>,
     uid: u32,
     gid: u32,
@@ -184,7 +185,7 @@ impl FilesystemMT for DorkFS {
             self.open_handles.read().unwrap();
         if let Some(open_obj) = open_handles.get(fh) {
             if let OpenObject::Directory(ref dir) = *open_obj {
-                Ok(dir.clone().into_iter()
+                Ok(dir.iter()
                     .map(Self::overlay_dir_entry_to_fuse_dir_entry)
                     .chain(STANDARD_DIR_ENTRIES.iter().cloned())
                     .collect())
@@ -245,13 +246,26 @@ impl FilesystemMT for DorkFS {
 
     fn release(&self,
                _req: RequestInfo,
-               _path: &Path,
+               path: &Path,
                fh: u64,
                _flags: u32,
                _lock_owner: u64,
                _flush: bool) -> ResultEmpty {
-        self.open_handles.write().unwrap().remove(fh).ok_or(libc::EBADF)?;
-        Ok(())
+        self.open_handles.write().unwrap().remove(fh)
+            .ok_or(libc::EBADF)
+            .and_then(|handle| {
+                if let OpenObject::File(file) = handle {
+                    file.close().
+                        map_err(|e| {
+                            error!("Unable to successfully close file {}: {}",
+                                   path.to_string_lossy(),
+                                   e);
+                            libc::EIO
+                        })
+                } else {
+                    Ok(())
+                }
+            })
     }
 
     fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32 )
@@ -318,8 +332,8 @@ impl FilesystemMT for DorkFS {
     fn mkdir(&self, req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32) -> ResultEntry {
         let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
 
-        info!("Creating overlay directory {}", &path);
-        self.overlay.ensure_directory(&path)
+        info!("Creating overlay directory {}", path.to_string_lossy());
+        self.overlay.as_ref().ensure_directory(&path)
             .map(|_| {
                 let current_time = get_time();
 
@@ -358,12 +372,12 @@ impl DorkFS {
         (((((u << 3) + g) << 3) + o) & (!self.umask)) as u16
     }
 
-    pub fn with_overlay(overlay: Overlay<HashFileCache>,
+    pub fn with_overlay(overlay: FilesystemOverlay<HashFileCache>,
                         uid: u32,
                         gid: u32,
                         umask: u32) -> Result<Self, Error> {
         let fs = DorkFS {
-            overlay,
+            overlay: ControlDir::new(overlay),
             open_handles: RwLock::new(OpenHandleSet::new()),
             uid,
             gid,

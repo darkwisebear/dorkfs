@@ -22,6 +22,7 @@ mod cache;
 mod overlay;
 mod types;
 mod utility;
+mod control;
 
 use std::io::Write;
 use std::path::Path;
@@ -30,7 +31,7 @@ use std::str::FromStr;
 use failure::Error;
 
 use cache::HashFileCache;
-use overlay::Overlay;
+use overlay::FilesystemOverlay;
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
@@ -126,7 +127,7 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
 
 #[cfg(feature = "fuse")]
 fn mount_fuse(mountpoint: &str,
-              overlay: overlay::Overlay<cache::HashFileCache>,
+              overlay: overlay::FilesystemOverlay<cache::HashFileCache>,
               uid: u32,
               gid: u32,
               umask: u32) {
@@ -134,11 +135,11 @@ fn mount_fuse(mountpoint: &str,
     dorkfs.mount(mountpoint).unwrap();
 }
 
-fn new_overlay<P: AsRef<Path>>(workspace: P) -> Result<Overlay<HashFileCache>, Error> {
+fn new_overlay<P: AsRef<Path>>(workspace: P) -> Result<FilesystemOverlay<HashFileCache>, Error> {
     let cachedir = workspace.as_ref().join("cache");
     let overlaydir = workspace.as_ref().join("overlay");
     let cache = HashFileCache::new(cachedir)?;
-    Overlay::new(cache, overlaydir)
+    FilesystemOverlay::new(cache, overlaydir)
 }
 
 pub fn init_logging() {
@@ -152,15 +153,8 @@ fn main() {
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
 
-    let mut fs = new_overlay(cachedir)
+    let fs = new_overlay(cachedir)
         .expect("Unable to create workspace");
-    let mut test_file = fs.open_file("test.txt", true)
-        .expect("Unable to open test.txt");
-    test_file.write("What a test!".as_bytes())
-        .expect("Unable to write to test.txt");
-    drop(test_file);
-    fs.commit("Test commit")
-        .expect("Commit failed!");
 
     #[cfg(feature = "fuse")]
         {

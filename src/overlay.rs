@@ -3,7 +3,7 @@ use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::ffi::OsString;
 use std::fmt::Debug;
 
@@ -14,30 +14,36 @@ use utility::*;
 use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, CacheObject};
 
 #[derive(Debug)]
-pub enum OverlayFile<C: CacheLayer+Debug> {
+pub enum FSOverlayFile<C: CacheLayer+Debug> {
     FsFile(File),
     CacheFile(C::File)
 }
 
-impl<C: CacheLayer+Debug> Read for OverlayFile<C> {
+impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
+    fn close(self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
-            OverlayFile::FsFile(ref mut read) => read.read(buf),
-            OverlayFile::CacheFile(ref mut read) => read.read(buf),
+            FSOverlayFile::FsFile(ref mut read) => read.read(buf),
+            FSOverlayFile::CacheFile(ref mut read) => read.read(buf),
         }
     }
 }
 
-impl<C: CacheLayer+Debug> Write for OverlayFile<C> {
+impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         match *self {
-            OverlayFile::FsFile(ref mut write) => write.write(buf),
-            OverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            FSOverlayFile::FsFile(ref mut write) => write.write(buf),
+            FSOverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
         }
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
-        if let OverlayFile::FsFile(ref mut write) = *self {
+        if let FSOverlayFile::FsFile(ref mut write) = *self {
             write.flush()
         } else {
             Ok(())
@@ -45,22 +51,23 @@ impl<C: CacheLayer+Debug> Write for OverlayFile<C> {
     }
 }
 
-impl<C: CacheLayer+Debug> Seek for OverlayFile<C> {
+impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
-            OverlayFile::FsFile(ref mut seek) => seek.seek(pos),
-            OverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
+            FSOverlayFile::FsFile(ref mut seek) => seek.seek(pos),
+            FSOverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
         }
     }
 }
 
-pub struct Overlay<C: CacheLayer> {
+#[derive(Debug)]
+pub struct FilesystemOverlay<C: CacheLayer> {
     cache: C,
     head: CacheRef,
     base_path: PathBuf
 }
 
-impl<C: CacheLayer+Debug> Overlay<C> {
+impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     fn file_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("files")
     }
@@ -99,7 +106,7 @@ impl<C: CacheLayer+Debug> Overlay<C> {
             }
         };
 
-        Ok(Overlay {
+        Ok(FilesystemOverlay {
             cache,
             head,
             base_path: base_path.as_ref().to_owned()
@@ -113,59 +120,6 @@ impl<C: CacheLayer+Debug> Overlay<C> {
             cache::resolve_object_ref(&self.cache, &commit, path)
         } else {
             Ok(None)
-        }
-    }
-
-    pub fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool)
-        -> Result<OverlayFile<C>, Error> {
-        let overlay_path = Self::file_path(&self.base_path).join(path.as_ref());
-        debug!("Trying to open {} in the overlay", overlay_path.to_string_lossy());
-
-        // Check if the file is already part of the overlay
-        let overlay_file = fs::OpenOptions::new()
-            .read(true)
-            .write(writable)
-            .create(false)
-            .open(&overlay_path);
-        match  overlay_file {
-            Ok(file) => Ok(OverlayFile::FsFile(file)),
-
-            Err(ioerr) => {
-                if ioerr.kind() == io::ErrorKind::NotFound {
-                    let cache_ref = self.resolve_object_ref(path)?;
-                    let mut cache_file = if let Some(existing_ref) = cache_ref {
-                        let cache_object = self.cache.get(&existing_ref)?;
-                        Some(cache_object.into_file()?)
-                    } else {
-                        None
-                    };
-
-                    if writable {
-                        if let Some(parent_path) = overlay_path.parent() {
-                            fs::create_dir_all(parent_path)?;
-                        }
-
-                        let mut new_file = fs::OpenOptions::new()
-                            .create(true)
-                            .read(true)
-                            .write(true)
-                            .open(&overlay_path)?;
-                        if let Some(mut cache_file) = cache_file {
-                            io::copy(&mut cache_file, &mut new_file)?;
-                            new_file.seek(SeekFrom::Start(0))?;
-                        }
-                        Ok(OverlayFile::FsFile(new_file))
-                    } else {
-                        if let Some(cache_file) = cache_file {
-                            Ok(OverlayFile::CacheFile(cache_file))
-                        } else {
-                            bail!("File not found!");
-                        }
-                    }
-                } else {
-                    Err(ioerr.into())
-                }
-            }
         }
     }
 
@@ -230,17 +184,6 @@ impl<C: CacheLayer+Debug> Overlay<C> {
             })
     }
 
-    pub fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
-        where I: FromIterator<OverlayDirEntry>,
-              P: AsRef<Path> {
-        self.iter_directory(
-            path,
-            |dir_entry| {
-                self.directory_entry_to_overlay_dir_entry(dir_entry)
-            },
-            OverlayDirEntry::from_dir_entry)
-    }
-
     fn generate_tree<P, Q>(&self, abs_path: P, file_path: Q) -> Result<CacheRef, Error>
         where P: AsRef<Path>,
               Q: AsRef<Path> {
@@ -272,7 +215,14 @@ impl<C: CacheLayer+Debug> Overlay<C> {
         Ok(new_head_file_path)
     }
 
-    pub fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
+    pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+        fs::create_dir_all(Self::file_path(&self.base_path).join(path))
+            .map_err(|e| e.into())
+    }
+}
+
+impl<C: CacheLayer+Debug> WorkspaceController for FilesystemOverlay<C> {
+    fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
         let file_path = Self::file_path(&self.base_path);
         let meta_path = Self::meta_path(&self.base_path);
 
@@ -300,13 +250,76 @@ impl<C: CacheLayer+Debug> Overlay<C> {
 
         Ok(new_commit_ref)
     }
+}
 
-    pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
-        fs::create_dir_all(Self::file_path(&self.base_path).join(path))
-            .map_err(|e| e.into())
+impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
+    type File = FSOverlayFile<C>;
+
+    fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool)
+                                     -> Result<FSOverlayFile<C>, Error> {
+        let overlay_path = Self::file_path(&self.base_path).join(path.as_ref());
+        debug!("Trying to open {} in the overlay", overlay_path.to_string_lossy());
+
+        // Check if the file is already part of the overlay
+        let overlay_file = fs::OpenOptions::new()
+            .read(true)
+            .write(writable)
+            .create(false)
+            .open(&overlay_path);
+        match  overlay_file {
+            Ok(file) => Ok(FSOverlayFile::FsFile(file)),
+
+            Err(ioerr) => {
+                if ioerr.kind() == io::ErrorKind::NotFound {
+                    let cache_ref = self.resolve_object_ref(path)?;
+                    let mut cache_file = if let Some(existing_ref) = cache_ref {
+                        let cache_object = self.cache.get(&existing_ref)?;
+                        Some(cache_object.into_file()?)
+                    } else {
+                        None
+                    };
+
+                    if writable {
+                        if let Some(parent_path) = overlay_path.parent() {
+                            fs::create_dir_all(parent_path)?;
+                        }
+
+                        let mut new_file = fs::OpenOptions::new()
+                            .create(true)
+                            .read(true)
+                            .write(true)
+                            .open(&overlay_path)?;
+                        if let Some(mut cache_file) = cache_file {
+                            io::copy(&mut cache_file, &mut new_file)?;
+                            new_file.seek(SeekFrom::Start(0))?;
+                        }
+                        Ok(FSOverlayFile::FsFile(new_file))
+                    } else {
+                        if let Some(cache_file) = cache_file {
+                            Ok(FSOverlayFile::CacheFile(cache_file))
+                        } else {
+                            bail!("File not found!");
+                        }
+                    }
+                } else {
+                    Err(ioerr.into())
+                }
+            }
+        }
     }
 
-    pub fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
+    fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
+        where I: FromIterator<OverlayDirEntry>,
+              P: AsRef<Path> {
+        self.iter_directory(
+            path,
+            |dir_entry| {
+                self.directory_entry_to_overlay_dir_entry(dir_entry)
+            },
+            OverlayDirEntry::from_dir_entry)
+    }
+
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
         let file_path = Self::file_path(&self.base_path).join(path.as_ref());
 
         if file_path.exists() {
@@ -321,10 +334,6 @@ impl<C: CacheLayer+Debug> Overlay<C> {
                 .and_then(Metadata::from_cache_metadata)
         }
     }
-
-    pub fn exists<P: AsRef<Path>>(&self, path: P) -> bool {
-        self.metadata(path).is_ok()
-    }
 }
 
 #[cfg(test)]
@@ -336,12 +345,12 @@ mod test {
     use std::io::{Read, Write, Seek, SeekFrom};
     use std::collections::HashSet;
 
-    fn open_working_copy<P: AsRef<Path>>(path: P) -> Overlay<HashFileCache> {
+    fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache> {
         let cache_dir = path.as_ref().join("cache");
         let overlay_dir = path.as_ref().join("overlay");
 
         let cache = HashFileCache::new(&cache_dir).expect("Unable to create cache");
-        Overlay::new(cache, &overlay_dir)
+        FilesystemOverlay::new(cache, &overlay_dir)
             .expect("Unable to create overlay")
     }
 
