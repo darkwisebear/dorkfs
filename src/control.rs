@@ -59,6 +59,21 @@ impl<O: Overlay+WorkspaceController> OverlayFile for ControlFile<O> {
     fn close(mut self) -> Result<(), Error> {
         self.execute_commit()
     }
+
+    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+        match self {
+            ControlFile::Commit(ref mut buf, ..) => {
+                let max_pos = u64::min(buf.position(), size);
+                buf.set_position(max_pos);
+
+                buf.get_mut().truncate(size as usize);
+
+                Ok(())
+            }
+            ControlFile::Log(..) => Ok(()),
+            ControlFile::OverlayFile(ref mut file) => file.truncate(size)
+        }
+    }
 }
 
 impl<O: Overlay+WorkspaceController> ControlFile<O> {

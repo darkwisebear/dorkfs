@@ -7,6 +7,8 @@ use std::result::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::time::SystemTime;
+use std::borrow::Cow;
+
 use failure::Error;
 use time::{get_time, Timespec};
 use fuse_mt::*;
@@ -18,6 +20,7 @@ use control::*;
 use overlay::*;
 use types;
 use types::*;
+use utility::OpenHandleSet;
 
 lazy_static! {
     static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
@@ -54,42 +57,6 @@ fn file_type_to_kind(file_type: fs::FileType) -> Result<FileType, Error> {
         Ok(FileType::Symlink)
     } else {
         bail!("Unknown file type!");
-    }
-}
-
-#[derive(Debug)]
-struct OpenHandleSet<T: Debug> {
-    next_handle: u64,
-    open_objects: HashMap<u64, T>
-}
-
-impl<T: Debug> OpenHandleSet<T> {
-    fn new() -> Self {
-        OpenHandleSet {
-            next_handle: 0,
-            open_objects: HashMap::new()
-        }
-    }
-
-    fn push(&mut self, value: T) -> u64 {
-        let handle = self.next_handle;
-        self.next_handle += 1;
-
-        self.open_objects.insert(handle, value);
-
-        handle
-    }
-
-    fn get(&self, handle: u64) -> Option<&T> {
-        self.open_objects.get(&handle)
-    }
-
-    fn get_mut(&mut self, handle: u64) -> Option<&mut T> {
-        self.open_objects.get_mut(&handle)
-    }
-
-    fn remove(&mut self, handle: u64) -> Option<T> {
-        self.open_objects.remove(&handle)
     }
 }
 
@@ -166,7 +133,8 @@ impl FilesystemMT for DorkFS {
             Ok(dir) => {
                 let mut open_handles =
                     self.open_handles.write().unwrap();
-                let dir_handle = open_handles.push(OpenObject::Directory(dir));
+                let dir_handle = open_handles.push(OpenObject::Directory(dir),
+                                                   Cow::Borrowed(path.as_os_str()));
                 Ok((dir_handle, 0))
             }
 
@@ -202,6 +170,8 @@ impl FilesystemMT for DorkFS {
     }
 
     fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
+        info!("Opening file {}", path.to_string_lossy());
+
         let path = path.strip_prefix("/").expect("Expect absolute path");
 
         let is_writable = Self::is_writable(flags);
@@ -209,7 +179,8 @@ impl FilesystemMT for DorkFS {
 
         match file {
             Ok(file) => {
-                let handle = self.open_handles.write().unwrap().push(OpenObject::File(file));
+                let handle = self.open_handles.write().unwrap()
+                    .push(OpenObject::File(file), Cow::Borrowed(path.as_os_str()));
                 Ok((handle, 0))
             },
 
@@ -270,15 +241,16 @@ impl FilesystemMT for DorkFS {
         let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
 
         if self.overlay.exists(&path) {
-            error!("File already exists: {}", path.as_os_str().to_string_lossy());
+            error!("File already exists: {}", path.to_string_lossy());
             return Err(libc::EEXIST)
         }
 
-        self.overlay.open_file(path, Self::is_writable(flags))
+        self.overlay.open_file(&path, Self::is_writable(flags))
             .map(|file| {
                 let mut open_handles =
                     self.open_handles.write().unwrap();
-                let fh = open_handles.push(OpenObject::File(file));
+                let fh = open_handles.push(OpenObject::File(file),
+                                           Cow::Owned(path.into_os_string()));
 
                 let current_time = get_time();
                 CreatedEntry {
@@ -355,6 +327,41 @@ impl FilesystemMT for DorkFS {
                 error!("Unable to create directory {}: {}", path.to_string_lossy(), e);
                 libc::EEXIST
             })
+    }
+
+    fn truncate(&self, _req: RequestInfo, path: &Path, fh: Option<u64>, size: u64)
+        -> ResultEmpty {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
+
+        info!("Truncating file fh: {:?} path: {:?} to {}", fh, path, size);
+
+        let mut open_handles = self.open_handles.write().unwrap();
+        let file = {
+            let open_object = if let Some(fh) = fh {
+                open_handles.get_mut(fh)
+            } else {
+                open_handles.get_named_mut(path)
+            };
+
+            match open_object {
+                Some(OpenObject::File(ref mut file)) => Ok(file),
+                Some(_) => {
+                    warn!("Trying to truncate non-file object!");
+                    Err(libc::EINVAL)
+                }
+                None => {
+                    warn!("Object not found!");
+                    Err(libc::ENOENT)
+                }
+            }
+        };
+
+        file.and_then(|file| {
+            file.truncate(size).map_err(|e| {
+                warn!("Truncating file failed: {}", e);
+                libc::EIO
+            })
+        })
     }
 }
 

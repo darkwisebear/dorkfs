@@ -22,6 +22,14 @@ impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
     fn close(self) -> Result<(), Error> {
         Ok(())
     }
+
+    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+        if let FSOverlayFile::FsFile(ref file) = *self {
+            file.set_len(size).map_err(Error::from)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {

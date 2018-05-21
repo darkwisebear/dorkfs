@@ -120,6 +120,7 @@ impl OverlayDirEntry {
 
 pub trait OverlayFile: Read+Write+Seek {
     fn close(self) -> Result<(), Error>;
+    fn truncate(&mut self, size: u64) -> Result<(), Error>;
 }
 
 pub trait Overlay: Debug {
