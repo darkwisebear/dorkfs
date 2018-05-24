@@ -87,7 +87,7 @@ impl FilesystemMT for DorkFS {
         let metadata = match self.overlay.metadata(path) {
             Ok(metadata) => metadata,
             Err(err) => {
-                error!("Unable to get attributes for {}: {}", path.to_string_lossy(), err);
+                info!("Unable to get attributes for {}: {}", path.to_string_lossy(), err);
                 return Err(libc::ENOENT);
             }
         };
