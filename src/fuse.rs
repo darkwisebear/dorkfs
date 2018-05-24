@@ -285,9 +285,10 @@ impl FilesystemMT for DorkFS {
         self.open_handles.write().unwrap().get_mut(fh).ok_or(libc::EINVAL)
             .and_then(|handle| {
                 if let OpenObject::File(ref mut file) = *handle {
-                    file.seek(SeekFrom::Start(offset)).and(
-                file.write_all(data.as_slice())
-                        .map(|_| data.len() as u32))
+                    file.seek(SeekFrom::Start(offset)).and_then(|_| {
+                        file.write_all(data.as_slice())
+                            .map(|_| data.len() as u32)
+                    })
                     .map_err(|e| {
                         error!("Unable to write to file: {}", e);
                         libc::EIO

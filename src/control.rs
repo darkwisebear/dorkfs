@@ -141,10 +141,10 @@ impl<O: Overlay+WorkspaceController> Write for ControlFile<O> {
 
 impl<O: Overlay+WorkspaceController> Seek for ControlFile<O> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
-        if let ControlFile::OverlayFile(ref mut file) = *self {
-            file.seek(pos)
-        } else {
-            Err(io::ErrorKind::AddrNotAvailable.into())
+        match *self {
+            ControlFile::OverlayFile(ref mut file) => file.seek(pos),
+            ControlFile::Commit(ref mut buf, ..) => buf.seek(pos),
+            ControlFile::Log(_) => Err(io::ErrorKind::AddrNotAvailable.into())
         }
     }
 }
