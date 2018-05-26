@@ -1,4 +1,4 @@
-use std::path::{PathBuf, Path};
+use std::path::Path;
 use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
 use std::iter::FromIterator;
 use std::fmt::Debug;
@@ -6,7 +6,6 @@ use std::collections::{HashSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 use std::str;
-use std::mem::replace;
 
 use failure::Error;
 
@@ -43,7 +42,7 @@ lazy_static! {
 
 #[derive(Debug)]
 pub enum ControlFile<O: Overlay+WorkspaceController> {
-    Commit(Cursor<Vec<u8>>, Arc<RwLock<O>>),
+    Commit(Option<Cursor<Vec<u8>>>, Arc<RwLock<O>>),
     Log(Cursor<Vec<u8>>),
     OverlayFile(O::File)
 }
@@ -62,7 +61,7 @@ impl<O: Overlay+WorkspaceController> OverlayFile for ControlFile<O> {
 
     fn truncate(&mut self, size: u64) -> Result<(), Error> {
         match self {
-            ControlFile::Commit(ref mut buf, ..) => {
+            ControlFile::Commit(Some(ref mut buf), ..) => {
                 let max_pos = u64::min(buf.position(), size);
                 buf.set_position(max_pos);
 
@@ -70,6 +69,7 @@ impl<O: Overlay+WorkspaceController> OverlayFile for ControlFile<O> {
 
                 Ok(())
             }
+            ControlFile::Commit(None, ..) => Err(format_err!("Commit already done!")),
             ControlFile::Log(..) => Ok(()),
             ControlFile::OverlayFile(ref mut file) => file.truncate(size)
         }
@@ -80,19 +80,23 @@ impl<O: Overlay+WorkspaceController> ControlFile<O> {
     fn execute_commit(&mut self) -> Result<(), Error> {
         match self {
             ControlFile::Commit(ref mut buf, ref control_dir) => {
-                info!("Executing commit");
-                let buf = replace(buf, Cursor::new(Vec::default()));
-                let contents = buf.get_ref().as_slice();
-                if contents.len() > 0 {
+                if let Some(buf) = buf.take() {
+                    info!("Executing commit");
+                    let contents = buf.get_ref().as_slice();
                     str::from_utf8(contents)
                         .map_err(Error::from)
                         .and_then(|commit_msg| {
-                            info!("Commit message: {}", commit_msg);
-                            let mut controller = control_dir.write().unwrap();
-                            controller.commit(commit_msg).map(|_| ())
+                            if !commit_msg.is_empty() {
+                                info!("Commit message: {}", commit_msg);
+                                let mut controller = control_dir.write().unwrap();
+                                controller.commit(commit_msg).map(|_| ())
+                            } else {
+                                info!("Aborting commit due to empty commit message.");
+                                Ok(())
+                            }
                         })
                 } else {
-                    info!("No commit message set");
+                    debug!("Commit already executed");
                     Ok(())
                 }
             }
@@ -102,11 +106,14 @@ impl<O: Overlay+WorkspaceController> ControlFile<O> {
 
     fn get_writer(&mut self) -> Result<&mut Write, io::Error> {
         match *self {
-            ControlFile::Commit(ref mut data, ..) => Ok(data as &mut Write),
+            ControlFile::Commit(Some(ref mut data), ..) => Ok(data as &mut Write),
+            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
+
             ControlFile::Log(ref data) => {
                 error!("Log is read-only!");
-                Err(io::ErrorKind::PermissionDenied.into())
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
             }
+
             ControlFile::OverlayFile(ref mut file) => Ok(file as &mut Write)
         }
     }
@@ -117,7 +124,7 @@ impl<O: Overlay+WorkspaceController> Read for ControlFile<O> {
         match *self {
             ControlFile::Commit(..) => {
                 error!("Unable to read from commit");
-                Err(io::ErrorKind::PermissionDenied.into())
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
             }
             ControlFile::Log(ref mut data) => data.read(buf),
             ControlFile::OverlayFile(ref mut file) => file.read(buf)
@@ -143,8 +150,11 @@ impl<O: Overlay+WorkspaceController> Seek for ControlFile<O> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
             ControlFile::OverlayFile(ref mut file) => file.seek(pos),
-            ControlFile::Commit(ref mut buf, ..) => buf.seek(pos),
-            ControlFile::Log(_) => Err(io::ErrorKind::AddrNotAvailable.into())
+            ControlFile::Commit(Some(ref mut buf), ..) => {
+                buf.seek(pos)
+            }
+            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
+            ControlFile::Log(_) => Err(io::Error::from(io::ErrorKind::AddrNotAvailable))
         }
     }
 }
@@ -178,7 +188,7 @@ impl<O: Overlay+WorkspaceController> Overlay for ControlDir<O> {
             match dorkfile.to_str() {
                 Some("commit") => {
                     info!("Open commit special file");
-                    Ok(ControlFile::Commit(Cursor::new(Vec::new()),
+                    Ok(ControlFile::Commit(Some(Cursor::new(Vec::new())),
                                                          Arc::clone(&self.overlay)))
                 },
                 _ => bail!("Unable to open special file {}", dorkfile.to_string_lossy())
