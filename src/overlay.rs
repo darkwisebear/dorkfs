@@ -250,25 +250,26 @@ impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
     type Item = Result<ReferencedCommit, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_cache_ref.take().map(|cache_ref| {
-            match self.cache.get(&cache_ref) {
-                Ok(CacheObject::Commit(commit)) => {
-                    if !commit.parents.is_empty() {
-                        if commit.parents.len() > 1 {
-                            warn!("Non-linear history not supported yet!");
+        self.next_cache_ref.take().and_then(|cache_ref| {
+            if cache_ref != CacheRef::default() {
+                match self.cache.get(&cache_ref) {
+                    Ok(CacheObject::Commit(commit)) => {
+                        if !commit.parents.is_empty() {
+                            if commit.parents.len() > 1 {
+                                warn!("Non-linear history not supported yet!");
+                            }
+
+                            self.next_cache_ref = Some(commit.parents[0]);
                         }
 
-                        let parent_commit = commit.parents[0];
-                        if parent_commit != CacheRef::default() {
-                            self.next_cache_ref = Some(parent_commit);
-                        }
+                        Some(Ok(ReferencedCommit(cache_ref, commit)))
                     }
 
-                    Ok(ReferencedCommit(cache_ref, commit))
+                    Ok(_) => Some(Err(format_err!("Current ref {} doesn't reference a commit", cache_ref))),
+                    Err(e) => Some(Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e)))
                 }
-
-                Ok(_) => Err(format_err!("Current ref {} doesn't reference a commit", cache_ref)),
-                Err(e) => Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e))
+            } else {
+                None
             }
         })
     }

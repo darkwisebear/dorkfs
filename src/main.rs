@@ -44,9 +44,9 @@ fn validate_umask(s: String) -> Result<(), String> {
     }
 }
 
-fn parse_umask(s: &str) -> u32 {
-    s.chars().fold(0u32, |v, c| {
-        (v << 3u32) + c.to_digit(8).expect("Number is not an octal!")
+fn parse_umask(s: &str) -> u16 {
+    s.chars().fold(0u16, |v, c| {
+        (v << 3u16) + c.to_digit(8).expect("Number is not an octal!") as u16
     })
 }
 
@@ -129,7 +129,7 @@ fn mount_fuse(mountpoint: &str,
               overlay: overlay::FilesystemOverlay<cache::HashFileCache>,
               uid: u32,
               gid: u32,
-              umask: u32) {
+              umask: u16) {
     let dorkfs = fuse::DorkFS::with_overlay(overlay, uid, gid, umask).unwrap();
     dorkfs.mount(mountpoint).unwrap();
 }

@@ -73,7 +73,7 @@ pub struct DorkFS {
     open_handles: RwLock<OpenHandleSet<OpenObject>>,
     uid: u32,
     gid: u32,
-    umask: u32
+    umask: u16
 }
 
 impl FilesystemMT for DorkFS {
@@ -92,20 +92,14 @@ impl FilesystemMT for DorkFS {
             }
         };
 
-        let (kind, perm) = match metadata.object_type {
-            types::ObjectType::File => {
-                (FileType::RegularFile, self.calculate_permission(6, 6, 6))
-            }
-
-            types::ObjectType::Directory => {
-                (FileType::Directory, self.calculate_permission(7, 7, 7))
-            }
-
-            _ => {
-                warn!("Unsupported object type in directory");
-                return Err(libc::EINVAL);
-            }
+        let perm = match metadata.object_type {
+            types::ObjectType::File => self.calculate_permission(6, 6, 6),
+            types::ObjectType::Pipe => self.calculate_permission(4, 4, 4),
+            types::ObjectType::Directory => self.calculate_permission(7, 7, 7),
+            types::ObjectType::Symlink => Self::octal_to_val(7, 7, 7)
         };
+
+        let kind = Self::object_type_to_file_type(metadata.object_type);
 
         let attr = FileAttr {
             size: metadata.size,
@@ -373,14 +367,18 @@ impl DorkFS {
             ((flags as libc::c_int & libc::O_WRONLY) != 0)
     }
 
-    fn calculate_permission(&self, u: u32, g: u32, o: u32) -> u16 {
-        (((((u << 3) + g) << 3) + o) & (!self.umask)) as u16
+    fn octal_to_val(u: u16, g: u16, o: u16) -> u16 {
+        (((u << 3) +g) << 3) + o
+    }
+
+    fn calculate_permission(&self, u: u16, g: u16, o: u16) -> u16 {
+        Self::octal_to_val(u, g, o) & (!self.umask)
     }
 
     pub fn with_overlay(overlay: FilesystemOverlay<HashFileCache>,
                         uid: u32,
                         gid: u32,
-                        umask: u32) -> Result<Self, Error> {
+                        umask: u16) -> Result<Self, Error> {
         let fs = DorkFS {
             overlay: ControlDir::new(overlay),
             open_handles: RwLock::new(OpenHandleSet::new()),
@@ -396,22 +394,17 @@ impl DorkFS {
             .map_err(|e| Error::from(e))
     }
 
-    fn object_type_to_file_type(obj_type: types::ObjectType) -> Result<FileType, Error> {
+    fn object_type_to_file_type(obj_type: types::ObjectType) -> FileType {
         match obj_type {
-            types::ObjectType::File => Ok(FileType::RegularFile),
-            types::ObjectType::Directory => Ok(FileType::Directory),
-            _ => bail!("Unmappable object type")
+            types::ObjectType::File => FileType::RegularFile,
+            types::ObjectType::Directory => FileType::Directory,
+            types::ObjectType::Pipe => FileType::NamedPipe,
+            types::ObjectType::Symlink => FileType::Symlink
         }
     }
 
     fn overlay_dir_entry_to_fuse_dir_entry(dir_entry: &OverlayDirEntry) -> ::fuse_mt::DirectoryEntry {
-        let kind = match Self::object_type_to_file_type(dir_entry.metadata.object_type) {
-            Ok(ft) => ft,
-            Err(err) => {
-                warn!("Unable to convert file type in dir entry: {}", err);
-                FileType::RegularFile
-            }
-        };
+        let kind = Self::object_type_to_file_type(dir_entry.metadata.object_type);
 
         ::fuse_mt::DirectoryEntry {
             name: OsString::from(dir_entry.name.clone()),

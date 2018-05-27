@@ -14,7 +14,8 @@ use utility::os_string_to_string;
 pub enum ObjectType {
     File,
     Directory,
-    Symlink
+    Symlink,
+    Pipe
 }
 
 impl ObjectType {
@@ -86,10 +87,10 @@ impl Hash for OverlayDirEntry {
     }
 }
 
-impl<'a> From<(&'a String, &'a Metadata)> for OverlayDirEntry {
-    fn from(val: (&'a String, &'a Metadata)) -> OverlayDirEntry {
+impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
+    fn from(val: (&'a str, &'a Metadata)) -> OverlayDirEntry {
         OverlayDirEntry {
-            name: val.0.clone(),
+            name: val.0.to_owned(),
             metadata: val.1.clone()
         }
     }

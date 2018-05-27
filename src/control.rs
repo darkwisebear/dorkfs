@@ -23,21 +23,6 @@ lazy_static! {
             }
         }
     ];
-
-    static ref DORKFS_FILES: HashMap<String, Metadata> = [
-        (String::from("log"),
-            Metadata {
-                size: 0,
-                object_type: ObjectType::File
-            }
-        ),
-        (String::from("commit"),
-            Metadata {
-                size: 0,
-                object_type: ObjectType::File
-            }
-        )
-    ].iter().cloned().collect();
 }
 
 #[derive(Debug)]
@@ -162,15 +147,66 @@ impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
     }
 }
 
+trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceController<'a> {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error>;
+}
+
+#[derive(Debug)]
+struct ConstantSpecialFile;
+
+impl<O> SpecialFile<O> for ConstantSpecialFile where for<'a> O: Overlay+WorkspaceController<'a> {
+    fn metadata(&self, _control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
+        let metadata = Metadata {
+            size: 0,
+            object_type: ObjectType::File
+        };
+
+        Ok(metadata)
+    }
+}
+
+#[derive(Debug)]
+struct LogFile;
+
+impl<O> SpecialFile<O> for LogFile where for<'a> O: Overlay+WorkspaceController<'a> {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
+        let metadata = Metadata {
+            size: control_dir.generate_log_string()?.as_bytes().len() as u64,
+            object_type: ObjectType::File
+        };
+
+        Ok(metadata)
+    }
+}
+
 #[derive(Debug)]
 pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    overlay: Arc<RwLock<O>>
+    overlay: Arc<RwLock<O>>,
+    special_files: HashMap<&'static str, Box<SpecialFile<O>>>
 }
 
 impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
+    fn log_metadata(&self) -> Metadata {
+        self.commit_metadata()
+    }
+
+    fn commit_metadata(&self) -> Metadata {
+        Metadata {
+            size: 0,
+            object_type: ObjectType::File
+        }
+    }
+
     pub fn new(overlay: O) -> Self {
+
+        let mut special_files = HashMap::new();
+        special_files.insert("log",
+                             Box::new(LogFile) as Box<SpecialFile::<O>>);
+        special_files.insert("commit",
+                             Box::new(ConstantSpecialFile) as Box<SpecialFile::<O>>);
         ControlDir {
-            overlay: Arc::new(RwLock::new(overlay))
+            overlay: Arc::new(RwLock::new(overlay)),
+            special_files
         }
     }
 
@@ -237,7 +273,10 @@ impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'
             }
 
             Some(prefix) if prefix == DORK_DIR_ENTRY => {
-                Ok(DORKFS_FILES.iter().map(OverlayDirEntry::from).collect())
+                self.special_files.iter().map(|(name, special_file)| {
+                    special_file.metadata(self)
+                        .map(|metadata| OverlayDirEntry::from((*name, &metadata)))
+                }).collect()
             }
 
             _ => self.overlay.read().unwrap().list_directory(&path)
@@ -254,7 +293,9 @@ impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'
             let file_name = path.as_ref().strip_prefix(DORK_DIR_ENTRY).unwrap();
             file_name.to_str().ok_or(format_err!("Unable to decode to UTF-8"))
                 .and_then(|s| {
-                    DORKFS_FILES.get(s).cloned().ok_or(format_err!("File entry not found!"))
+                    self.special_files.get(s)
+                        .ok_or(format_err!("File entry not found!"))
+                        .and_then(|special_file| special_file.metadata(self))
                 })
         } else {
             self.overlay.read().unwrap().metadata(path)

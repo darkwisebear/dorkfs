@@ -249,7 +249,7 @@ pub struct Commit {
 impl Display for Commit {
     fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
         f.write_str(self.message.as_str())?;
-        write!(f, "\n\nTree: {}\n", self.tree)?;
+        write!(f, "\n\nTree:   {}\n", self.tree)?;
         for parent_commit in &self.parents {
             write!(f, "Parent: {}", parent_commit)?;
         }
