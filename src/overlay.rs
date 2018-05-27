@@ -10,7 +10,7 @@ use failure::Error;
 
 use types::*;
 use utility::*;
-use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, CacheObject};
+use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject};
 
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
@@ -228,7 +228,55 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 }
 
-impl<C: CacheLayer+Debug> WorkspaceController for FilesystemOverlay<C> {
+pub struct CacheLayerLog<'a, C: CacheLayer+'a> {
+    cache: &'a C,
+    next_cache_ref: Option<CacheRef>
+}
+
+impl<'a, C: CacheLayer+'a> CacheLayerLog<'a, C> {
+    fn new<'b>(cache: &'a C, commit_ref: &'b CacheRef) -> Result<Self, Error> {
+        let log = CacheLayerLog {
+            cache,
+            next_cache_ref: Some(commit_ref.clone())
+        };
+
+        Ok(log)
+    }
+}
+
+impl<'a, C: CacheLayer+'a> WorkspaceLog<'a> for CacheLayerLog<'a, C> { }
+
+impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
+    type Item = Result<ReferencedCommit, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_cache_ref.take().map(|cache_ref| {
+            match self.cache.get(&cache_ref) {
+                Ok(CacheObject::Commit(commit)) => {
+                    if !commit.parents.is_empty() {
+                        if commit.parents.len() > 1 {
+                            warn!("Non-linear history not supported yet!");
+                        }
+
+                        let parent_commit = commit.parents[0];
+                        if parent_commit != CacheRef::default() {
+                            self.next_cache_ref = Some(parent_commit);
+                        }
+                    }
+
+                    Ok(ReferencedCommit(cache_ref, commit))
+                }
+
+                Ok(_) => Err(format_err!("Current ref {} doesn't reference a commit", cache_ref)),
+                Err(e) => Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e))
+            }
+        })
+    }
+}
+
+impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C> {
+    type Log = CacheLayerLog<'a, C>;
+
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
         let file_path = Self::file_path(&self.base_path);
         let meta_path = Self::meta_path(&self.base_path);
@@ -256,6 +304,14 @@ impl<C: CacheLayer+Debug> WorkspaceController for FilesystemOverlay<C> {
         fs::rename(new_head_path, head_file_path)?;
 
         Ok(new_commit_ref)
+    }
+
+    fn get_current_head_ref(&self) -> Result<CacheRef, Error> {
+        Ok(self.head)
+    }
+
+    fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error> {
+        CacheLayerLog::new(&self.cache, start_commit)
     }
 }
 
@@ -344,15 +400,11 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
 }
 
 #[cfg(test)]
-mod test {
-    use tempfile::tempdir;
+pub mod testutil {
     use cache::*;
     use overlay::*;
-    use std::path::Path;
-    use std::io::{Read, Write, Seek, SeekFrom};
-    use std::collections::HashSet;
 
-    fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache> {
+    pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache> {
         let cache_dir = path.as_ref().join("cache");
         let overlay_dir = path.as_ref().join("overlay");
 
@@ -360,6 +412,17 @@ mod test {
         FilesystemOverlay::new(cache, &overlay_dir)
             .expect("Unable to create overlay")
     }
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::tempdir;
+    use cache::*;
+    use overlay::*;
+    use std::path::Path;
+    use std::io::{Read, Write, Seek, SeekFrom};
+    use std::collections::HashSet;
+    use super::testutil::open_working_copy;
 
     #[test]
     fn create_root_commit() {

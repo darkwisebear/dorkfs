@@ -41,20 +41,25 @@ lazy_static! {
 }
 
 #[derive(Debug)]
-pub enum ControlFile<O: Overlay+WorkspaceController> {
+pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     Commit(Option<Cursor<Vec<u8>>>, Arc<RwLock<O>>),
     Log(Cursor<Vec<u8>>),
     OverlayFile(O::File)
 }
 
-impl<O: Overlay+WorkspaceController> Drop for ControlFile<O> {
-    fn drop(&mut self) {
-        self.execute_commit()
-            .expect("Unable to execute commit")
-    }
-}
+// Due to https://github.com/rust-lang/rust/issues/27863 we cannot implement Drop for ControlFile
+// without introducing a lifetime parameter for it. Do not auto-execute a started commit on Drop
+// for now. Instead, close() has to be called explicitly.
+//
+// impl<O> Drop for ControlFile<O> where for <'a> O: Overlay+WorkspaceController<'a> {
+//     fn drop(&mut self) {
+//         if let Err(e) = self.execute_commit() {
+//             error!("Unable to complete commit: {}", e);
+//         }
+//     }
+// }
 
-impl<O: Overlay+WorkspaceController> OverlayFile for ControlFile<O> {
+impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn close(mut self) -> Result<(), Error> {
         self.execute_commit()
     }
@@ -76,7 +81,7 @@ impl<O: Overlay+WorkspaceController> OverlayFile for ControlFile<O> {
     }
 }
 
-impl<O: Overlay+WorkspaceController> ControlFile<O> {
+impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn execute_commit(&mut self) -> Result<(), Error> {
         match self {
             ControlFile::Commit(ref mut buf, ref control_dir) => {
@@ -119,7 +124,7 @@ impl<O: Overlay+WorkspaceController> ControlFile<O> {
     }
 }
 
-impl<O: Overlay+WorkspaceController> Read for ControlFile<O> {
+impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
             ControlFile::Commit(..) => {
@@ -132,7 +137,7 @@ impl<O: Overlay+WorkspaceController> Read for ControlFile<O> {
     }
 }
 
-impl<O: Overlay+WorkspaceController> Write for ControlFile<O> {
+impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         self.get_writer().and_then(|w| w.write(buf))
     }
@@ -146,25 +151,23 @@ impl<O: Overlay+WorkspaceController> Write for ControlFile<O> {
     }
 }
 
-impl<O: Overlay+WorkspaceController> Seek for ControlFile<O> {
+impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
             ControlFile::OverlayFile(ref mut file) => file.seek(pos),
-            ControlFile::Commit(Some(ref mut buf), ..) => {
-                buf.seek(pos)
-            }
+            ControlFile::Commit(Some(ref mut buf), ..) => buf.seek(pos),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
-            ControlFile::Log(_) => Err(io::Error::from(io::ErrorKind::AddrNotAvailable))
+            ControlFile::Log(ref mut buf) => buf.seek(pos)
         }
     }
 }
 
 #[derive(Debug)]
-pub struct ControlDir<O: Overlay+WorkspaceController> {
+pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     overlay: Arc<RwLock<O>>
 }
 
-impl<O: Overlay+WorkspaceController> ControlDir<O> {
+impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     pub fn new(overlay: O) -> Self {
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay))
@@ -178,9 +181,22 @@ impl<O: Overlay+WorkspaceController> ControlDir<O> {
     pub fn as_mut<'a>(&'a mut self) -> impl DerefMut<Target=O>+'a {
         self.overlay.write().unwrap()
     }
+
+    fn generate_log_string(&self) -> Result<String, Error> {
+        let workspace_controller = self.as_ref();
+        let head_ref = workspace_controller.get_current_head_ref()?;
+        let log = workspace_controller.get_log(&head_ref)?;
+
+        let mut result_string = String::from("On branch (HEAD)\n");
+        for commit_result in log {
+            result_string.push_str(&commit_result?.to_string());
+        }
+
+        Ok(result_string)
+    }
 }
 
-impl<O: Overlay+WorkspaceController> Overlay for ControlDir<O> {
+impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     type File = ControlFile<O>;
 
     fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool) -> Result<Self::File, Error> {
@@ -189,8 +205,18 @@ impl<O: Overlay+WorkspaceController> Overlay for ControlDir<O> {
                 Some("commit") => {
                     info!("Open commit special file");
                     Ok(ControlFile::Commit(Some(Cursor::new(Vec::new())),
-                                                         Arc::clone(&self.overlay)))
-                },
+                                           Arc::clone(&self.overlay)))
+                }
+
+                Some("log") => {
+                    info!("Open log special file");
+                    self.generate_log_string()
+                        .map(|full_log_string| {
+                            let byte_vec = Vec::from(full_log_string);
+                            ControlFile::Log(Cursor::new(byte_vec))
+                        })
+                }
+
                 _ => bail!("Unable to open special file {}", dorkfile.to_string_lossy())
             }
         } else {
@@ -233,5 +259,47 @@ impl<O: Overlay+WorkspaceController> Overlay for ControlDir<O> {
         } else {
             self.overlay.read().unwrap().metadata(path)
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::tempdir;
+    use overlay::testutil::open_working_copy;
+    use types::{Overlay, OverlayFile, WorkspaceController};
+    use std::io::Write;
+    use std::iter::Iterator;
+    use cache::ReferencedCommit;
+
+    #[test]
+    fn commit_via_file() {
+        ::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut file = control_overlay.open_file("test.txt", true)
+            .expect("Unable to create test file");
+        file.write("Teststring".as_bytes())
+            .expect("Unable to write to test file");
+        drop(file);
+
+        let mut commit_file = control_overlay.open_file(".dork/commit", true)
+            .expect("Unable to open commit file");
+        commit_file.write("Test commit message".as_bytes())
+            .expect("Unable to write commit message");
+        commit_file.close()
+            .expect("Closing commit message failed");
+
+        let workspace_controller = control_overlay.as_ref();
+        let head_ref = workspace_controller.get_current_head_ref()
+            .expect("Unable to get new head revision");
+        let mut log = workspace_controller.get_log(&head_ref)
+            .expect("Unable to get log for workspace");
+        let ReferencedCommit(_, head_commit) = log.next()
+            .expect("No head commit available")
+            .expect("Error while retrieving head commit");
+        assert_eq!("Test commit message", head_commit.message.as_str());
     }
 }

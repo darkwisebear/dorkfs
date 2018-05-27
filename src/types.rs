@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 use failure::Error;
 
-use cache::{self, CacheRef, DirectoryEntry};
+use cache::{self, Commit, ReferencedCommit, CacheRef, DirectoryEntry};
 use utility::os_string_to_string;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -136,6 +136,12 @@ pub trait Overlay: Debug {
     }
 }
 
-pub trait WorkspaceController: Debug {
+pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit, Error>> { }
+
+pub trait WorkspaceController<'a>: Debug {
+    type Log: WorkspaceLog<'a>;
+
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error>;
+    fn get_current_head_ref(&self) -> Result<CacheRef, Error>;
+    fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
 }

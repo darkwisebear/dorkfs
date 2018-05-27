@@ -246,6 +246,27 @@ pub struct Commit {
     pub message: String
 }
 
+impl Display for Commit {
+    fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
+        f.write_str(self.message.as_str())?;
+        write!(f, "\n\nTree: {}\n", self.tree)?;
+        for parent_commit in &self.parents {
+            write!(f, "Parent: {}", parent_commit)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReferencedCommit(pub CacheRef, pub Commit);
+
+impl Display for ReferencedCommit {
+    fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
+        write!(f, "Commit: {}\n\n{}", self.0, self.1)
+    }
+}
+
 #[derive(Debug)]
 pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     File(F),
