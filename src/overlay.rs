@@ -70,7 +70,7 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
 #[derive(Debug)]
 pub struct FilesystemOverlay<C: CacheLayer> {
     cache: C,
-    head: CacheRef,
+    head: Option<CacheRef>,
     base_path: PathBuf
 }
 
@@ -98,15 +98,12 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             Ok(mut file) => {
                 let mut head = String::new();
                 file.read_to_string(&mut head)?;
-                head.parse()?
+                Some(head.parse()?)
             }
 
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
-                    let head = CacheRef::default();
-                    let mut new_head_file = File::create(&head_path)?;
-                    new_head_file.write(head.to_string().as_bytes())?;
-                    head
+                    None
                 } else {
                     return Err(ioerr.into());
                 }
@@ -121,12 +118,14 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>, Error> {
-        if !self.head.is_root() {
-            let commit = self.cache.get(&self.head)?.into_commit()
-                .expect("Head ref is not a commit");
-            cache::resolve_object_ref(&self.cache, &commit, path)
-        } else {
-            Ok(None)
+        match self.head {
+            Some(head) => {
+                let commit = self.cache.get(&head)?.into_commit()
+                    .expect("Head ref is not a commit");
+                cache::resolve_object_ref(&self.cache, &commit, path)
+            }
+
+            None => Ok(None)
         }
     }
 
@@ -209,7 +208,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn create_new_head_commit(&mut self, commit_ref: &CacheRef) -> Result<PathBuf, Error> {
-        self.head = commit_ref.clone();
+        self.head = Some(commit_ref.clone());
 
         let meta_path = Self::meta_path(&self.base_path);
         let new_head_file_path = meta_path.join("NEW_HEAD");
@@ -251,25 +250,21 @@ impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_cache_ref.take().and_then(|cache_ref| {
-            if cache_ref != CacheRef::default() {
-                match self.cache.get(&cache_ref) {
-                    Ok(CacheObject::Commit(commit)) => {
-                        if !commit.parents.is_empty() {
-                            if commit.parents.len() > 1 {
-                                warn!("Non-linear history not supported yet!");
-                            }
-
-                            self.next_cache_ref = Some(commit.parents[0]);
+            match self.cache.get(&cache_ref) {
+                Ok(CacheObject::Commit(commit)) => {
+                    if !commit.parents.is_empty() {
+                        if commit.parents.len() > 1 {
+                            warn!("Non-linear history not supported yet!");
                         }
 
-                        Some(Ok(ReferencedCommit(cache_ref, commit)))
+                        self.next_cache_ref = Some(commit.parents[0]);
                     }
 
-                    Ok(_) => Some(Err(format_err!("Current ref {} doesn't reference a commit", cache_ref))),
-                    Err(e) => Some(Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e)))
+                    Some(Ok(ReferencedCommit(cache_ref, commit)))
                 }
-            } else {
-                None
+
+                Ok(_) => Some(Err(format_err!("Current ref {} doesn't reference a commit", cache_ref))),
+                Err(e) => Some(Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e)))
             }
         })
     }
@@ -283,8 +278,9 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         let meta_path = Self::meta_path(&self.base_path);
 
         let tree = self.generate_tree(&file_path, &file_path)?;
+        let parents = Vec::from_iter(self.head.take().into_iter());
         let commit = Commit {
-            parents: vec![self.head],
+            parents,
             tree,
             message: message.to_owned()
         };
@@ -299,7 +295,14 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         // Stage 2: Cleanup overlay content
         fs::remove_dir_all(&file_path)?;
         fs::create_dir(&file_path)?;
-        fs::remove_file(&head_file_path)?;
+        if let Err(e) = fs::remove_file(&head_file_path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                error!("Unable to remove the old HEAD file: ", e);
+                return Err(e.into());
+            } else {
+                info!("Creating new HEAD file");
+            }
+        }
 
         // Stage 3: Replace old HEAD with NEW_HEAD
         fs::rename(new_head_path, head_file_path)?;
@@ -308,7 +311,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     }
 
     fn get_current_head_ref(&self) -> Result<CacheRef, Error> {
-        Ok(self.head)
+        self.head.ok_or(format_err!("Head ref does not exist yet"))
     }
 
     fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error> {

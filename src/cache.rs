@@ -56,18 +56,8 @@ impl From<serde_json::Error> for CacheError {
 
 pub type Result<T> = result::Result<T, CacheError>;
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy, Default)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct CacheRef([u8; 32]);
-
-impl CacheRef {
-    pub fn root() -> Self {
-        Self::default()
-    }
-
-    pub fn is_root(&self) -> bool {
-        self.eq(&Self::root())
-    }
-}
 
 impl Display for CacheRef {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
