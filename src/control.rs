@@ -220,15 +220,18 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 
     fn generate_log_string(&self) -> Result<String, Error> {
         let workspace_controller = self.as_ref();
-        let head_ref = workspace_controller.get_current_head_ref()?;
-        let log = workspace_controller.get_log(&head_ref)?;
+        if let Some(head_ref) = workspace_controller.get_current_head_ref()? {
+            let log = workspace_controller.get_log(&head_ref)?;
 
-        let mut result_string = String::from("On branch (HEAD)\n");
-        for commit_result in log {
-            result_string.push_str(&commit_result?.to_string());
+            let mut result_string = String::from("On branch (HEAD)\n");
+            for commit_result in log {
+                result_string.push_str(&commit_result?.to_string());
+            }
+
+            Ok(result_string)
+        } else {
+            Ok(String::from("(No commit yet)"))
         }
-
-        Ok(result_string)
     }
 }
 
@@ -308,7 +311,7 @@ mod test {
     use tempfile::tempdir;
     use overlay::testutil::open_working_copy;
     use types::{Overlay, OverlayFile, WorkspaceController};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::iter::Iterator;
     use cache::ReferencedCommit;
 
@@ -335,12 +338,28 @@ mod test {
 
         let workspace_controller = control_overlay.as_ref();
         let head_ref = workspace_controller.get_current_head_ref()
-            .expect("Unable to get new head revision");
+            .expect("Unable to get new head revision")
+            .expect("No head revision existing");
         let mut log = workspace_controller.get_log(&head_ref)
             .expect("Unable to get log for workspace");
         let ReferencedCommit(_, head_commit) = log.next()
             .expect("No head commit available")
             .expect("Error while retrieving head commit");
         assert_eq!("Test commit message", head_commit.message.as_str());
+    }
+
+    #[test]
+    fn fetch_empty_log() {
+        ::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut log_file = control_overlay.open_file(".dork/log", false)
+            .expect("Unable to open log file");
+        let mut log_contents = String::new();
+        log_file.read_to_string(&mut log_contents)
+            .expect("Unable to read from log");
     }
 }

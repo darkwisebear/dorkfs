@@ -143,6 +143,6 @@ pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog<'a>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error>;
-    fn get_current_head_ref(&self) -> Result<CacheRef, Error>;
+    fn get_current_head_ref(&self) -> Result<Option<CacheRef>, Error>;
     fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
 }
