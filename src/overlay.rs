@@ -163,19 +163,23 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         // Get the directory contents from the cache if it's already there
         let dir_entries_result: Result<HashSet<T>, Error> =
             if let Some(cache_dir_ref) = self.resolve_object_ref(path.as_ref())? {
+                debug!("Reading dir {:?} from cache", path.as_ref());
                 let dir = self.cache.get(&cache_dir_ref)?.into_directory()?;
                 dir.into_iter().map(|e| from_directory_entry(e)).collect()
             } else {
+                debug!("Directory not existing in cache");
                 Ok(HashSet::new())
             };
         let mut dir_entries = dir_entries_result?;
 
         // Now merge the staged content into the directory
         let abs_path = Self::file_path(&self.base_path).join(path.as_ref());
-        info!("Reading overlay path {}", abs_path.to_string_lossy());
-        for dir_entry in fs::read_dir(abs_path)? {
-            let entry = from_dir_entry(dir_entry?)?;
-            dir_entries.insert(entry);
+        if abs_path.exists() {
+            info!("Reading overlay path {}", abs_path.to_string_lossy());
+            for dir_entry in fs::read_dir(abs_path)? {
+                let entry = from_dir_entry(dir_entry?)?;
+                dir_entries.insert(entry);
+            }
         }
 
         Ok(I::from_iter(dir_entries.into_iter()))
@@ -564,5 +568,27 @@ mod test {
             .expect("Unable to get directory contents of a/nested/dir");
         assert_eq!(HashSet::<String>::from_iter(["test.txt"].iter().map(|s| s.to_string())),
                    HashSet::<String>::from_iter(dir_entries.iter().map(|e| e.name.clone())));
+    }
+
+    #[test]
+    fn commit_empty_directory() {
+        ::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        overlay.ensure_directory("test")
+            .expect("Unable to create directory");
+        overlay.commit("Test message")
+            .expect("Unable to commit empty directory");
+
+        let dir: Vec<OverlayDirEntry> = overlay.list_directory("")
+            .expect("Unable to list directory");
+        let dir_names: HashSet<String> = dir.into_iter().map(|e| e.name).collect();
+        assert_eq!(dir_names, HashSet::from_iter(["test"].iter().map(|s| s.to_string())));
+
+        let subdir: Vec<OverlayDirEntry> = overlay.list_directory("test")
+            .expect("Unable to list subdirectory test");
+        assert!(subdir.is_empty());
     }
 }
