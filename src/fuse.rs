@@ -64,7 +64,7 @@ type Cache = HashFileCache;
 
 #[derive(Debug)]
 enum OpenObject {
-    File(ControlFile<FilesystemOverlay<HashFileCache>>),
+    File(ControlFile<FilesystemOverlay<Cache>>),
     Directory(Vec<OverlayDirEntry>),
 }
 
@@ -375,7 +375,7 @@ impl DorkFS {
         Self::octal_to_val(u, g, o) & (!self.umask)
     }
 
-    pub fn with_overlay(overlay: FilesystemOverlay<HashFileCache>,
+    pub fn with_overlay(overlay: FilesystemOverlay<Cache>,
                         uid: u32,
                         gid: u32,
                         umask: u16) -> Result<Self, Error> {
