@@ -1,12 +1,8 @@
 use std::path::Path;
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::ffi::{OsStr, OsString};
-use std::fmt::Debug;
 use std::sync::RwLock;
 use std::result::Result;
-use std::collections::HashMap;
-use std::fs;
-use std::time::SystemTime;
 use std::borrow::Cow;
 
 use failure::Error;
@@ -34,30 +30,6 @@ lazy_static! {
             kind: FileType::Directory
         }
     ];
-}
-
-fn system_time_to_timespec(systime: SystemTime) -> Timespec {
-    use std::time::UNIX_EPOCH;
-
-    let duration = systime.duration_since(UNIX_EPOCH)
-        .expect("Time before epoch!");
-
-    Timespec {
-        sec: duration.as_secs() as i64,
-        nsec: duration.subsec_nanos() as i32
-    }
-}
-
-fn file_type_to_kind(file_type: fs::FileType) -> Result<FileType, Error> {
-    if file_type.is_dir() {
-        Ok(FileType::Directory)
-    } else if file_type.is_file() {
-        Ok(FileType::RegularFile)
-    } else if file_type.is_symlink() {
-        Ok(FileType::Symlink)
-    } else {
-        bail!("Unknown file type!");
-    }
 }
 
 type Cache = HashFileCache;
@@ -300,7 +272,7 @@ impl FilesystemMT for DorkFS {
 
         info!("Creating overlay directory {}", path.to_string_lossy());
 
-        let ensure_result = state.overlay.as_ref().ensure_directory(&path);
+        let ensure_result = state.overlay.get_overlay().ensure_directory(&path);
         match ensure_result {
             Ok(()) => {
                 let current_time = get_time();
@@ -419,36 +391,5 @@ impl DorkFS {
             name: OsString::from(dir_entry.name.clone()),
             kind
         }
-    }
-
-    fn attr_from_metadata(&self, metadata: &fs::Metadata) -> Result<FileAttr, Error> {
-        let size = metadata.len();
-
-        let atime = system_time_to_timespec(metadata.accessed()?);
-        let mtime = system_time_to_timespec(metadata.modified()?);
-        let crtime = system_time_to_timespec(metadata.created()?);
-
-        let kind = file_type_to_kind(metadata.file_type())?;
-        let perm = if let FileType::Directory = kind {
-            self.calculate_permission(7, 7, 7)
-        } else {
-            self.calculate_permission(6, 6, 6)
-        };
-
-        Ok(FileAttr {
-            size,
-            blocks: (size + 4095) / 4096,
-            atime,
-            mtime,
-            ctime: mtime,
-            crtime,
-            kind,
-            perm,
-            nlink: 1,
-            uid: self.uid,
-            gid: self.gid,
-            rdev: 0,
-            flags: 0,
-        })
     }
 }

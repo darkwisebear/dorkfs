@@ -2,8 +2,8 @@ use std::path::Path;
 use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
 use std::iter::FromIterator;
 use std::fmt::Debug;
-use std::collections::{HashSet, HashMap};
-use std::ops::{Deref, DerefMut};
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::str;
 
@@ -99,7 +99,7 @@ impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
             ControlFile::Commit(Some(ref mut data), ..) => Ok(data as &mut Write),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
 
-            ControlFile::Log(ref data) => {
+            ControlFile::Log(_) => {
                 error!("Log is read-only!");
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             }
@@ -186,17 +186,6 @@ pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 }
 
 impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn log_metadata(&self) -> Metadata {
-        self.commit_metadata()
-    }
-
-    fn commit_metadata(&self) -> Metadata {
-        Metadata {
-            size: 0,
-            object_type: ObjectType::File
-        }
-    }
-
     pub fn new(overlay: O) -> Self {
 
         let mut special_files = HashMap::new();
@@ -210,16 +199,12 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
         }
     }
 
-    pub fn as_ref<'a>(&'a self) -> impl Deref<Target=O>+'a {
+    pub fn get_overlay<'a>(&'a self) -> impl Deref<Target=O>+'a {
         self.overlay.read().unwrap()
     }
 
-    pub fn as_mut<'a>(&'a mut self) -> impl DerefMut<Target=O>+'a {
-        self.overlay.write().unwrap()
-    }
-
     fn generate_log_string(&self) -> Result<String, Error> {
-        let workspace_controller = self.as_ref();
+        let workspace_controller = self.get_overlay();
         if let Some(head_ref) = workspace_controller.get_current_head_ref()? {
             let log = workspace_controller.get_log(&head_ref)?;
 
@@ -336,7 +321,7 @@ mod test {
         commit_file.close()
             .expect("Closing commit message failed");
 
-        let workspace_controller = control_overlay.as_ref();
+        let workspace_controller = control_overlay.get_overlay();
         let head_ref = workspace_controller.get_current_head_ref()
             .expect("Unable to get new head revision")
             .expect("No head revision existing");

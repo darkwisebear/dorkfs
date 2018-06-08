@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 use failure::Error;
 
-use cache::{self, Commit, ReferencedCommit, CacheRef, DirectoryEntry};
+use cache::{self, ReferencedCommit, CacheRef, DirectoryEntry};
 use utility::os_string_to_string;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
