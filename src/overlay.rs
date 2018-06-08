@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::hash::Hash;
 use std::fmt::Debug;
+use std::sync::{Arc, Weak, Mutex};
+use std::collections::HashMap;
 
 use failure::Error;
 
@@ -14,7 +16,7 @@ use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit
 
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
-    FsFile(File),
+    FsFile(Arc<Mutex<File>>),
     CacheFile(C::File)
 }
 
@@ -24,7 +26,8 @@ impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
     }
 
     fn truncate(&mut self, size: u64) -> Result<(), Error> {
-        if let FSOverlayFile::FsFile(ref file) = *self {
+        if let FSOverlayFile::FsFile(ref mut file) = *self {
+            let mut file = file.lock().unwrap();
             file.set_len(size).map_err(Error::from)
         } else {
             Ok(())
@@ -35,7 +38,10 @@ impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
 impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
-            FSOverlayFile::FsFile(ref mut read) => read.read(buf),
+            FSOverlayFile::FsFile(ref mut read) => {
+                let mut file = read.lock().unwrap();
+                file.read(buf)
+            }
             FSOverlayFile::CacheFile(ref mut read) => read.read(buf),
         }
     }
@@ -44,14 +50,18 @@ impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
 impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         match *self {
-            FSOverlayFile::FsFile(ref mut write) => write.write(buf),
+            FSOverlayFile::FsFile(ref mut write) => {
+                let mut file = write.lock().unwrap();
+                file.write(buf)
+            }
             FSOverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
         }
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
         if let FSOverlayFile::FsFile(ref mut write) = *self {
-            write.flush()
+            let mut file = write.lock().unwrap();
+            file.flush()
         } else {
             Ok(())
         }
@@ -61,7 +71,10 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
 impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
-            FSOverlayFile::FsFile(ref mut seek) => seek.seek(pos),
+            FSOverlayFile::FsFile(ref mut seek) => {
+                let mut file = seek.lock().unwrap();
+                file.seek(pos)
+            }
             FSOverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
         }
     }
@@ -71,6 +84,7 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
 pub struct FilesystemOverlay<C: CacheLayer> {
     cache: C,
     head: Option<CacheRef>,
+    overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
     base_path: PathBuf
 }
 
@@ -81,6 +95,12 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     fn meta_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("meta")
+    }
+
+    fn add_fs_file<P: AsRef<Path>>(&mut self, path: P, file: File) -> FSOverlayFile<C> {
+        let file = Arc::new(Mutex::new(file));
+        self.overlay_files.insert(path.as_ref().to_owned(), Arc::downgrade(&file));
+        FSOverlayFile::FsFile(file)
     }
 
     pub fn new<P: AsRef<Path>>(cache: C, base_path: P) -> Result<Self, Error> {
@@ -113,6 +133,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(FilesystemOverlay {
             cache,
             head,
+            overlay_files: HashMap::new(),
             base_path: base_path.as_ref().to_owned()
         })
     }
@@ -225,6 +246,37 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(new_head_file_path)
     }
 
+    fn clear_closed_files_in_path<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+        let path = path.as_ref();
+        debug!("Clearing overlay path {:?}", path);
+
+        for entry_result in fs::read_dir(path)? {
+            let entry = entry_result?;
+            let file_type = entry.file_type()?;
+            let file_path = entry.path();
+
+            if file_type.is_dir() {
+                self.clear_closed_files_in_path(file_path)?;
+            } else {
+                if !self.overlay_files.contains_key(file_path.strip_prefix(path)?) {
+                    debug!("Removing overlay file {:?}", &file_path);
+                    fs::remove_file(file_path).ok();
+                }
+            }
+        }
+
+        fs::remove_dir(path).ok();
+
+        Ok(())
+    }
+
+    fn clear_closed_files(&mut self) -> Result<(), Error> {
+        debug!("Currently open files: {:?}", self.overlay_files.keys().collect::<Vec<&PathBuf>>());
+
+        let base_path = Self::file_path(&self.base_path);
+        self.clear_closed_files_in_path(base_path)
+    }
+
     pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
         fs::create_dir_all(Self::file_path(&self.base_path).join(path))
             .map_err(|e| e.into())
@@ -297,8 +349,8 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         let head_file_path = meta_path.join("HEAD");
 
         // Stage 2: Cleanup overlay content
-        fs::remove_dir_all(&file_path)?;
-        fs::create_dir(&file_path)?;
+        self.clear_closed_files()?;
+
         if let Err(e) = fs::remove_file(&head_file_path) {
             if e.kind() != io::ErrorKind::NotFound {
                 error!("Unable to remove the old HEAD file: {}", e);
@@ -326,7 +378,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     type File = FSOverlayFile<C>;
 
-    fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool)
+    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool)
                                      -> Result<FSOverlayFile<C>, Error> {
         let overlay_path = Self::file_path(&self.base_path).join(path.as_ref());
         debug!("Trying to open {} in the overlay", overlay_path.to_string_lossy());
@@ -338,11 +390,11 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
             .create(false)
             .open(&overlay_path);
         match  overlay_file {
-            Ok(file) => Ok(FSOverlayFile::FsFile(file)),
+            Ok(file) => Ok(self.add_fs_file(path.as_ref(), file)),
 
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
-                    let cache_ref = self.resolve_object_ref(path)?;
+                    let cache_ref = self.resolve_object_ref(path.as_ref())?;
                     let mut cache_file = if let Some(existing_ref) = cache_ref {
                         let cache_object = self.cache.get(&existing_ref)?;
                         Some(cache_object.into_file()?)
@@ -364,7 +416,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                             io::copy(&mut cache_file, &mut new_file)?;
                             new_file.seek(SeekFrom::Start(0))?;
                         }
-                        Ok(FSOverlayFile::FsFile(new_file))
+                        Ok(self.add_fs_file(path.as_ref(), new_file))
                     } else {
                         if let Some(cache_file) = cache_file {
                             Ok(FSOverlayFile::CacheFile(cache_file))
@@ -519,7 +571,7 @@ mod test {
         ::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
-        let overlay = open_working_copy(tempdir.path());
+        let mut overlay = open_working_copy(tempdir.path());
 
         let mut test_file = overlay.open_file("test.txt", true)
             .expect("Unable to create file");
@@ -528,7 +580,7 @@ mod test {
 
         drop(overlay);
 
-        let overlay = open_working_copy(tempdir.path());
+        let mut overlay = open_working_copy(tempdir.path());
 
         let mut committed_file = overlay.open_file("test.txt", false)
             .expect("Unable to open committed file!");

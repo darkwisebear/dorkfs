@@ -201,9 +201,9 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 
         let mut special_files = HashMap::new();
         special_files.insert("log",
-                             Box::new(LogFile) as Box<SpecialFile::<O>>);
+                             Box::new(LogFile) as Box<SpecialFile<O>>);
         special_files.insert("commit",
-                             Box::new(ConstantSpecialFile) as Box<SpecialFile::<O>>);
+                             Box::new(ConstantSpecialFile) as Box<SpecialFile<O>>);
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -238,7 +238,7 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     type File = ControlFile<O>;
 
-    fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool) -> Result<Self::File, Error> {
+    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error> {
         if let Ok(ref dorkfile) = path.as_ref().strip_prefix(DORK_DIR_ENTRY) {
             match dorkfile.to_str() {
                 Some("commit") => {
@@ -259,7 +259,7 @@ impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'
                 _ => bail!("Unable to open special file {}", dorkfile.to_string_lossy())
             }
         } else {
-            self.overlay.read().unwrap().open_file(&path, writable)
+            self.overlay.write().unwrap().open_file(&path, writable)
                 .map(ControlFile::OverlayFile)
         }
     }

@@ -127,7 +127,7 @@ pub trait OverlayFile: Read+Write+Seek {
 pub trait Overlay: Debug {
     type File: OverlayFile;
 
-    fn open_file<P: AsRef<Path>>(&self, path: P, writable: bool) -> Result<Self::File, Error>;
+    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error>;
     fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
         where I: FromIterator<OverlayDirEntry>,
               P: AsRef<Path>;
