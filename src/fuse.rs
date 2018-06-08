@@ -68,9 +68,13 @@ enum OpenObject {
     Directory(Vec<OverlayDirEntry>),
 }
 
-pub struct DorkFS {
+struct FsState {
     overlay: ControlDir<FilesystemOverlay<Cache>>,
-    open_handles: RwLock<OpenHandleSet<OpenObject>>,
+    open_handles: OpenHandleSet<OpenObject>
+}
+
+pub struct DorkFS {
+    state: RwLock<FsState>,
     uid: u32,
     gid: u32,
     umask: u16
@@ -83,8 +87,9 @@ impl FilesystemMT for DorkFS {
 
     fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
         let path = path.strip_prefix("/").expect("Expect absolute path");
+        let state = self.state.read().unwrap();
 
-        let metadata = match self.overlay.metadata(path) {
+        let metadata = match state.overlay.metadata(path) {
             Ok(metadata) => metadata,
             Err(err) => {
                 info!("Unable to get attributes for {}: {}", path.to_string_lossy(), err);
@@ -122,13 +127,12 @@ impl FilesystemMT for DorkFS {
 
     fn opendir(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
         let path = path.strip_prefix("/").expect("Expect absolute path");
+        let mut state = self.state.write().unwrap();
 
-        match self.overlay.list_directory(path) {
+        match state.overlay.list_directory(path) {
             Ok(dir) => {
-                let mut open_handles =
-                    self.open_handles.write().unwrap();
-                let dir_handle = open_handles.push(OpenObject::Directory(dir),
-                                                   Cow::Borrowed(path.as_os_str()));
+                let dir_handle = state.open_handles.push(OpenObject::Directory(dir),
+                                                         Cow::Borrowed(path.as_os_str()));
                 Ok((dir_handle, 0))
             }
 
@@ -140,9 +144,8 @@ impl FilesystemMT for DorkFS {
     }
 
     fn readdir(&self, _req: RequestInfo, _path: &Path, fh: u64) -> ResultReaddir {
-        let open_handles =
-            self.open_handles.read().unwrap();
-        if let Some(open_obj) = open_handles.get(fh) {
+        let state = self.state.read().unwrap();
+        if let Some(open_obj) = state.open_handles.get(fh) {
             if let OpenObject::Directory(ref dir) = *open_obj {
                 Ok(dir.iter()
                     .map(Self::overlay_dir_entry_to_fuse_dir_entry)
@@ -157,9 +160,8 @@ impl FilesystemMT for DorkFS {
     }
 
     fn releasedir(&self, _req: RequestInfo, _path: &Path, fh: u64, _flags: u32) -> ResultEmpty {
-        let mut open_handles =
-            self.open_handles.write().unwrap();
-        open_handles.remove(fh);
+        let mut state = self.state.write().unwrap();
+        state.open_handles.remove(fh);
         Ok(())
     }
 
@@ -167,14 +169,15 @@ impl FilesystemMT for DorkFS {
         info!("Opening file {}", path.to_string_lossy());
 
         let path = path.strip_prefix("/").expect("Expect absolute path");
+        let mut state = self.state.write().unwrap();
 
         let is_writable = Self::is_writable(flags);
-        let file = self.overlay.open_file(path, is_writable);
+        let file = state.overlay.open_file(path, is_writable);
 
         match file {
             Ok(file) => {
-                let handle = self.open_handles.write().unwrap()
-                    .push(OpenObject::File(file), Cow::Borrowed(path.as_os_str()));
+                let handle = state.open_handles.push(OpenObject::File(file),
+                                                     Cow::Borrowed(path.as_os_str()));
                 Ok((handle, 0))
             },
 
@@ -186,10 +189,9 @@ impl FilesystemMT for DorkFS {
     }
 
     fn read(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, size: u32) -> ResultData {
-        let mut open_handles =
-            self.open_handles.write().unwrap();
+        let mut state = self.state.write().unwrap();
         let file_obj =
-            open_handles.get_mut(fh).ok_or(libc::EBADF)?;
+            state.open_handles.get_mut(fh).ok_or(libc::EBADF)?;
         if let OpenObject::File(ref mut file) = *file_obj {
             let mut result = Vec::with_capacity(size as usize);
             unsafe { result.set_len(size as usize); }
@@ -213,7 +215,7 @@ impl FilesystemMT for DorkFS {
                _flags: u32,
                _lock_owner: u64,
                _flush: bool) -> ResultEmpty {
-        self.open_handles.write().unwrap().remove(fh)
+        self.state.write().unwrap().open_handles.remove(fh)
             .ok_or(libc::EBADF)
             .and_then(|handle| {
                 if let OpenObject::File(file) = handle {
@@ -233,17 +235,16 @@ impl FilesystemMT for DorkFS {
     fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32 )
         -> ResultCreate {
         let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
+        let mut state = self.state.write().unwrap();
 
-        if self.overlay.exists(&path) {
+        if state.overlay.exists(&path) {
             error!("File already exists: {}", path.to_string_lossy());
             return Err(libc::EEXIST)
         }
 
-        self.overlay.open_file(&path, Self::is_writable(flags))
+        state.overlay.open_file(&path, Self::is_writable(flags))
             .map(|file| {
-                let mut open_handles =
-                    self.open_handles.write().unwrap();
-                let fh = open_handles.push(OpenObject::File(file),
+                let fh = state.open_handles.push(OpenObject::File(file),
                                            Cow::Owned(path.into_os_string()));
 
                 let current_time = get_time();
@@ -276,7 +277,7 @@ impl FilesystemMT for DorkFS {
 
     fn write(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, data: Vec<u8>, _flags: u32)
         -> ResultWrite {
-        self.open_handles.write().unwrap().get_mut(fh).ok_or(libc::EINVAL)
+        self.state.write().unwrap().open_handles.get_mut(fh).ok_or(libc::EINVAL)
             .and_then(|handle| {
                 if let OpenObject::File(ref mut file) = *handle {
                     file.seek(SeekFrom::Start(offset)).and_then(|_| {
@@ -295,13 +296,16 @@ impl FilesystemMT for DorkFS {
 
     fn mkdir(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32) -> ResultEntry {
         let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
+        let state = self.state.read().unwrap();
 
         info!("Creating overlay directory {}", path.to_string_lossy());
-        self.overlay.as_ref().ensure_directory(&path)
-            .map(|_| {
+
+        let ensure_result = state.overlay.as_ref().ensure_directory(&path);
+        match ensure_result {
+            Ok(()) => {
                 let current_time = get_time();
 
-                (Timespec::new(0, 0),
+                Ok((Timespec::new(0, 0),
                  FileAttr {
                      size: 0,
                      blocks: 1,
@@ -316,12 +320,14 @@ impl FilesystemMT for DorkFS {
                      gid: self.gid,
                      rdev: 0,
                      flags: 0
-                 })
-            })
-            .map_err(|e| {
+                 }))
+            }
+
+            Err(e) => {
                 error!("Unable to create directory {}: {}", path.to_string_lossy(), e);
-                libc::EEXIST
-            })
+                Err(libc::EEXIST)
+            }
+        }
     }
 
     fn truncate(&self, _req: RequestInfo, path: &Path, fh: Option<u64>, size: u64)
@@ -330,12 +336,12 @@ impl FilesystemMT for DorkFS {
 
         info!("Truncating file fh: {:?} path: {:?} to {}", fh, path, size);
 
-        let mut open_handles = self.open_handles.write().unwrap();
+        let mut state = self.state.write().unwrap();
         let file = {
             let open_object = if let Some(fh) = fh {
-                open_handles.get_mut(fh)
+                state.open_handles.get_mut(fh)
             } else {
-                open_handles.get_named_mut(path)
+                state.open_handles.get_named_mut(path)
             };
 
             match open_object {
@@ -379,9 +385,12 @@ impl DorkFS {
                         uid: u32,
                         gid: u32,
                         umask: u16) -> Result<Self, Error> {
-        let fs = DorkFS {
+        let state = FsState {
             overlay: ControlDir::new(overlay),
-            open_handles: RwLock::new(OpenHandleSet::new()),
+            open_handles: OpenHandleSet::new()
+        };
+        let fs = DorkFS {
+            state: RwLock::new(state),
             uid,
             gid,
             umask
