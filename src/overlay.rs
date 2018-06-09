@@ -271,6 +271,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn clear_closed_files(&mut self) -> Result<(), Error> {
+        self.overlay_files.retain(|_, file| file.upgrade().is_some());
+
         debug!("Currently open files: {:?}", self.overlay_files.keys().collect::<Vec<&PathBuf>>());
 
         let base_path = Self::file_path(&self.base_path);
