@@ -465,6 +465,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
 pub mod testutil {
     use cache::*;
     use overlay::*;
+    use std::io::{Read, Seek, SeekFrom};
 
     pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache> {
         let cache_dir = path.as_ref().join("cache");
@@ -473,6 +474,14 @@ pub mod testutil {
         let cache = HashFileCache::new(&cache_dir).expect("Unable to create cache");
         FilesystemOverlay::new(cache, &overlay_dir)
             .expect("Unable to create overlay")
+    }
+
+    pub fn check_file_content<F: Read+Seek>(file: &mut F, expected_content: &str) {
+        file.seek(SeekFrom::Start(0)).expect("Unable to seek in test file");
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .expect("Unable to read from test file");
+        assert_eq!(expected_content, content.as_str());
     }
 }
 
@@ -484,7 +493,7 @@ mod test {
     use std::path::Path;
     use std::io::{Read, Write, Seek, SeekFrom};
     use std::collections::HashSet;
-    use super::testutil::open_working_copy;
+    use super::testutil::*;
 
     #[test]
     fn create_root_commit() {
@@ -610,7 +619,7 @@ mod test {
         for writable in &[true, false] {
             let mut committed_file = overlay.open_file("a/nested/dir/test.txt", *writable)
                 .expect(format!("Unable to open committed file as {}",
-                        if *writable { "writable" } else { "readonly" }).as_str());
+                                if *writable { "writable" } else { "readonly" }).as_str());
             let mut contents = String::new();
             committed_file.read_to_string(&mut contents)
                 .expect("Unable to read from committed file");
@@ -644,5 +653,27 @@ mod test {
         let subdir: Vec<OverlayDirEntry> = overlay.list_directory("test")
             .expect("Unable to list subdirectory test");
         assert!(subdir.is_empty());
+    }
+
+    #[test]
+    fn modify_file_after_commit() {
+        ::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        let mut test_file = overlay.open_file("test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        check_file_content(&mut test_file, "What a test!");
+
+        overlay.commit("A test commit").expect("Unable to commit");
+        check_file_content(&mut test_file, "What a test!");
+
+        write!(test_file, "Incredible!").expect("Couldn't write to test file");
+        check_file_content(&mut test_file, "What a test!Incredible!");
+
+        overlay.commit("A test commit with parent").expect("Unable to commit");
+        check_file_content(&mut test_file, "What a test!Incredible!");
     }
 }
