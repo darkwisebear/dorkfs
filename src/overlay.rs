@@ -463,7 +463,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
 
 #[cfg(test)]
 pub mod testutil {
-    use cache::*;
+    use hashfilecache::HashFileCache;
     use overlay::*;
     use std::io::{Read, Seek, SeekFrom};
 
@@ -488,9 +488,7 @@ pub mod testutil {
 #[cfg(test)]
 mod test {
     use tempfile::tempdir;
-    use cache::*;
     use overlay::*;
-    use std::path::Path;
     use std::io::{Read, Write, Seek, SeekFrom};
     use std::collections::HashSet;
     use super::testutil::*;

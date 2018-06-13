@@ -11,6 +11,7 @@ use fuse_mt::*;
 use libc;
 
 use cache::*;
+use hashfilecache::HashFileCache;
 use control::*;
 
 use overlay::*;

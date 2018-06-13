@@ -23,13 +23,14 @@ mod overlay;
 mod types;
 mod utility;
 mod control;
+mod hashfilecache;
 
 use std::path::Path;
 use std::str::FromStr;
 
 use failure::Error;
 
-use cache::HashFileCache;
+use hashfilecache::HashFileCache;
 use overlay::FilesystemOverlay;
 
 fn is_octal_number(s: &str) -> bool {
