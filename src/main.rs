@@ -13,10 +13,10 @@ extern crate tiny_keccak;
 #[macro_use] extern crate lazy_static;
 extern crate tempfile;
 
-#[cfg(feature = "fuse")]
+#[cfg(target_os = "linux")]
 extern crate fuse_mt;
 
-#[cfg(feature = "fuse")]
+#[cfg(target_os = "linux")]
 mod fuse;
 mod cache;
 mod overlay;
@@ -125,9 +125,9 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
         .get_matches()
 }
 
-#[cfg(feature = "fuse")]
+#[cfg(target_os = "linux")]
 fn mount_fuse(mountpoint: &str,
-              overlay: overlay::FilesystemOverlay<cache::HashFileCache>,
+              overlay: overlay::FilesystemOverlay<HashFileCache>,
               uid: u32,
               gid: u32,
               umask: u16) {
@@ -156,7 +156,7 @@ fn main() {
     let fs = new_overlay(cachedir)
         .expect("Unable to create workspace");
 
-    #[cfg(feature = "fuse")]
+    #[cfg(target_os = "linux")]
         {
             let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
             let umask = args.value_of("umask")
