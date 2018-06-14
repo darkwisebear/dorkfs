@@ -18,6 +18,8 @@ extern crate fuse_mt;
 
 #[cfg(target_os = "linux")]
 mod fuse;
+#[cfg(feature = "gitcache")]
+mod gitcache;
 mod cache;
 mod overlay;
 mod types;

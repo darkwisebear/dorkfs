@@ -3,6 +3,9 @@ name = "dorkfs"
 version = "0.1.0"
 authors = ["Markus Hosch <markus.hosch@gmx.net>"]
 
+[features]
+gitcache = ["git2"]
+
 [dependencies]
 clap = "2.30"
 failure = "0.1"
@@ -18,6 +21,7 @@ tiny-keccak = "1.4"
 rand = "0.4"
 lazy_static = "1.0"
 tempfile = "3.0"
+git2 = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse_mt = "0.4"
