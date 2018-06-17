@@ -9,7 +9,7 @@ use std::iter::FromIterator;
 use tiny_keccak::Keccak;
 use serde_json;
 
-use cache::{self, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
+use cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
             CacheObject, CacheObjectMetadata, ObjectType};
 
 #[derive(Debug)]
@@ -18,7 +18,7 @@ pub struct HashFile {
 }
 
 impl ReadonlyFile for HashFile {
-    fn metadata(&self) -> cache::Result<fs::Metadata> {
+    fn metadata(&self) -> Result<fs::Metadata> {
         self.file.metadata().map_err(|err| CacheError::from(err))
     }
 }
@@ -64,7 +64,7 @@ impl CacheLayer for HashFileCache {
     type File = HashFile;
     type Directory = HashDirectory;
 
-    fn get(&self, cache_ref: &CacheRef) -> cache::Result<CacheObject<Self::File, Self::Directory>> {
+    fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let mut file = self.open_object_file(cache_ref)?;
         let objtype = Self::identify_object_type(&mut file)?;
 
@@ -91,7 +91,7 @@ impl CacheLayer for HashFileCache {
         Ok(cache_object)
     }
 
-    fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> cache::Result<CacheRef> {
+    fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef> {
         let obj_type = ObjectType::from(&object);
         let (mut target_file, rel_path) = self.create_staging_file(obj_type)?;
 
@@ -136,7 +136,7 @@ impl CacheLayer for HashFileCache {
         Ok(cache_ref)
     }
 
-    fn create_file(&self, source_file: fs::File) -> cache::Result<Self::File> {
+    fn create_file(&self, source_file: fs::File) -> Result<Self::File> {
         let hash_file = HashFile {
             file: source_file
         };
@@ -145,7 +145,7 @@ impl CacheLayer for HashFileCache {
     }
 
     fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, entries: I)
-                                                          -> cache::Result<Self::Directory> {
+                                                          -> Result<Self::Directory> {
         let dir = HashDirectory {
             entries: Vec::from_iter(entries)
         };
@@ -153,7 +153,7 @@ impl CacheLayer for HashFileCache {
         Ok(dir)
     }
 
-    fn metadata(&self, cache_ref: &CacheRef) -> cache::Result<CacheObjectMetadata> {
+    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
         let mut file = self.open_object_file(cache_ref)?;
         let size = file.metadata()?.len() - 1;
         let object_type = Self::identify_object_type(&mut file)?;
@@ -169,7 +169,7 @@ impl CacheLayer for HashFileCache {
 
 
 impl HashFileCache {
-    pub fn new<P: AsRef<Path>>(cache_dir: P) -> cache::Result<Self> {
+    pub fn new<P: AsRef<Path>>(cache_dir: P) -> Result<Self> {
         let cache = HashFileCache {
             base_path: Arc::new(cache_dir.as_ref().to_owned())
         };
@@ -182,7 +182,7 @@ impl HashFileCache {
         Ok(cache)
     }
 
-    fn ensure_path<P: AsRef<Path>>(&self, rel_path: P) -> cache::Result<()> {
+    fn ensure_path<P: AsRef<Path>>(&self, rel_path: P) -> Result<()> {
         let full_path = self.base_path.join(rel_path);
         debug!("Ensuring path {}", full_path.display());
         if !full_path.exists() {
@@ -196,7 +196,7 @@ impl HashFileCache {
         }
     }
 
-    fn build_cache_ref<R: Read>(mut reader: R) -> cache::Result<CacheRef> {
+    fn build_cache_ref<R: Read>(mut reader: R) -> Result<CacheRef> {
         let mut hash_writer = HashWriter::new();
         io::copy(&mut reader, &mut hash_writer)?;
         Ok(CacheRef(hash_writer.finish()))
@@ -217,7 +217,7 @@ impl HashFileCache {
         Path::new("staging").join(rand_name)
     }
 
-    fn create_staging_file(&self, object_type: ObjectType) -> cache::Result<(fs::File, PathBuf)> {
+    fn create_staging_file(&self, object_type: ObjectType) -> Result<(fs::File, PathBuf)> {
         self.ensure_path("staging")?;
         let rel_path = HashFileCache::generate_staging_path();
         let full_path = self.base_path.join(&rel_path);
@@ -234,7 +234,7 @@ impl HashFileCache {
         Ok((file, rel_path))
     }
 
-    fn open_object_file(&self, cache_ref: &CacheRef) -> cache::Result<fs::File> {
+    fn open_object_file(&self, cache_ref: &CacheRef) -> Result<fs::File> {
         let rel_path = Self::rel_path_from_ref(cache_ref);
         let path = self.base_path.join(&rel_path);
 
@@ -246,7 +246,7 @@ impl HashFileCache {
         }
     }
 
-    fn identify_object_type<R: Read>(object_file: &mut R) -> cache::Result<ObjectType> {
+    fn identify_object_type<R: Read>(object_file: &mut R) -> Result<ObjectType> {
         let mut objtype_identifier = [0u8; 1];
         object_file.read_exact(&mut objtype_identifier)?;
         ObjectType::from_identifier(&objtype_identifier)

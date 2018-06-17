@@ -211,7 +211,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         OverlayDirEntry::from_directory_entry(
             dir_entry,
             |dir_entry| {
-                self.cache.metadata(&dir_entry.cache_ref).map_err(|e| e.into())
+                self.cache.metadata(&dir_entry.cache_ref)
+                    .map_err(Error::from)
             })
     }
 
@@ -455,7 +456,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
             self.resolve_object_ref(path)
                 .and_then(|cache_ref| cache_ref.ok_or(format_err!("File not found!")))
                 .and_then(|cache_ref| self.cache.metadata(&cache_ref)
-                    .map_err(|e| e.into()))
+                    .map_err(Error::from))
                 .and_then(Metadata::from_cache_metadata)
         }
     }

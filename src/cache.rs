@@ -9,9 +9,11 @@ use std::str::FromStr;
 use std::hash::{Hash, Hasher};
 
 use serde_json;
-use failure;
+use failure::{Fail, Error};
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
+
+pub trait LayerError: Fail {}
 
 #[derive(Fail, Debug)]
 pub enum CacheError {
@@ -34,8 +36,13 @@ pub enum CacheError {
     JsonError(serde_json::Error),
 
     #[fail(display = "Unparsable reference {}: {}", _0, _1)]
-    UnparsableCacheRef(String, failure::Error)
+    UnparsableCacheRef(String, Error),
+
+    #[fail(display = "Layer error: {}", _0)]
+    LayerError(Error)
 }
+
+pub type Result<T> = result::Result<T, CacheError>;
 
 impl From<io::Error> for CacheError {
     fn from(ioerr: io::Error) -> Self {
@@ -49,7 +56,11 @@ impl From<serde_json::Error> for CacheError {
     }
 }
 
-pub type Result<T> = result::Result<T, CacheError>;
+impl<E: LayerError> From<E> for CacheError {
+    fn from(err: E) -> Self {
+        CacheError::LayerError(err.into())
+    }
+}
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct CacheRef(pub [u8; 32]);
@@ -64,30 +75,20 @@ impl Display for CacheRef {
 }
 
 impl FromStr for CacheRef {
-    type Err = CacheError;
+    type Err = Error;
 
-    fn from_str(v: &str) -> Result<Self> {
+    fn from_str(v: &str) -> result::Result<Self, Self::Err> {
         let mut last_index = 0;
         let mut result: [u8; 32] = unsafe { ::std::mem::uninitialized() };
 
         for (index, byte_result ) in HexCharIterator::new(v).enumerate() {
-            if index < 32 {
-                result[index] = byte_result?;
-                last_index = index;
-            } else {
-                return Err(CacheError::UnparsableCacheRef(
-                    v.to_string(),
-                    format_err!("Given hex string {} too large", v.to_string())));
-            }
+            ensure!(index < 32, "Given hex string {} too large", v.to_string());
+            result[index] = byte_result?;
+            last_index = index;
         }
 
-        if last_index == 31 {
-            Ok(CacheRef(result))
-        } else {
-            return Err(CacheError::UnparsableCacheRef(
-                v.to_string(),
-                format_err!("Given hex string {} too small", v.to_string())));
-        }
+        ensure!(last_index == 31, "Given hex string {} too small", v.to_string());
+        Ok(CacheRef(result))
     }
 }
 
@@ -110,7 +111,7 @@ impl<'a> HexCharIterator<'a> {
 }
 
 impl<'a> Iterator for HexCharIterator<'a> {
-    type Item = Result<u8>;
+    type Item = result::Result<u8, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (byte_str, rest) =
@@ -121,7 +122,7 @@ impl<'a> Iterator for HexCharIterator<'a> {
 
             let byte = u8::from_str_radix(byte_str, 16)
                 .map_err(|e| {
-                    CacheError::UnparsableCacheRef(self.hex.to_string(), e.into())
+                    format_err!("Unparsable cacheref {}: {}", self.hex.to_string(), e)
                 });
             Some(byte)
         } else {
@@ -196,7 +197,7 @@ impl ObjectType {
             b'F' => Ok(ObjectType::File),
             b'D' => Ok(ObjectType::Directory),
             b'C' => Ok(ObjectType::Commit),
-            obj_type => return Err(CacheError::UnknownObjectType(obj_type))
+            obj_type => Err(CacheError::UnknownObjectType(obj_type))
         }
     }
 }
@@ -304,7 +305,7 @@ pub trait CacheLayer {
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
-    -> result::Result<Option<CacheRef>, failure::Error> where C: CacheLayer,
+    -> result::Result<Option<CacheRef>, Error> where C: CacheLayer,
                                                               P: AsRef<Path> {
     let mut objs = vec![commit.tree.clone()];
     let path = path.as_ref();
@@ -348,10 +349,10 @@ mod test {
     #[test]
     fn hex_char_iterator() {
         use super::HexCharIterator;
-        use super::Result;
+        use failure::Error;
 
         let iter = HexCharIterator::new("123456789abcdef");
-        let bytes: Result<Vec<u8>> = iter.collect();
+        let bytes: Result<Vec<u8>, Error> = iter.collect();
         assert_eq!(vec![0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf], bytes.unwrap());
     }
 }
