@@ -17,11 +17,7 @@ pub struct HashFile {
     file: fs::File
 }
 
-impl ReadonlyFile for HashFile {
-    fn metadata(&self) -> Result<fs::Metadata> {
-        self.file.metadata().map_err(|err| CacheError::from(err))
-    }
-}
+impl ReadonlyFile for HashFile {}
 
 impl Read for HashFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -136,9 +132,10 @@ impl CacheLayer for HashFileCache {
         Ok(cache_ref)
     }
 
-    fn create_file(&self, source_file: fs::File) -> Result<Self::File> {
+    fn create_file<P: AsRef<Path>>(&self, source_path: P) -> Result<Self::File> {
+        let file = fs::File::open(source_path)?;
         let hash_file = HashFile {
-            file: source_file
+            file
         };
 
         Ok(hash_file)

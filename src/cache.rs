@@ -152,9 +152,7 @@ impl<'de> Deserialize<'de> for CacheRef {
     }
 }
 
-pub trait ReadonlyFile: io::Read+io::Seek {
-    fn metadata(&self) -> Result<fs::Metadata>;
-}
+pub trait ReadonlyFile: io::Read+io::Seek {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ObjectType {
@@ -299,7 +297,7 @@ pub trait CacheLayer {
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;
     fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef>;
-    fn create_file(&self, source_file: fs::File) -> Result<Self::File>;
+    fn create_file<P: AsRef<Path>>(&self, source_path: P) -> Result<Self::File>;
     fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I)
         -> Result<Self::Directory>;
 }

@@ -158,8 +158,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             let cache_ref  = self.generate_tree(dir_entry.path(), file_path)?;
             (cache_ref, cache::ObjectType::Directory)
         } else if file_type.is_file() {
-            let file = File::open(dir_entry.path())?;
-            let cache_file  = self.cache.create_file(file)?;
+            let cache_file = self.cache.create_file(dir_entry.path())?;
             let cache_ref = self.cache.add(CacheObject::File(cache_file))?;
             (cache_ref, cache::ObjectType::File)
         } else {
