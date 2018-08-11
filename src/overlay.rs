@@ -123,7 +123,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
-                    None
+                    cache.get_head_commit()?
                 } else {
                     return Err(ioerr.into());
                 }

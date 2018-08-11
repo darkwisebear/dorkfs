@@ -38,6 +38,9 @@ pub enum CacheError {
     #[fail(display = "Unparsable reference {}: {}", _0, _1)]
     UnparsableCacheRef(String, Error),
 
+    #[fail(display = "Runtime error {}: {}", _0, _1)]
+    Custom(&'static str, Error),
+
     #[fail(display = "Layer error: {}", _0)]
     LayerError(Error)
 }
@@ -299,6 +302,7 @@ pub trait CacheLayer {
     fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef>;
     fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef>;
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
+    fn get_head_commit(&self) -> Result<Option<CacheRef>> { Ok(None) }
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
