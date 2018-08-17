@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::sync::RwLock;
 use std::result::Result;
 use std::borrow::Cow;
+use std::fmt::Debug;
 
 use failure::Error;
 use time::{get_time, Timespec};
@@ -15,6 +16,7 @@ use control::*;
 use overlay::*;
 use types;
 use types::*;
+use cache::CacheLayer;
 use utility::OpenHandleSet;
 
 lazy_static! {
@@ -31,27 +33,27 @@ lazy_static! {
     ];
 }
 
-type Cache = HashFileCache;
-
 #[derive(Debug)]
-enum OpenObject {
-    File(ControlFile<FilesystemOverlay<Cache>>),
+enum OpenObject<C> where C: CacheLayer+Debug+'static {
+    File(ControlFile<FilesystemOverlay<C>>),
     Directory(Vec<OverlayDirEntry>),
 }
 
-struct FsState {
-    overlay: ControlDir<FilesystemOverlay<Cache>>,
-    open_handles: OpenHandleSet<OpenObject>
+struct FsState<C> where C: CacheLayer+Debug+'static {
+    overlay: ControlDir<FilesystemOverlay<C>>,
+    open_handles: OpenHandleSet<OpenObject<C>>
 }
 
-pub struct DorkFS {
-    state: RwLock<FsState>,
+pub struct DorkFS<C> where C: CacheLayer+Debug+'static {
+    state: RwLock<FsState<C>>,
     uid: u32,
     gid: u32,
     umask: u16
 }
 
-impl FilesystemMT for DorkFS {
+impl<C> FilesystemMT for DorkFS<C> where
+    C: CacheLayer+Debug+Send+Sync,
+    <C as CacheLayer>::File: Send+Sync+'static {
     fn init(&self, _req: RequestInfo) -> ResultEmpty {
         Ok(())
     }
@@ -338,7 +340,9 @@ impl FilesystemMT for DorkFS {
 }
 
 
-impl DorkFS {
+impl<C> DorkFS<C> where
+    C: CacheLayer+Debug+Send+Sync+'static,
+    <C as CacheLayer>::File: Send+Sync+'static {
     fn is_writable(flags: u32) -> bool {
         ((flags as libc::c_int & libc::O_RDWR) != 0) ||
             ((flags as libc::c_int & libc::O_WRONLY) != 0)
@@ -352,7 +356,7 @@ impl DorkFS {
         Self::octal_to_val(u, g, o) & (!self.umask)
     }
 
-    pub fn with_overlay(overlay: FilesystemOverlay<Cache>,
+    pub fn with_overlay(overlay: FilesystemOverlay<C>,
                         uid: u32,
                         gid: u32,
                         umask: u16) -> Result<Self, Error> {

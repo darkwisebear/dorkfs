@@ -1,7 +1,7 @@
 use std::path::{Component, Path};
 use std::ffi::OsStr;
 use std::io;
-use std::fmt::{Display, Formatter, self};
+use std::fmt::{Debug, Display, Formatter, self};
 use std::fs;
 use std::result;
 use std::string::ToString;
@@ -291,8 +291,8 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
 }
 
 pub trait CacheLayer {
-    type File: ReadonlyFile;
-    type Directory: Directory;
+    type File: ReadonlyFile+Debug;
+    type Directory: Directory+Debug;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;

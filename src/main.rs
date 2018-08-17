@@ -29,11 +29,13 @@ mod hashfilecache;
 
 use std::path::Path;
 use std::str::FromStr;
+use std::fmt::Debug;
 
 use failure::Error;
 
 use hashfilecache::HashFileCache;
 use overlay::FilesystemOverlay;
+use cache::CacheLayer;
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
@@ -128,11 +130,14 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_fuse(mountpoint: &str,
-              overlay: overlay::FilesystemOverlay<HashFileCache>,
-              uid: u32,
-              gid: u32,
-              umask: u16) {
+fn mount_fuse<C>(
+    mountpoint: &str,
+    overlay: overlay::FilesystemOverlay<C>,
+    uid: u32,
+    gid: u32,
+    umask: u16)
+    where C: CacheLayer+Debug+'static+Send+Sync,
+          <C as CacheLayer>::File: 'static+Send+Sync {
     let dorkfs = fuse::DorkFS::with_overlay(overlay, uid, gid, umask).unwrap();
     dorkfs.mount(mountpoint).unwrap();
 }
