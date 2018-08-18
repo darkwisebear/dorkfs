@@ -3,6 +3,8 @@ use std::io::{self, Read, Seek, SeekFrom, Cursor};
 use std::vec;
 use std::sync::{Arc, Weak, Mutex, mpsc::channel};
 use std::str;
+use std::collections::HashMap;
+use std::default::Default;
 
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Chunk, Body, body::Payload, Request, Client, client:: HttpConnector};
@@ -110,7 +112,8 @@ pub struct Github {
     repo: String,
     token: String,
     tokio: Arc<Runtime>,
-    http_client: Client<HttpsConnector<HttpConnector>>
+    http_client: Client<HttpsConnector<HttpConnector>>,
+    query_cache: Mutex<HashMap<CacheRef, GraphQLQueryResponse>>
 }
 
 mod restv3 {
@@ -399,7 +402,8 @@ impl Github {
             repo: repo.to_string(),
             token: token.to_string(),
             tokio,
-            http_client
+            http_client,
+            query_cache: Default::default()
         })
     }
 
@@ -433,7 +437,7 @@ impl Github {
         }
     }
 
-    fn query_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
+    fn fetch_remote_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
         -> cache::Result<GraphQLQueryResponse> {
         let query = format!("{{\"query\":\" \
 query {{ \
@@ -495,11 +499,29 @@ query {{ \
             });
         }
 
+        Ok(get_response)
+    }
+
+    fn query_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
+        -> cache::Result<GraphQLQueryResponse> {
+        use std::collections::hash_map::Entry;
+
+        let mut cache =
+            self.query_cache.lock().unwrap();
+        let get_response = match cache.entry(*cache_ref) {
+                Entry::Occupied(occupied) => occupied.into_mut(),
+                Entry::Vacant(vacant) => {
+                    let fetched_obj =
+                        self.fetch_remote_object(cache_ref, get_blob_contents)?;
+                    vacant.insert(fetched_obj)
+                }
+        };
+
         if get_blob_contents {
-            self.ensure_blob_data(cache_ref, &mut get_response)?;
+            self.ensure_blob_data(cache_ref, get_response)?;
         }
 
-        Ok(get_response)
+        Ok(get_response.clone())
     }
 
     fn ensure_blob_data(&self, cache_ref: &CacheRef, response: &mut GraphQLQueryResponse)

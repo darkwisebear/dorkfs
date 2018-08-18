@@ -65,7 +65,7 @@ impl<E: LayerError> From<E> for CacheError {
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct CacheRef(pub [u8; 32]);
 
 impl Display for CacheRef {
