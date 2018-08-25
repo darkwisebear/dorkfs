@@ -554,9 +554,11 @@ query {{ \
 
     fn issue_request(&self, mut request_builder: request::Builder, body: Body)
         -> cache::Result<String> {
+        let user_agent = format!("dorkfs/{}",
+                                 option_env!("CARGO_PKG_VERSION").unwrap_or("(unknown)"));
         let request = request_builder
             .header("Authorization", format!("Bearer {}", &self.token).as_str())
-            .header("User-Agent", "dorkfs/0.1.0")
+            .header("User-Agent", user_agent)
             .body(body).unwrap();
 
         let (send, recv) = channel();
