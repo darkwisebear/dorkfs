@@ -74,7 +74,7 @@ impl From<hyper::Error> for Error {
 
 #[derive(Debug)]
 pub struct GithubBlob {
-    data: Cursor<Vec<u8>>
+    data: Cursor<Arc<[u8]>>
 }
 
 impl Read for GithubBlob {
@@ -129,6 +129,8 @@ mod graphql {
     use std::str::FromStr;
     use std::io::Cursor;
     use std::fmt::{self, Formatter};
+    use std::sync::Arc;
+
     use cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType};
     use failure::Error;
     use serde::{Deserializer, de::Visitor};
@@ -181,8 +183,8 @@ mod graphql {
 
         #[serde(rename_all = "camelCase")]
         Blob {
-            #[serde(default, deserialize_with = "vec_u8_from_string")]
-            text: Option<Vec<u8>>,
+            #[serde(default, deserialize_with = "arc_u8_from_string")]
+            text: Option<Arc<[u8]>>,
             is_truncated: bool,
             byte_size: usize,
             #[serde(flatten)]
@@ -195,19 +197,19 @@ mod graphql {
         }
     }
 
-    fn vec_u8_from_string<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    fn arc_u8_from_string<'de, D>(deserializer: D) -> Result<Option<Arc<[u8]>>, D::Error>
         where D: Deserializer<'de> {
         struct StringToVecVisitor;
 
         impl<'de> Visitor<'de> for StringToVecVisitor {
-            type Value = Option<Vec<u8>>;
+            type Value = Option<Arc<[u8]>>;
 
             fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
                 write!(formatter, "Just. A. String.")
             }
 
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
-                Ok(Some(v.into_bytes()))
+                Ok(Some(v.into_bytes().into()))
             }
         }
 
@@ -531,7 +533,7 @@ query {{ \
                         ref mut is_truncated, ..
                     }) = response.data.repository.object {
             if text.is_none() || *is_truncated {
-                *text = Some(self.get_blob_data(cache_ref)?);
+                *text = Some(self.get_blob_data(cache_ref)?.into());
                 *is_truncated = false;
             }
         }
