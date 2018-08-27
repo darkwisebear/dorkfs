@@ -10,7 +10,7 @@ use tiny_keccak::Keccak;
 use serde_json;
 
 use cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
-            CacheObject, CacheObjectMetadata, ObjectType};
+            CacheObject, CacheObjectMetadata, ObjectType, Commit};
 
 #[derive(Debug)]
 pub struct HashFile {
@@ -87,7 +87,51 @@ impl CacheLayer for HashFileCache {
         Ok(cache_object)
     }
 
-    fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef> {
+    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
+        let mut file = self.open_object_file(cache_ref)?;
+        let size = file.metadata()?.len() - 1;
+        let object_type = Self::identify_object_type(&mut file)?;
+
+        let result = CacheObjectMetadata {
+            size,
+            object_type
+        };
+
+        Ok(result)
+    }
+
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef> {
+        self.create_file(source_path)
+            .and_then(|file| self.add(CacheObject::File(file)))
+    }
+
+    fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef> {
+        self.create_directory(items)
+            .and_then(|dir| self.add(CacheObject::Directory(dir)))
+    }
+
+    fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
+        self.add(CacheObject::Commit(commit))
+    }
+}
+
+
+impl HashFileCache {
+    pub fn new<P: AsRef<Path>>(cache_dir: P) -> Result<Self> {
+        let cache = HashFileCache {
+            base_path: Arc::new(cache_dir.as_ref().to_owned())
+        };
+
+        // Actually this could be omitted, but it will tell us early if the target location is
+        // accessible
+        cache.ensure_path("objects")?;
+        cache.ensure_path("staging")?;
+
+        Ok(cache)
+    }
+
+    fn add(&self, object: CacheObject<<Self as CacheLayer>::File, <Self as CacheLayer>::Directory>)
+        -> Result<CacheRef> {
         let obj_type = ObjectType::from(&object);
         let (mut target_file, rel_path) = self.create_staging_file(obj_type)?;
 
@@ -132,7 +176,7 @@ impl CacheLayer for HashFileCache {
         Ok(cache_ref)
     }
 
-    fn create_file<P: AsRef<Path>>(&self, source_path: P) -> Result<Self::File> {
+    fn create_file<P: AsRef<Path>>(&self, source_path: P) -> Result<<Self as CacheLayer>::File> {
         let file = fs::File::open(source_path)?;
         let hash_file = HashFile {
             file
@@ -142,41 +186,12 @@ impl CacheLayer for HashFileCache {
     }
 
     fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, entries: I)
-                                                          -> Result<Self::Directory> {
+        -> Result<<Self as CacheLayer>::Directory> {
         let dir = HashDirectory {
             entries: Vec::from_iter(entries)
         };
 
         Ok(dir)
-    }
-
-    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
-        let mut file = self.open_object_file(cache_ref)?;
-        let size = file.metadata()?.len() - 1;
-        let object_type = Self::identify_object_type(&mut file)?;
-
-        let result = CacheObjectMetadata {
-            size,
-            object_type
-        };
-
-        Ok(result)
-    }
-}
-
-
-impl HashFileCache {
-    pub fn new<P: AsRef<Path>>(cache_dir: P) -> Result<Self> {
-        let cache = HashFileCache {
-            base_path: Arc::new(cache_dir.as_ref().to_owned())
-        };
-
-        // Actually this could be omitted, but it will tell us early if the target location is
-        // accessible
-        cache.ensure_path("objects")?;
-        cache.ensure_path("staging")?;
-
-        Ok(cache)
     }
 
     fn ensure_path<P: AsRef<Path>>(&self, rel_path: P) -> Result<()> {

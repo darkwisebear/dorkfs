@@ -296,10 +296,9 @@ pub trait CacheLayer {
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;
-    fn add(&self, object: CacheObject<Self::File, Self::Directory>) -> Result<CacheRef>;
-    fn create_file<P: AsRef<Path>>(&self, source_path: P) -> Result<Self::File>;
-    fn create_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I)
-        -> Result<Self::Directory>;
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef>;
+    fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef>;
+    fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)

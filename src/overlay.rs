@@ -158,8 +158,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             let cache_ref  = self.generate_tree(dir_entry.path(), file_path)?;
             (cache_ref, cache::ObjectType::Directory)
         } else if file_type.is_file() {
-            let cache_file = self.cache.create_file(dir_entry.path())?;
-            let cache_ref = self.cache.add(CacheObject::File(cache_file))?;
+            let cache_ref = self.cache.add_file_by_path(dir_entry.path())?;
             (cache_ref, cache::ObjectType::File)
         } else {
             unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
@@ -227,9 +226,9 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             |e| {
                 self.dir_entry_to_directory_entry(e, file_path.as_ref())
             })?;
-        let directory = self.cache.create_directory(dir_entries.into_iter())?;
 
-        Ok(self.cache.add(CacheObject::Directory(directory))?)
+        let directory = dir_entries.into_iter();
+        self.cache.add_directory(directory).map_err(Into::into)
     }
 
     fn create_new_head_commit(&mut self, commit_ref: &CacheRef) -> Result<PathBuf, Error> {
@@ -343,7 +342,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
             message: message.to_owned()
         };
 
-        let new_commit_ref = self.cache.add(CacheObject::Commit(commit))?;
+        let new_commit_ref = self.cache.add_commit(commit)?;
 
         // Stage 1: create file "NEW_HEAD"
         let new_head_path = self.create_new_head_commit(&new_commit_ref)?;
