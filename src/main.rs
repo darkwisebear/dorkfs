@@ -33,6 +33,7 @@ mod utility;
 mod control;
 mod hashfilecache;
 mod github;
+mod nullcache;
 
 use std::path::Path;
 use std::str::FromStr;
@@ -155,17 +156,21 @@ fn mount_fuse<C>(
     dorkfs.mount(mountpoint).unwrap();
 }
 
-fn new_overlay<P: AsRef<Path>, S: AsRef<str>>(workspace: P, rooturl: S, rootrepo: S)
-    -> Result<FilesystemOverlay<github::Github>, Error> {
+fn new_overlay<P: AsRef<Path>, U: AsRef<str>, R: AsRef<str>>(workspace: P, rooturl: U, rootrepo: R)
+    -> Result<FilesystemOverlay<hashfilecache::HashFileCache<github::Github>>, Error> {
     let overlaydir = workspace.as_ref().join("overlay");
+    let cachedir = workspace.as_ref().join("cache");
+
     let baseurl = rooturl.as_ref().to_owned();
     let mut rootrepo_parts = rootrepo.as_ref().split('/');
     let org = rootrepo_parts.next().expect("Missing repo owner");
     let repo = rootrepo_parts.next().expect("Missing repo name");
     let token = ::std::env::var("GITHUB_TOKEN").unwrap();
     debug!("Connecting to GitHub at {} org {} repo {}", baseurl, org, repo);
-    let cache = github::Github::new(baseurl.as_str(), org, repo, token.as_str()).unwrap();
-    FilesystemOverlay::new(cache, overlaydir)
+    let github = github::Github::new(baseurl.as_str(), org, repo, token.as_str())?;
+
+    let cached_github = HashFileCache::new(github, cachedir)?;
+    FilesystemOverlay::new(cached_github, overlaydir)
 }
 
 pub fn init_logging() {

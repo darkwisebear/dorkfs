@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::borrow::{Cow, Borrow};
+use std::io::{self, Write};
+
 use failure::Error;
+use tiny_keccak::Keccak;
 
 pub fn os_string_to_string(s: OsString) -> Result<String, Error> {
     s.into_string()
@@ -79,5 +82,55 @@ impl<T: Debug> OpenHandleSet<T> {
                 self.object_names.remove(name.0.as_os_str());
                 obj
             })
+    }
+}
+
+pub struct HashWriter {
+    hasher: Keccak
+}
+
+impl HashWriter {
+    pub fn new() -> Self {
+        HashWriter {
+            hasher: Keccak::new_shake256()
+        }
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        let mut result = unsafe {
+            ::std::mem::uninitialized::<[u8; 32]>()
+        };
+        self.hasher.finalize(&mut result);
+        result
+    }
+}
+
+impl Into<[u8; 32]> for HashWriter {
+    fn into(self) -> [u8; 32] {
+        self.finish()
+    }
+}
+
+impl From<Keccak> for HashWriter {
+    fn from(hasher: Keccak) -> Self {
+        Self {
+            hasher
+        }
+    }
+}
+
+impl Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.hasher.update(buf);
+        Ok(())
     }
 }

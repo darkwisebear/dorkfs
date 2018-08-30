@@ -38,6 +38,9 @@ pub enum CacheError {
     #[fail(display = "Unparsable reference {}: {}", _0, _1)]
     UnparsableCacheRef(String, Error),
 
+    #[fail(display = "Object creation failed: read only cache layer")]
+    WriteProtectedError,
+
     #[fail(display = "Runtime error {}: {}", _0, _1)]
     Custom(&'static str, Error),
 

@@ -465,12 +465,14 @@ pub mod testutil {
     use hashfilecache::HashFileCache;
     use overlay::*;
     use std::io::{Read, Seek, SeekFrom};
+    use nullcache::NullCache;
 
-    pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache> {
+    pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache<NullCache>> {
         let cache_dir = path.as_ref().join("cache");
         let overlay_dir = path.as_ref().join("overlay");
 
-        let cache = HashFileCache::new(&cache_dir).expect("Unable to create cache");
+        let cache = HashFileCache::new(NullCache, &cache_dir)
+            .expect("Unable to create cache");
         FilesystemOverlay::new(cache, &overlay_dir)
             .expect("Unable to create overlay")
     }
