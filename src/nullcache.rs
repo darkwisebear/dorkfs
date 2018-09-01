@@ -54,7 +54,7 @@ impl CacheLayer for NullCache {
         Err(CacheError::ObjectNotFound(cache_ref.clone()))
     }
 
-    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef, CacheError> {
+    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef, CacheError> {
         let mut keccak = HashWriter::new();
 
         let mut file = File::open(source_path)?;
@@ -64,7 +64,8 @@ impl CacheLayer for NullCache {
         Ok(CacheRef(keccak.into()))
     }
 
-    fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef, CacheError> {
+    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>)
+        -> Result<CacheRef, CacheError> {
         let mut keccak = HashWriter::new();
 
         items.fold(Ok(0), |result, entry|

@@ -157,7 +157,7 @@ fn mount_fuse<C>(
 }
 
 fn new_overlay<P: AsRef<Path>, U: AsRef<str>, R: AsRef<str>>(workspace: P, rooturl: U, rootrepo: R)
-    -> Result<FilesystemOverlay<hashfilecache::HashFileCache<github::Github>>, Error> {
+    -> Result<FilesystemOverlay<cache::BoxedCacheLayer>, Error> {
     let overlaydir = workspace.as_ref().join("overlay");
     let cachedir = workspace.as_ref().join("cache");
 
@@ -170,7 +170,7 @@ fn new_overlay<P: AsRef<Path>, U: AsRef<str>, R: AsRef<str>>(workspace: P, rootu
     let github = github::Github::new(baseurl.as_str(), org, repo, token.as_str())?;
 
     let cached_github = HashFileCache::new(github, cachedir)?;
-    FilesystemOverlay::new(cached_github, overlaydir)
+    FilesystemOverlay::new(cache::boxed(cached_github), overlaydir)
 }
 
 pub fn init_logging() {

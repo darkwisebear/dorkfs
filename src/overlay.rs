@@ -158,7 +158,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             let cache_ref  = self.generate_tree(dir_entry.path(), file_path)?;
             (cache_ref, cache::ObjectType::Directory)
         } else if file_type.is_file() {
-            let cache_ref = self.cache.add_file_by_path(dir_entry.path())?;
+            let cache_ref = self.cache.add_file_by_path(&dir_entry.path())?;
             (cache_ref, cache::ObjectType::File)
         } else {
             unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
@@ -227,8 +227,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 self.dir_entry_to_directory_entry(e, file_path.as_ref())
             })?;
 
-        let directory = dir_entries.into_iter();
-        self.cache.add_directory(directory).map_err(Into::into)
+        let mut directory = dir_entries.into_iter();
+        self.cache.add_directory(&mut directory).map_err(Into::into)
     }
 
     fn create_new_head_commit(&mut self, commit_ref: &CacheRef) -> Result<PathBuf, Error> {

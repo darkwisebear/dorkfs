@@ -109,16 +109,16 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         Ok(result)
     }
 
-    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef> {
+    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
         let cache_ref = self.cache.add_file_by_path(&source_path)?;
         let mut source_file = fs::File::open(source_path)?;
         self.store_file(&cache_ref, source_file)?;
         Ok(cache_ref)
     }
 
-    fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef> {
+    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
         let entries = Vec::from_iter(items);
-        let cache_ref = self.cache.add_directory(entries.iter().cloned())?;
+        let cache_ref = self.cache.add_directory(&mut entries.iter().cloned())?;
 
         let hash_dir = HashDirectory { entries };
         self.store_json(&cache_ref, &hash_dir, ObjectType::Directory)?;

@@ -332,11 +332,11 @@ impl CacheLayer for Github {
         Ok(metadata)
     }
 
-    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> cache::Result<CacheRef> {
+    fn add_file_by_path(&self, source_path: &Path) -> cache::Result<CacheRef> {
         unimplemented!()
     }
 
-    fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> cache::Result<CacheRef> {
+    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> cache::Result<CacheRef> {
         unimplemented!()
     }
 
