@@ -182,7 +182,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         // Get the directory contents from the cache if it's already there
         let dir_entries_result: Result<HashSet<T>, Error> =
             if let Some(cache_dir_ref) = self.resolve_object_ref(path.as_ref())? {
-                debug!("Reading dir {:?} from cache", path.as_ref());
+                debug!("Reading dir {:?} with ref {} from cache", path.as_ref(), &cache_dir_ref);
                 let dir = self.cache.get(&cache_dir_ref)?.into_directory()?;
                 dir.into_iter().map(|e| from_directory_entry(e)).collect()
             } else {
