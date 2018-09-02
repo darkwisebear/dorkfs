@@ -97,16 +97,23 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
     }
 
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
-        let mut file = self.open_object_file(cache_ref)?;
-        let size = file.metadata()?.len() - 1;
-        let object_type = Self::identify_object_type(&mut file)?;
+        match self.open_object_file(cache_ref) {
+            Ok(mut file) => {
+                let size = file.metadata()?.len() - 1;
+                let object_type = Self::identify_object_type(&mut file)?;
 
-        let result = CacheObjectMetadata {
-            size,
-            object_type
-        };
+                let result = CacheObjectMetadata {
+                    size,
+                    object_type
+                };
 
-        Ok(result)
+                Ok(result)
+            }
+
+            Err(CacheError::ObjectNotFound(_)) => self.cache.metadata(cache_ref),
+
+            Err(e) => Err(e)
+        }
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
