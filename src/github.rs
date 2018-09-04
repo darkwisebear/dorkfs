@@ -4,6 +4,7 @@ use std::vec;
 use std::sync::{Arc, Weak, Mutex, mpsc::channel};
 use std::str;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::default::Default;
 
 use http::{uri::InvalidUri, request};
@@ -113,7 +114,7 @@ pub struct Github {
     token: String,
     tokio: Arc<Runtime>,
     http_client: Client<HttpsConnector<HttpConnector>>,
-    query_cache: Mutex<HashMap<CacheRef, GraphQLQueryResponse>>
+    query_cache: Mutex<HashMap<CacheRef, graphql::GitObject>>
 }
 
 mod restv3 {
@@ -145,6 +146,21 @@ mod graphql {
     #[derive(Debug, Clone, Deserialize)]
     pub struct GitObjectId {
         pub oid: String
+    }
+
+    impl GitObjectId {
+        pub fn try_into_cache_ref(mut self) -> Result<CacheRef, Error> {
+            self.oid.push_str("000000000000000000000000");
+            CacheRef::from_str(self.oid.as_str())
+        }
+    }
+
+    impl From<CacheRef> for GitObjectId {
+        fn from(cache_ref: CacheRef) -> Self {
+            let mut oid = cache_ref.to_string();
+            oid.truncate(40);
+            Self { oid }
+        }
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -216,11 +232,6 @@ mod graphql {
         deserializer.deserialize_string(StringToVecVisitor)
     }
 
-    pub fn oid_string_to_cache_ref(mut oid_string: String) -> Result<CacheRef, Error> {
-        oid_string.push_str("000000000000000000000000");
-        CacheRef::from_str(oid_string.as_str())
-    }
-
     pub fn object_to_object_type(object: &GitObject) -> ObjectType {
         match *object {
             GitObject::Commit { .. } => ObjectType::Commit,
@@ -237,11 +248,11 @@ mod graphql {
                     parents: Some(parents),
                     message: Some(message), ..
                 } => {
-                    let cache_ref = oid_string_to_cache_ref(tree.oid)?;
+                    let cache_ref = tree.try_into_cache_ref()?;
                     let converted_parents =
                         parents.nodes.into_iter()
                             .map(|parent|
-                                oid_string_to_cache_ref(parent.oid));
+                                parent.try_into_cache_ref());
                     let commit = Commit {
                         tree: cache_ref,
                         parents: converted_parents.collect::<Result<Vec<CacheRef>, Error>>()?,
@@ -268,7 +279,7 @@ mod graphql {
                     let dir
                     = entries.into_iter().map(|entry| -> Result<DirectoryEntry, Error> {Ok(DirectoryEntry {
                         name: entry.name,
-                        cache_ref: oid_string_to_cache_ref(entry.oid.oid)?,
+                        cache_ref: entry.oid.try_into_cache_ref()?,
                         object_type: object_to_object_type(&entry.object),
                     })});
                     let dir_vec = dir.collect::<Result<_, Error>>()?;
@@ -308,18 +319,13 @@ impl CacheLayer for Github {
 
     fn get(&self, cache_ref: &CacheRef)
            -> cache::Result<CacheObject<Self::File, Self::Directory>> {
-        let get_response = self.query_object(cache_ref, true)?;
-        let cache_obj: Result<_, _> =
-            get_response.data.repository.object
-                .ok_or(Error::UnexpectedGraphQlResponse("Missing object"))?
-                .into();
+        let object = self.query_object(cache_ref, true)?;
+        let cache_obj: Result<_, _> = object.into();
         Ok(cache_obj.unwrap())
     }
 
     fn metadata(&self, cache_ref: &CacheRef) -> cache::Result<CacheObjectMetadata> {
-        let get_response = self.query_object(cache_ref, false)?;
-        let object = get_response.data.repository.object
-            .ok_or(Error::UnexpectedGraphQlResponse("Missing object"))?;
+        let object = self.query_object(cache_ref, false)?;
         let metadata = CacheObjectMetadata {
             object_type: graphql::object_to_object_type(
                 &object),
@@ -365,7 +371,7 @@ query {{ \
             .target;
 
         if let graphql::GitObject::Commit { oid: Some(oid), .. } = head_commit_object {
-            graphql::oid_string_to_cache_ref(oid.oid)
+            oid.try_into_cache_ref()
                 .map(Some)
                 .map_err(|e| CacheError::Custom("Unparsable OID string", e))
         } else {
@@ -493,45 +499,61 @@ query {{ \
         let mut get_response: GraphQLQueryResponse = from_json_str(response.as_str())?;
         debug!("Parsed response: {:?}", get_response);
 
+        // If we've received a blob, set its oid since we may need it to get the object's
+        // contents later
         if let Some(graphql::GitObject::Blob { ref mut oid, .. }) = get_response.data.repository.object {
-            let mut oid_string = cache_ref.to_string();
-            oid_string.truncate(40);
-            *oid = Some(graphql::GitObjectId {
-                oid: oid_string
-            });
+            *oid = Some(graphql::GitObjectId::from(*cache_ref));
         }
 
         Ok(get_response)
     }
 
     fn query_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
-        -> cache::Result<GraphQLQueryResponse> {
-        use std::collections::hash_map::Entry;
-
+        -> cache::Result<graphql::GitObject> {
         let mut cache =
             self.query_cache.lock().unwrap();
-        let get_response = match cache.entry(*cache_ref) {
+        let obj = {
+            let obj = match cache.entry(*cache_ref) {
                 Entry::Occupied(occupied) => occupied.into_mut(),
                 Entry::Vacant(vacant) => {
                     let fetched_obj =
                         self.fetch_remote_object(cache_ref, get_blob_contents)?;
-                    vacant.insert(fetched_obj)
+                    let obj = fetched_obj.data.repository.object
+                        .ok_or(Error::UnexpectedGraphQlResponse("Missing object"))?;
+                    vacant.insert(obj)
                 }
+            };
+
+            if get_blob_contents {
+                self.ensure_blob_data(cache_ref, obj)?;
+            }
+
+            obj.clone()
         };
 
-        if get_blob_contents {
-            self.ensure_blob_data(cache_ref, get_response)?;
+        // If we've received a tree we extract the entries so that we don't have to query them
+        // again if we need their metadata
+        if let graphql::GitObject::Tree { ref entries } = obj {
+            for tree_entry in entries {
+                let cache_ref =
+                    tree_entry.oid.clone().try_into_cache_ref()
+                        .map_err(|e| CacheError::Custom(
+                            "Unable to convert the oid to a CacheRef", e))?;
+                if let Entry::Vacant(cache_entry) = cache.entry(cache_ref) {
+                    cache_entry.insert(tree_entry.object.clone());
+                }
+            }
         }
 
-        Ok(get_response.clone())
+        Ok(obj)
     }
 
-    fn ensure_blob_data(&self, cache_ref: &CacheRef, response: &mut GraphQLQueryResponse)
+    fn ensure_blob_data(&self, cache_ref: &CacheRef, object: &mut graphql::GitObject)
         -> cache::Result<()> {
-        if let Some(graphql::GitObject::Blob {
+        if let graphql::GitObject::Blob {
                         ref mut text,
                         ref mut is_truncated, ..
-                    }) = response.data.repository.object {
+                    } = object {
             if text.is_none() || *is_truncated {
                 *text = Some(self.get_blob_data(cache_ref)?.into());
                 *is_truncated = false;
