@@ -209,7 +209,7 @@ mod graphql {
 
         Tree {
             #[serde(default)]
-            entries: Vec<TreeEntry>
+            entries: Option<Vec<TreeEntry>>
         }
     }
 
@@ -277,11 +277,14 @@ mod graphql {
 
                 GitObject::Tree { entries } => {
                     let dir
-                    = entries.into_iter().map(|entry| -> Result<DirectoryEntry, Error> {Ok(DirectoryEntry {
-                        name: entry.name,
-                        cache_ref: entry.oid.try_into_cache_ref()?,
-                        object_type: object_to_object_type(&entry.object),
-                    })});
+                        = entries.unwrap_or_default().into_iter().map(
+                            |entry| -> Result<DirectoryEntry, Error> {
+                                Ok(DirectoryEntry {
+                                    name: entry.name,
+                                    cache_ref: entry.oid.try_into_cache_ref()?,
+                                    object_type: object_to_object_type(&entry.object),
+                                })
+                            });
                     let dir_vec = dir.collect::<Result<_, Error>>()?;
                     Ok(CacheObject::Directory(GithubTree(dir_vec)))
                 }
@@ -331,7 +334,8 @@ impl CacheLayer for Github {
                 &object),
             size: match object {
                 graphql::GitObject::Blob { byte_size, .. } => byte_size as u64,
-                graphql::GitObject::Tree { ref entries } => entries.len() as u64,
+                graphql::GitObject::Tree { entries: Some(ref entries) } => entries.len() as u64,
+                graphql::GitObject::Tree { entries: None } => 0u64,
                 graphql::GitObject::Commit { .. } => 0u64
             }
         };
@@ -515,6 +519,7 @@ query {{ \
         let obj = {
             let obj = match cache.entry(*cache_ref) {
                 Entry::Occupied(occupied) => occupied.into_mut(),
+
                 Entry::Vacant(vacant) => {
                     let fetched_obj =
                         self.fetch_remote_object(cache_ref, get_blob_contents)?;
@@ -525,7 +530,7 @@ query {{ \
             };
 
             if get_blob_contents {
-                self.ensure_blob_data(cache_ref, obj)?;
+                self.ensure_git_object_data(cache_ref, obj)?;
             }
 
             obj.clone()
@@ -533,7 +538,7 @@ query {{ \
 
         // If we've received a tree we extract the entries so that we don't have to query them
         // again if we need their metadata
-        if let graphql::GitObject::Tree { ref entries } = obj {
+        if let graphql::GitObject::Tree { entries: Some(ref entries) } = obj {
             for tree_entry in entries {
                 let cache_ref =
                     tree_entry.oid.clone().try_into_cache_ref()
@@ -548,16 +553,42 @@ query {{ \
         Ok(obj)
     }
 
-    fn ensure_blob_data(&self, cache_ref: &CacheRef, object: &mut graphql::GitObject)
+    fn ensure_git_object_data(&self, cache_ref: &CacheRef, object: &mut graphql::GitObject)
         -> cache::Result<()> {
-        if let graphql::GitObject::Blob {
-                        ref mut text,
-                        ref mut is_truncated, ..
-                    } = object {
-            if text.is_none() || *is_truncated {
-                *text = Some(self.get_blob_data(cache_ref)?.into());
-                *is_truncated = false;
+        match object {
+            graphql::GitObject::Blob {
+                ref mut text,
+                ref mut is_truncated, ..
+            } => {
+                if text.is_none() || *is_truncated {
+                    *text = Some(self.get_blob_data(cache_ref)?.into());
+                    *is_truncated = false;
+                }
             }
+
+            // If the cached tree is missing its entries we add them directly to the cached
+            // tree object
+            graphql::GitObject::Tree { entries: None } => {
+                let fetched_obj =
+                    self.fetch_remote_object(cache_ref, false)?;
+                *object = fetched_obj.data.repository.object
+                    .ok_or(Error::UnexpectedGraphQlResponse("Missing object"))?;
+
+                // Check if we received what we expected
+                match object {
+                    graphql::GitObject::Tree { entries: Some(_) } => (), // We're cool
+                    graphql::GitObject::Tree { entries: None } =>
+                        return Err(Error::UnexpectedGraphQlResponse(
+                            "No entries received in tree").into()),
+                    _ => {
+                        error!("Unexpected object {:?}", *object);
+                        return Err(Error::UnexpectedGraphQlResponse(
+                            "Unexpectedly not receiving a tree object").into())
+                    }
+                }
+            }
+
+            _ => ()
         }
 
         Ok(())
