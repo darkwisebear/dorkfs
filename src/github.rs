@@ -686,4 +686,40 @@ mod test {
         obj.into_file().unwrap().read_to_string(&mut contents).unwrap();
         assert_eq!(contents.into_bytes(), explicit_get);
     }
+
+    #[test]
+    fn empty_vs_missing_tree_entries() {
+        use serde_json;
+        use super::graphql::GitObject;
+        // TODO: Add test that checks if present (but emtpy) tree entries are correctly deserialized
+        // We expect this to be deserialized as Some(vec![])
+        let test1 = r#"{ "__typename": "Tree", "entries": [] }"#;
+        let test2 = r#"{ "__typename": "Tree", "entries": [{ "name": "test",
+        "mode": 33188, "oid": "77bd95d183dbe757ebd53c0aa95d1a710b85460f", "object":
+        { "__typename": "Blob", "isTruncated": false, "byteSize": 123 } }] }"#;
+        let test3 = r#"{ "__typename": "Tree" }"#;
+
+        let test1_parsed: GitObject = serde_json::from_str(test1).unwrap();
+        let test2_parsed: GitObject = serde_json::from_str(test2).unwrap();
+        let test3_parsed: GitObject = serde_json::from_str(test3).unwrap();
+
+        if let GitObject::Tree { entries: Some(v) } = test1_parsed {
+            assert_eq!(0, v.len());
+        } else {
+            panic!("Unexpected deserialization result: {:?}", test1_parsed);
+        }
+
+        if let GitObject::Tree { entries: Some(v) } = test2_parsed {
+            assert_eq!("77bd95d183dbe757ebd53c0aa95d1a710b85460f", v[0].oid.oid.as_str());
+            assert_eq!("test", v[0].name);
+        } else {
+            panic!("Unexpected deserialization result: {:?}", test3_parsed);
+        }
+
+        if let GitObject::Tree { entries: None } = test3_parsed {
+
+        } else {
+            panic!("Unexpected deserialization result: {:?}", test3_parsed);
+        }
+    }
 }
