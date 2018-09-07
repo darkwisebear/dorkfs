@@ -2,7 +2,6 @@ use std::path::{Component, Path};
 use std::ffi::OsStr;
 use std::io;
 use std::fmt::{Debug, Display, Formatter, self};
-use std::fs;
 use std::result;
 use std::string::ToString;
 use std::str::FromStr;
@@ -189,25 +188,6 @@ impl<'a, F: ReadonlyFile, D: Directory> From<&'a CacheObject<F, D>> for ObjectTy
     }
 }
 
-impl ObjectType {
-    pub fn as_identifier(&self) -> &'static [u8; 1] {
-        match *self {
-            ObjectType::File => &[b'F'],
-            ObjectType::Directory => &[b'D'],
-            ObjectType::Commit => &[b'C']
-        }
-    }
-
-    pub fn from_identifier(id: &[u8; 1]) -> Result<ObjectType> {
-        match id[0] {
-            b'F' => Ok(ObjectType::File),
-            b'D' => Ok(ObjectType::Directory),
-            b'C' => Ok(ObjectType::Commit),
-            obj_type => Err(CacheError::UnknownObjectType(obj_type))
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -266,7 +246,7 @@ pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     Commit(Commit),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CacheObjectMetadata {
     pub size: u64,
     pub object_type: ObjectType
@@ -472,7 +452,7 @@ mod test {
     #[test]
     fn check_thread_safety() {
         use nullcache::NullCache;
-        use super::{boxed, BoxedCacheLayer, CacheLayer};
+        use super::{boxed, CacheLayer};
 
         fn bounds_test<F: FnOnce()+Send+Sync+'static>(f: F) {
             f()

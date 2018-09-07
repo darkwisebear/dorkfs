@@ -11,7 +11,72 @@ use serde_json;
 use serde::Serialize;
 
 use cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
-            CacheObject, CacheObjectMetadata, ObjectType, Commit};
+            CacheObject, ObjectType, CacheObjectMetadata, Commit};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileMetadata {
+    size: u64,
+    objtype: char
+}
+
+impl From<CacheObjectMetadata> for FileMetadata {
+    fn from(val: CacheObjectMetadata) -> Self {
+        FileMetadata {
+            size: val.size,
+            objtype: CacheFileType::from(val.object_type).as_identifier().into()
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CacheFileType {
+    File,
+    Directory,
+    Commit,
+    Metadata
+}
+
+impl CacheFileType {
+    fn from_identifier(id: u8) -> Result<Self> {
+        match id {
+            b'F' => Ok(CacheFileType::File),
+            b'M' => Ok(CacheFileType::Metadata),
+            b'D' => Ok(CacheFileType::Directory),
+            b'C' => Ok(CacheFileType::Commit),
+            _ => Err(CacheError::UnknownObjectType(id))
+        }
+    }
+
+    fn try_into_object_type(self) -> Result<ObjectType> {
+        match self {
+            CacheFileType::File => Ok(ObjectType::File),
+            CacheFileType::Directory => Ok(ObjectType::Directory),
+            CacheFileType::Commit => Ok(ObjectType::Commit),
+            CacheFileType::Metadata => Err(CacheError::LayerError(
+                format_err!("Unexpected cache file type!")))
+
+        }
+    }
+
+    fn as_identifier(&self) -> u8 {
+        match self {
+            CacheFileType::File => b'F',
+            CacheFileType::Metadata => b'M',
+            CacheFileType::Directory => b'D',
+            CacheFileType::Commit => b'C'
+        }
+    }
+}
+
+impl From<ObjectType> for CacheFileType {
+    fn from(val: ObjectType) -> Self {
+        match val {
+            ObjectType::File => CacheFileType::File,
+            ObjectType::Directory => CacheFileType::Directory,
+            ObjectType::Commit => CacheFileType::Commit
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct HashFile {
@@ -63,8 +128,9 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
     type Directory = HashDirectory;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
-        match self.open_object_file(cache_ref) {
-            Ok(file) => Self::load_cache_object(file),
+        match self.open_object_file(cache_ref)
+            .and_then(|f| Self::load_cache_object(f, *cache_ref)) {
+            Ok(object) => Ok(object),
 
             Err(CacheError::ObjectNotFound(_)) => {
                 let mut upstream_object =
@@ -82,12 +148,12 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
                         let hash_dir = HashDirectory {
                             entries: Vec::from_iter(dir.clone().into_iter())
                         };
-                        self.store_json(cache_ref, &hash_dir, ObjectType::Directory)
+                        self.store_json(cache_ref, &hash_dir, CacheFileType::Directory)
                             .map(|_| CacheObject::Directory(hash_dir))
                     }
 
                     CacheObject::Commit(ref commit) =>
-                        self.store_json(cache_ref, commit, ObjectType::Commit)
+                        self.store_json(cache_ref, commit, CacheFileType::Commit)
                             .map(|_| CacheObject::Commit(commit.clone()))
                 }
             }
@@ -99,18 +165,43 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
         match self.open_object_file(cache_ref) {
             Ok(mut file) => {
-                let size = file.metadata()?.len() - 1;
-                let object_type = Self::identify_object_type(&mut file)?;
+                let cache_file_type = Self::identify_object_type(&mut file)?;
+                let result = match cache_file_type {
+                    CacheFileType::Metadata => {
+                        let metadata: FileMetadata = serde_json::from_reader(file)?;
+                        let cache_file_type = CacheFileType::from_identifier(metadata.objtype as u8)?;
+                        CacheObjectMetadata {
+                            size: metadata.size,
+                            object_type: cache_file_type.try_into_object_type()?
+                        }
+                    }
 
-                let result = CacheObjectMetadata {
-                    size,
-                    object_type
+                    CacheFileType::File |
+                    CacheFileType::Directory |
+                    CacheFileType::Commit => {
+                        let size = file.metadata()?.len() - 1;
+                        CacheObjectMetadata {
+                            size,
+                            object_type: cache_file_type.try_into_object_type().unwrap()
+                        }
+                    }
                 };
 
                 Ok(result)
             }
 
-            Err(CacheError::ObjectNotFound(_)) => self.cache.metadata(cache_ref),
+            Err(CacheError::ObjectNotFound(_)) => {
+                let cache_metadata = self.cache.metadata(cache_ref)?;
+
+                let file_metadata = FileMetadata::from(cache_metadata.clone());
+                if let Err(e) = self.store_json(cache_ref,
+                                                &file_metadata,
+                                                CacheFileType::Metadata) {
+                    warn!("Unable to store metadata: {}", e);
+                }
+
+                Ok(cache_metadata)
+            }
 
             Err(e) => Err(e)
         }
@@ -118,7 +209,7 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
 
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
         let cache_ref = self.cache.add_file_by_path(&source_path)?;
-        let mut source_file = fs::File::open(source_path)?;
+        let source_file = fs::File::open(source_path)?;
         self.store_file(&cache_ref, source_file)?;
         Ok(cache_ref)
     }
@@ -128,13 +219,13 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         let cache_ref = self.cache.add_directory(&mut entries.iter().cloned())?;
 
         let hash_dir = HashDirectory { entries };
-        self.store_json(&cache_ref, &hash_dir, ObjectType::Directory)?;
+        self.store_json(&cache_ref, &hash_dir, CacheFileType::Directory)?;
         Ok(cache_ref)
     }
 
     fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
         let cache_ref = self.cache.add_commit(commit.clone())?;
-        self.store_json(&cache_ref, &commit, ObjectType::Commit)?;
+        self.store_json(&cache_ref, &commit, CacheFileType::Commit)?;
         Ok(cache_ref)
     }
 
@@ -180,19 +271,6 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         Ok(())
     }
 
-    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
-        let mut file = self.open_object_file(cache_ref)?;
-        let size = file.metadata()?.len() - 1;
-        let object_type = Self::identify_object_type(&mut file)?;
-
-        let result = CacheObjectMetadata {
-            size,
-            object_type
-        };
-
-        Ok(result)
-    }
-
     fn ensure_path<P: AsRef<Path>>(&self, rel_path: P) -> Result<()> {
         let full_path = self.base_path.join(rel_path);
         debug!("Ensuring path {}", full_path.display());
@@ -222,7 +300,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         Path::new("staging").join(rand_name)
     }
 
-    fn create_staging_file(&self, object_type: ObjectType) -> Result<(fs::File, PathBuf)> {
+    fn create_staging_file(&self, object_type: CacheFileType) -> Result<(fs::File, PathBuf)> {
         self.ensure_path("staging")?;
         let rel_path = Self::generate_staging_path();
         let full_path = self.base_path.join(&rel_path);
@@ -234,7 +312,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
             .write(true)
             .open(full_path)?;
 
-        file.write(object_type.as_identifier())?;
+        file.write(&[object_type.as_identifier()])?;
 
         Ok((file, rel_path))
     }
@@ -251,39 +329,41 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         }
     }
 
-    fn identify_object_type<R: Read>(object_file: &mut R) -> Result<ObjectType> {
+    fn identify_object_type<R: Read>(object_file: &mut R) -> Result<CacheFileType> {
         let mut objtype_identifier = [0u8; 1];
         object_file.read_exact(&mut objtype_identifier)?;
-        ObjectType::from_identifier(&objtype_identifier)
+        CacheFileType::from_identifier(objtype_identifier[0])
     }
 
-    fn load_cache_object(mut file: fs::File) -> Result<CacheObject<HashFile, HashDirectory>> {
+    fn load_cache_object(mut file: fs::File, cache_ref: CacheRef)
+        -> Result<CacheObject<HashFile, HashDirectory>> {
         let objtype = Self::identify_object_type(&mut file)?;
-        let cache_object = match objtype {
-            ObjectType::File => {
+        match objtype {
+            CacheFileType::File => {
                 let hash_file = HashFile {
                     file
                 };
 
-                CacheObject::File(hash_file)
+                Ok(CacheObject::File(hash_file))
             }
 
-            ObjectType::Directory => {
+            CacheFileType::Directory => {
                 let hash_dir = serde_json::from_reader(file)?;
-                CacheObject::Directory(hash_dir)
+                Ok(CacheObject::Directory(hash_dir))
             }
 
-            ObjectType::Commit => {
+            CacheFileType::Commit => {
                 let commit = serde_json::from_reader(file)?;
-                CacheObject::Commit(commit)
+                Ok(CacheObject::Commit(commit))
             }
-        };
-        Ok(cache_object)
+
+            CacheFileType::Metadata => Err(CacheError::ObjectNotFound(cache_ref))
+        }
     }
 
     fn store_file<R: Read>(&self, cache_ref: &CacheRef, mut source: R) -> Result<fs::File> {
         let (mut target_file, rel_path) =
-            self.create_staging_file(ObjectType::File)?;
+            self.create_staging_file(CacheFileType::File)?;
         // TODO: Use CoW if possible
         let copied = io::copy(&mut source, &mut target_file)?;
         debug!("Bytes copied to staging file: {}", copied);
@@ -291,7 +371,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         Ok(target_file)
     }
 
-    fn store_json<T>(&self, cache_ref: &CacheRef, value: &T, obj_type: ObjectType)
+    fn store_json<T>(&self, cache_ref: &CacheRef, value: &T, obj_type: CacheFileType)
         -> Result<fs::File> where T: ?Sized+Serialize {
         let (mut target_file, rel_path) =
             self.create_staging_file(obj_type)?;
