@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::default::Default;
 
-use http::{uri::InvalidUri, request};
+use http::{uri, uri::InvalidUri, request};
 use hyper::{self, Uri, Chunk, Body, body::Payload, Request, Client, client:: HttpConnector};
 use hyper_tls::{self, HttpsConnector};
 use futures::{Stream, Future};
@@ -108,7 +108,8 @@ impl IntoIterator for GithubTree {
 
 #[derive(Debug)]
 pub struct Github {
-    base_uri: Uri,
+    graphql_uri: Uri,
+    rest_base_uri: String,
     org: String,
     repo: String,
     token: String,
@@ -408,8 +409,27 @@ impl Github {
         let http_client =
             Client::builder().build(HttpsConnector::new(4)?);
 
+        // Here we will also parse the given str. Therefore we can unwrap the parses later as we
+        // already verified that the URL is fine.
+        let uri: Uri = {
+            if base_url.ends_with('/') {
+                (&base_url[0..base_url.len()-1]).parse()?
+            } else {
+                base_url.parse()?
+            }
+        };
+
+        let github_host = uri.host().expect("No host name given");
+        let (graphql_uri, rest_base_uri) = if github_host.ends_with("github.com") {
+            ("https://api.github.com/graphql".parse().unwrap(),
+             "https://api.github.com".to_string())
+        } else {
+            (format!("{}/graphql", uri).parse().unwrap(), format!("{}/v3", uri))
+        };
+
         Ok(Github {
-            base_uri: base_url.parse()?,
+            graphql_uri,
+            rest_base_uri,
             org: org.to_string(),
             repo: repo.to_string(),
             token: token.to_string(),
@@ -420,13 +440,14 @@ impl Github {
     }
 
     pub fn get_blob_data(&self, cache_ref: &CacheRef) -> cache::Result<Vec<u8>> {
-        let path = format!("/repos/{org}/{repo}/git/blobs/{sha}",
+        let path = format!("{base}/repos/{org}/{repo}/git/blobs/{sha}",
+                           base=self.rest_base_uri,
                            org=self.org,
                            repo=self.repo,
                            sha=&cache_ref.to_string()[0..40]);
-        let mut uri_parts = self.base_uri.clone().into_parts();
-        uri_parts.path_and_query = Some(path.parse().unwrap()); // TODO: Handle errors if this can fail
-        let uri = Uri::from_parts(uri_parts).unwrap(); // TODO: Handle errors if this can fail
+        let uri = Uri::from_shared(path.into()).unwrap(); // This shouldn't fail as we already
+                                                          // checked the validity URL during
+                                                          // construction
 
         info!("Retrieving git blob from {}", uri);
 
@@ -595,13 +616,9 @@ query {{ \
     }
 
     fn execute_graphql_query(&self, query: String) -> cache::Result<String> {
-        let mut parts = self.base_uri.clone().into_parts();
-        parts.path_and_query = Some("/graphql".parse().unwrap());
-        let graphql_query_url = Uri::from_parts(parts).unwrap();
+        debug!("Sending query to GitHub at {}: {}", &self.graphql_uri, query);
 
-        debug!("Sending query to GitHub at {}: {}", graphql_query_url, query);
-
-        let request_builder = Request::post(graphql_query_url);
+        let request_builder = Request::post(self.graphql_uri.clone());
         self.issue_request(request_builder, Body::from(query))
     }
 
