@@ -211,6 +211,7 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
             let mut result_string = String::from("On branch (HEAD)\n");
             for commit_result in log {
                 result_string.push_str(&commit_result?.to_string());
+                result_string.push('\n');
             }
 
             Ok(result_string)
