@@ -1,8 +1,9 @@
 use std::path::Path;
 use std::io::{self, Read, Seek, SeekFrom, Cursor};
 use std::vec;
+use std::fs;
 use std::sync::{Arc, Weak, Mutex, mpsc::channel};
-use std::str;
+use std::str::{self, FromStr};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::default::Default;
@@ -13,6 +14,7 @@ use hyper_tls::{self, HttpsConnector};
 use futures::{Stream, Future};
 use tokio::{runtime::Runtime, self};
 use serde_json::de::from_str as from_json_str;
+use serde_json::ser::to_string as to_json_string;
 use failure;
 use base64;
 
@@ -73,6 +75,16 @@ impl From<hyper::Error> for Error {
     }
 }
 
+pub fn sha_to_cache_ref(mut sha: String) -> Result<CacheRef, failure::Error> {
+    sha.push_str("000000000000000000000000");
+    CacheRef::from_str(sha.as_str())
+}
+
+pub fn cache_ref_to_sha(mut cache_ref_str: String) -> String {
+    cache_ref_str.truncate(40);
+    cache_ref_str
+}
+
 #[derive(Debug)]
 pub struct GithubBlob {
     data: Cursor<Arc<[u8]>>
@@ -119,11 +131,75 @@ pub struct Github {
 }
 
 mod restv3 {
-    #[derive(Debug, Clone, Deserialize)]
+    use cache::{DirectoryEntry, ObjectType, Commit};
+    use failure::Error;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct GitBlob {
         pub content: String,
         pub encoding: String,
-        pub size: usize
+        pub size: Option<usize>
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct GitObjectCreated {
+        pub url: String,
+        pub sha: String
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct GitTreeEntry {
+        pub path: String,
+        pub mode: String,
+        #[serde(rename = "type")]
+        pub obj_type: String,
+        pub sha: Option<String>,
+        pub content: Option<String>
+    }
+
+    impl From<DirectoryEntry> for GitTreeEntry {
+        fn from(dir_entry: DirectoryEntry) -> Self {
+            let sha = super::cache_ref_to_sha(dir_entry.cache_ref.to_string());
+            let (obj_type, mode) = match dir_entry.object_type {
+                ObjectType::File => ("blob", "100644"),
+                ObjectType::Directory => ("tree", "040000"),
+                ObjectType::Commit => ("commit", "160000"),
+            };
+
+            Self {
+                path: dir_entry.name,
+                mode: mode.to_string(),
+                obj_type: obj_type.to_string(),
+                sha: Some(sha),
+                content: None
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct GitTree {
+        pub tree: Vec<GitTreeEntry>,
+        pub base_tree: Option<String>
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct GitCommit {
+        pub message: String,
+        pub tree: String,
+        pub parents: Vec<String>
+    }
+
+    impl From<Commit> for GitCommit {
+        fn from(commit: Commit) -> Self {
+            let parents = commit.parents.into_iter()
+                .map(|cache_ref| super::cache_ref_to_sha(
+                    cache_ref.to_string())).collect();
+            Self {
+                message: commit.message,
+                tree: super::cache_ref_to_sha(commit.tree.to_string()),
+                parents
+            }
+        }
     }
 }
 
@@ -133,7 +209,7 @@ mod graphql {
     use std::fmt::{self, Formatter};
     use std::sync::Arc;
 
-    use cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType};
+    use cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType, CacheError};
     use failure::Error;
     use serde::{Deserializer, de::Visitor};
     use super::{GithubBlob, GithubTree};
@@ -151,16 +227,13 @@ mod graphql {
 
     impl GitObjectId {
         pub fn try_into_cache_ref(mut self) -> Result<CacheRef, Error> {
-            self.oid.push_str("000000000000000000000000");
-            CacheRef::from_str(self.oid.as_str())
+            super::sha_to_cache_ref(self.oid)
         }
     }
 
     impl From<CacheRef> for GitObjectId {
         fn from(cache_ref: CacheRef) -> Self {
-            let mut oid = cache_ref.to_string();
-            oid.truncate(40);
-            Self { oid }
+            Self { oid: super::cache_ref_to_sha(cache_ref.to_string()) }
         }
     }
 
@@ -233,11 +306,13 @@ mod graphql {
         deserializer.deserialize_string(StringToVecVisitor)
     }
 
-    pub fn object_to_object_type(object: &GitObject) -> ObjectType {
-        match *object {
-            GitObject::Commit { .. } => ObjectType::Commit,
-            GitObject::Tree { .. } => ObjectType::Directory,
-            GitObject::Blob { .. } => ObjectType::File
+    impl<'a> Into<ObjectType> for &'a GitObject {
+        fn into(self) -> ObjectType {
+            match *self {
+                GitObject::Commit { .. } => ObjectType::Commit,
+                GitObject::Tree { .. } => ObjectType::Directory,
+                GitObject::Blob { .. } => ObjectType::File
+            }
         }
     }
 
@@ -283,7 +358,7 @@ mod graphql {
                                 Ok(DirectoryEntry {
                                     name: entry.name,
                                     cache_ref: entry.oid.try_into_cache_ref()?,
-                                    object_type: object_to_object_type(&entry.object),
+                                    object_type: (&entry.object).into(),
                                 })
                             });
                     let dir_vec = dir.collect::<Result<_, Error>>()?;
@@ -331,8 +406,7 @@ impl CacheLayer for Github {
     fn metadata(&self, cache_ref: &CacheRef) -> cache::Result<CacheObjectMetadata> {
         let object = self.query_object(cache_ref, false)?;
         let metadata = CacheObjectMetadata {
-            object_type: graphql::object_to_object_type(
-                &object),
+            object_type: (&object).into(),
             size: match object {
                 graphql::GitObject::Blob { byte_size, .. } => byte_size as u64,
                 graphql::GitObject::Tree { entries: Some(ref entries) } => entries.len() as u64,
@@ -344,15 +418,23 @@ impl CacheLayer for Github {
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> cache::Result<CacheRef> {
-        unimplemented!()
+        let mut source = fs::File::open(source_path)?;
+        self.post_blob_data(source)
     }
 
     fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> cache::Result<CacheRef> {
-        unimplemented!()
+        let git_tree_entries = items.map(restv3::GitTreeEntry::from);
+        let git_tree = restv3::GitTree {
+            tree: git_tree_entries.collect(),
+            base_tree: None
+        };
+        let git_tree_json = to_json_string(&git_tree)?;
+        self.post_git_object_json(git_tree_json, "tree")
     }
 
     fn add_commit(&self, commit: Commit) -> cache::Result<CacheRef> {
-        unimplemented!()
+        let git_commit_json = to_json_string(&restv3::GitCommit::from(commit))?;
+        self.post_git_object_json(git_commit_json, "commit")
     }
 
     fn get_head_commit(&self) -> cache::Result<Option<CacheRef>> {
@@ -380,7 +462,7 @@ query {{ \
                 .map(Some)
                 .map_err(|e| CacheError::Custom("Unparsable OID string", e))
         } else {
-            Err(CacheError::UnexpectedObjectType(graphql::object_to_object_type(&head_commit_object)))
+            Err(CacheError::UnexpectedObjectType((&head_commit_object).into()))
         }
 
     }
@@ -468,6 +550,42 @@ impl Github {
         } else {
             Err(Error::UnsupportedBlobEncoding.into())
         }
+    }
+
+    fn post_blob_data<R: Read>(&self, mut reader: R) -> cache::Result<CacheRef> {
+        let mut input = Vec::new();
+        reader.read_to_end(&mut input)?;
+
+        let content = base64::encode_config(input.as_slice(), base64::MIME);
+        let blob = restv3::GitBlob {
+            content,
+            encoding: "base64".to_string(),
+            size: None
+        };
+
+        let obj_json = to_json_string(&blob)?;
+        self.post_git_object_json(obj_json, "blobs")
+    }
+
+    fn post_git_object_json(&self, obj_json: String, git_obj_type: &str) -> cache::Result<CacheRef> {
+        let path = format!("{base}/repos/{org}/{repo}/git/{obj_type}",
+                           base = self.rest_base_uri,
+                           org = self.org,
+                           repo = self.repo,
+                           obj_type = git_obj_type);
+        // This shouldn't fail as we already checked the validity URL during construction
+        let uri = Uri::from_shared(path.into()).unwrap();
+
+        let mut request_builder = Request::post(uri);
+        request_builder.header("Accept", "application/vnd.github.v3+json");
+        let response =
+            self.issue_request(request_builder, obj_json.into())?;
+        let git_blob_created: restv3::GitObjectCreated = from_json_str(response.as_str())?;
+
+        sha_to_cache_ref(git_blob_created.sha)
+            .map_err(|e|
+                CacheError::Custom("Cannot decode SHA reploy from GitHub after blob creation",
+                                   e))
     }
 
     fn fetch_remote_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
