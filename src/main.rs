@@ -125,8 +125,8 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
         .arg(Arg::with_name("rootrepo")
             .takes_value(true)
             .required(true)
-            .help("Connection specification to root repository. For GitHub this string has the \
-            following form: github;<GItHub API URL>;<org>/<repo>"))
+            .help("Connection specification to the root repository. For GitHub this string has \
+            the following form: github;<GitHub API URL>;<org>/<repo>[;branch]"))
         .arg(Arg::with_name("uid")
             .takes_value(true)
             .default_value("0")
@@ -156,8 +156,12 @@ fn mount_fuse<C>(
     dorkfs.mount(mountpoint).unwrap();
 }
 
-fn new_overlay<P: AsRef<Path>, U: AsRef<str>, R: AsRef<str>>(workspace: P, rooturl: U, rootrepo: R)
-    -> Result<FilesystemOverlay<cache::BoxedCacheLayer>, Error> {
+fn new_overlay<P, U, R, B>(workspace: P, rooturl: U, rootrepo: R, branch: Option<B>)
+    -> Result<FilesystemOverlay<cache::BoxedCacheLayer>, Error>
+    where P: AsRef<Path>,
+          U: AsRef<str>,
+          R: AsRef<str>,
+          B: AsRef<str> {
     let overlaydir = workspace.as_ref().join("overlay");
     let cachedir = workspace.as_ref().join("cache");
 
@@ -167,7 +171,13 @@ fn new_overlay<P: AsRef<Path>, U: AsRef<str>, R: AsRef<str>>(workspace: P, rootu
     let repo = rootrepo_parts.next().expect("Missing repo name");
     let token = ::std::env::var("GITHUB_TOKEN").unwrap();
     debug!("Connecting to GitHub at {} org {} repo {}", baseurl, org, repo);
-    let github = github::Github::new(baseurl.as_str(), org, repo, token.as_str())?;
+    let b = if let Some(ref x) = branch { Some(x.as_ref()) } else { None };
+    let github = github::Github::new(
+        baseurl.as_str(),
+        org,
+        repo,
+        token.as_str(),
+        b)?;
 
     let cached_github = HashFileCache::new(github, cachedir)?;
     FilesystemOverlay::new(cache::boxed(cached_github), overlaydir)
@@ -184,6 +194,7 @@ fn main() {
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let rootrepo = args.value_of("rootrepo").expect("No root URL given");
+    let branch = args.value_of("branch");
 
     let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
     let umask = args.value_of("umask")
@@ -195,12 +206,14 @@ fn main() {
         .expect("Cannot parse GID");
 
     let mut rootrepo_parts = rootrepo.split(';');
+
     match rootrepo_parts.next().expect("No driver specified") {
         "github" => {
             let fs = new_overlay(
                 cachedir,
-                        rootrepo_parts.next().expect("Missing base URL"),
-                        rootrepo_parts.next().expect("Missing root repo specificstion"))
+                rootrepo_parts.next().expect("Missing base URL"),
+                rootrepo_parts.next().expect("Missing root repo specification"),
+                rootrepo_parts.next())
                 .expect("Unable to create workspace");
 
             #[cfg(target_os = "linux")]

@@ -4,7 +4,7 @@ use std::vec::IntoIter;
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::File;
 
-use cache::{self, CacheLayer, LayerError, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
+use cache::{self, CacheLayer, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
             DirectoryEntry, ReadonlyFile, Directory, Commit};
 use utility::HashWriter;
 

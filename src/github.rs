@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::default::Default;
 
-use http::{uri, uri::InvalidUri, request};
-use hyper::{self, Uri, Chunk, Body, body::Payload, Request, Client, client:: HttpConnector};
+use http::{uri::InvalidUri, request};
+use hyper::{self, Uri, Chunk, Body, Request, Client, client:: HttpConnector};
 use hyper_tls::{self, HttpsConnector};
 use futures::{Stream, Future};
 use tokio::{runtime::Runtime, self};
@@ -118,6 +118,13 @@ impl IntoIterator for GithubTree {
     }
 }
 
+#[derive(Clone, Debug)]
+enum HeadRef {
+    Default,
+    Branch(String),
+    Ref(Option<CacheRef>, String)
+}
+
 #[derive(Debug)]
 pub struct Github {
     graphql_uri: Uri,
@@ -127,12 +134,12 @@ pub struct Github {
     token: String,
     tokio: Arc<Runtime>,
     http_client: Client<HttpsConnector<HttpConnector>>,
-    query_cache: Mutex<HashMap<CacheRef, graphql::GitObject>>
+    query_cache: Mutex<HashMap<CacheRef, graphql::GitObject>>,
+    head_ref: Mutex<HeadRef>
 }
 
 mod restv3 {
     use cache::{DirectoryEntry, ObjectType, Commit};
-    use failure::Error;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct GitBlob {
@@ -204,12 +211,11 @@ mod restv3 {
 }
 
 mod graphql {
-    use std::str::FromStr;
     use std::io::Cursor;
     use std::fmt::{self, Formatter};
     use std::sync::Arc;
 
-    use cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType, CacheError};
+    use cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType};
     use failure::Error;
     use serde::{Deserializer, de::Visitor};
     use super::{GithubBlob, GithubTree};
@@ -226,7 +232,7 @@ mod graphql {
     }
 
     impl GitObjectId {
-        pub fn try_into_cache_ref(mut self) -> Result<CacheRef, Error> {
+        pub fn try_into_cache_ref(self) -> Result<CacheRef, Error> {
             super::sha_to_cache_ref(self.oid)
         }
     }
@@ -370,6 +376,7 @@ mod graphql {
 
     #[derive(Debug, Clone, Deserialize)]
     pub struct Ref {
+        pub name: String,
         pub target: GitObject
     }
 
@@ -377,7 +384,9 @@ mod graphql {
     #[serde(rename_all = "camelCase")]
     pub struct Repository {
         pub object: Option<GitObject>,
-        pub default_branch_ref: Option<Ref>
+        pub default_branch_ref: Option<Ref>,
+        #[serde(rename = "ref")]
+        pub branch_ref: Option<Ref>
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -418,7 +427,7 @@ impl CacheLayer for Github {
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> cache::Result<CacheRef> {
-        let mut source = fs::File::open(source_path)?;
+        let source = fs::File::open(source_path)?;
         self.post_blob_data(source)
     }
 
@@ -438,35 +447,24 @@ impl CacheLayer for Github {
     }
 
     fn get_head_commit(&self) -> cache::Result<Option<CacheRef>> {
-        let query = format!("{{\"query\":\" \
-query {{ \
-  repository(owner:\\\"{org}\\\",name:\\\"{repo}\\\") {{ \
-    defaultBranchRef {{ \
-      target {{ \
-        __typename \
-        oid \
-      }} \
-    }} \
-  }} \
-}} \
-\"}}", org=self.org, repo=self.repo);
-        let response = self.execute_graphql_query(query)?;
-
-        let head_commit_response: GraphQLQueryResponse = from_json_str(response.as_str())?;
-        let head_commit_object = head_commit_response.data.repository.default_branch_ref
-            .ok_or(Error::UnexpectedGraphQlResponse("Missing branch ref"))?
-            .target;
-
-        if let graphql::GitObject::Commit { oid: Some(oid), .. } = head_commit_object {
-            oid.try_into_cache_ref()
-                .map(Some)
-                .map_err(|e| CacheError::Custom("Unparsable OID string", e))
-        } else {
-            Err(CacheError::UnexpectedObjectType((&head_commit_object).into()))
+        let mut head_ref = self.head_ref.lock().unwrap();
+        let new_ref = match *head_ref {
+            HeadRef::Default => self.get_ref_info(None)?,
+            HeadRef::Branch(ref branch) => self.get_ref_info(Some(branch.as_str()))?,
+            HeadRef::Ref(..) => None
+        };
+        if let Some((refname, ref_sha)) = new_ref {
+            *head_ref = HeadRef::Ref(Some(ref_sha), refname);
         }
 
+        if let HeadRef::Ref(cache_ref, _) = *head_ref {
+            Ok(cache_ref)
+        } else {
+            Err(CacheError::InitializationFailed)
+        }
     }
 }
+
 
 impl Github {
     fn push_chunk(mut string: String, data: Chunk) -> Result<String, Error> {
@@ -475,7 +473,8 @@ impl Github {
         Ok(string)
     }
 
-    pub fn new(base_url: &str, org: &str, repo: &str, token: &str) -> Result<Self, Error> {
+    pub fn new(base_url: &str, org: &str, repo: &str, token: &str, branch: Option<&str>)
+        -> Result<Self, Error> {
         let tokio = {
             let mut runtime = TOKIO_RUNTIME.lock().unwrap();
             match runtime.upgrade() {
@@ -509,6 +508,11 @@ impl Github {
             (format!("{}/graphql", uri).parse().unwrap(), format!("{}/v3", uri))
         };
 
+        let head_ref = match branch {
+            Some(branch) => HeadRef::Branch(branch.to_string()),
+            None => HeadRef::Default
+        };
+
         Ok(Github {
             graphql_uri,
             rest_base_uri,
@@ -517,7 +521,8 @@ impl Github {
             token: token.to_string(),
             tokio,
             http_client,
-            query_cache: Default::default()
+            query_cache: Default::default(),
+            head_ref: Mutex::new(head_ref)
         })
     }
 
@@ -771,6 +776,48 @@ query {{ \
 
         Ok(response)
     }
+
+    fn get_ref_info(&self, branch: Option<&str>) -> Result<Option<(String, CacheRef)>, CacheError> {
+        let ref_query = if let Some(branch_name) = branch {
+            format!("ref(qualifiedName: \\\"refs/heads/{}\\\")", branch_name)
+        } else {
+            "defaultBranchRef".to_string()
+        };
+
+        let query = format!("{{\"query\":\" \
+query {{ \
+  repository(owner:\\\"{org}\\\",name:\\\"{repo}\\\") {{ \
+    {ref_query} {{ \
+      name \
+      target {{ \
+        __typename \
+        oid \
+      }} \
+    }} \
+  }} \
+}} \
+\"}}", ref_query = ref_query, org = self.org, repo = self.repo);
+        let response = self.execute_graphql_query(query)?;
+        let head_commit_response: GraphQLQueryResponse = from_json_str(response.as_str())?;
+
+        let branch_ref = if branch.is_some() {
+            head_commit_response.data.repository.branch_ref
+        } else {
+            head_commit_response.data.repository.default_branch_ref
+        }.ok_or(Error::UnexpectedGraphQlResponse("Missing branch ref"))?;
+
+        if let graphql::Ref {
+            target: graphql::GitObject::Commit { oid: Some(oid), .. },
+            name
+        } = branch_ref {
+            oid.try_into_cache_ref()
+                .map(|cache_ref| Some((name, cache_ref)))
+                .map_err(|e| CacheError::Custom("Unparsable OID string", e))
+        } else {
+            let obj_type = (&branch_ref.target).into();
+            Err(CacheError::UnexpectedObjectType(obj_type))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -787,7 +834,8 @@ mod test {
         Github::new("https://api.github.com",
                     "darkwisebear",
                     "dorkfs",
-                    gh_token.as_str()).unwrap()
+                    gh_token.as_str(),
+                    None).unwrap()
     }
 
     #[test]
