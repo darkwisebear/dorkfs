@@ -442,8 +442,12 @@ impl CacheLayer for Github {
     }
 
     fn add_commit(&self, commit: Commit) -> cache::Result<CacheRef> {
-        let git_commit_json = to_json_string(&restv3::GitCommit::from(commit))?;
-        self.post_git_object_json(git_commit_json, "commit")
+        to_json_string(&restv3::GitCommit::from(commit))
+            .map_err(Into::into)
+            .and_then(|git_commit_json|
+                self.post_git_object_json(git_commit_json, "commit"))
+            .and_then(|cache_ref|
+                self.update_head_ref(cache_ref).map(|_| cache_ref))
     }
 
     fn get_head_commit(&self) -> cache::Result<Option<CacheRef>> {
@@ -816,6 +820,41 @@ query {{ \
         } else {
             let obj_type = (&branch_ref.target).into();
             Err(CacheError::UnexpectedObjectType(obj_type))
+        }
+    }
+
+    fn update_head_ref(&self, cache_ref: CacheRef) -> cache::Result<()> {
+        self.get_head_commit()?;
+
+        if let HeadRef::Ref(ref mut current_cache_ref, ref ref_name) = *self.head_ref.lock().unwrap() {
+            if current_cache_ref.is_some() {
+                // Ref exists, we need to issue a PATCH
+                let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs/{gitref}",
+                                  baseuri=self.rest_base_uri,
+                                  owner=self.org,
+                                  repo=self.repo,
+                                  gitref=ref_name);
+                let request = Request::patch(Uri::from_shared(uri.into()).unwrap());
+                let body = format!("{{ \"sha\": \"{sha}\" }}",
+                                   sha=cache_ref_to_sha(cache_ref.to_string()));
+                self.issue_request(request, Body::from(body))
+            } else {
+                // Ref doesn't exist yet, we POST it
+                let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs",
+                                  baseuri=self.rest_base_uri,
+                                  owner=self.org,
+                                  repo=self.repo);
+                let request = Request::post(Uri::from_shared(uri.into()).unwrap());
+                let body = format!("{{ \"ref\": \"{gitref}\", \"sha\": \"{sha}\" }}",
+                                   gitref=ref_name,
+                                   sha=cache_ref_to_sha(cache_ref.to_string()));
+                self.issue_request(request, Body::from(body))
+            }?;
+
+            *current_cache_ref = Some(cache_ref);
+            Ok(())
+        } else {
+            unreachable!()
         }
     }
 }
