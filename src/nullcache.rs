@@ -4,9 +4,60 @@ use std::vec::IntoIter;
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::File;
 
+use tiny_keccak::Keccak;
+
 use cache::{self, CacheLayer, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
             DirectoryEntry, ReadonlyFile, Directory, Commit};
-use utility::HashWriter;
+
+pub struct HashWriter {
+    hasher: Keccak
+}
+
+impl HashWriter {
+    pub fn new() -> Self {
+        HashWriter {
+            hasher: Keccak::new_shake256()
+        }
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        let mut result = unsafe {
+            ::std::mem::uninitialized::<[u8; 32]>()
+        };
+        self.hasher.finalize(&mut result);
+        result
+    }
+}
+
+impl Into<[u8; 32]> for HashWriter {
+    fn into(self) -> [u8; 32] {
+        self.finish()
+    }
+}
+
+impl From<Keccak> for HashWriter {
+    fn from(hasher: Keccak) -> Self {
+        Self {
+            hasher
+        }
+    }
+}
+
+impl Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.hasher.update(buf);
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct NullFile;

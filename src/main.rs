@@ -33,6 +33,7 @@ mod utility;
 mod control;
 mod hashfilecache;
 mod github;
+#[cfg(test)]
 mod nullcache;
 
 use std::path::Path;
@@ -40,7 +41,6 @@ use std::str::FromStr;
 use std::fmt::Debug;
 
 use failure::Error;
-use http::uri::Uri;
 
 use hashfilecache::HashFileCache;
 use overlay::FilesystemOverlay;
@@ -194,7 +194,6 @@ fn main() {
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let rootrepo = args.value_of("rootrepo").expect("No root URL given");
-    let branch = args.value_of("branch");
 
     let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
     let umask = args.value_of("umask")
