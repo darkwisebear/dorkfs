@@ -145,6 +145,7 @@ mod restv3 {
     pub struct GitBlob {
         pub content: String,
         pub encoding: String,
+        #[serde(skip_serializing_if="Option::is_none")]
         pub size: Option<usize>
     }
 
@@ -161,6 +162,7 @@ mod restv3 {
         #[serde(rename = "type")]
         pub obj_type: String,
         pub sha: Option<String>,
+        #[serde(skip_serializing_if="Option::is_none")]
         pub content: Option<String>
     }
 
@@ -186,6 +188,7 @@ mod restv3 {
     #[derive(Debug, Clone, Serialize)]
     pub struct GitTree {
         pub tree: Vec<GitTreeEntry>,
+        #[serde(skip_serializing_if="Option::is_none")]
         pub base_tree: Option<String>
     }
 
@@ -438,14 +441,15 @@ impl CacheLayer for Github {
             base_tree: None
         };
         let git_tree_json = to_json_string(&git_tree)?;
-        self.post_git_object_json(git_tree_json, "tree")
+        debug!("Adding directory with request {}", git_tree_json.as_str());
+        self.post_git_object_json(git_tree_json, "trees")
     }
 
     fn add_commit(&self, commit: Commit) -> cache::Result<CacheRef> {
         to_json_string(&restv3::GitCommit::from(commit))
             .map_err(Into::into)
             .and_then(|git_commit_json|
-                self.post_git_object_json(git_commit_json, "commit"))
+                self.post_git_object_json(git_commit_json, "commits"))
             .and_then(|cache_ref|
                 self.update_head_ref(cache_ref).map(|_| cache_ref))
     }
@@ -829,14 +833,15 @@ query {{ \
         if let HeadRef::Ref(ref mut current_cache_ref, ref ref_name) = *self.head_ref.lock().unwrap() {
             if current_cache_ref.is_some() {
                 // Ref exists, we need to issue a PATCH
-                let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs/{gitref}",
+                let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs/heads/{gitref}",
                                   baseuri=self.rest_base_uri,
                                   owner=self.org,
                                   repo=self.repo,
                                   gitref=ref_name);
-                let request = Request::patch(Uri::from_shared(uri.into()).unwrap());
                 let body = format!("{{ \"sha\": \"{sha}\" }}",
                                    sha=cache_ref_to_sha(cache_ref.to_string()));
+                debug!("Updating ref with URL {} to {}", uri.as_str(), body.as_str());
+                let request = Request::patch(Uri::from_shared(uri.into()).unwrap());
                 self.issue_request(request, Body::from(body))
             } else {
                 // Ref doesn't exist yet, we POST it
@@ -845,7 +850,7 @@ query {{ \
                                   owner=self.org,
                                   repo=self.repo);
                 let request = Request::post(Uri::from_shared(uri.into()).unwrap());
-                let body = format!("{{ \"ref\": \"{gitref}\", \"sha\": \"{sha}\" }}",
+                let body = format!("{{ \"ref\": \"refs/heads/{gitref}\", \"sha\": \"{sha}\" }}",
                                    gitref=ref_name,
                                    sha=cache_ref_to_sha(cache_ref.to_string()));
                 self.issue_request(request, Body::from(body))
@@ -864,9 +869,10 @@ mod test {
     use cache::CacheLayer;
     use std::str::FromStr;
     use std::env;
+    use std::fmt::Debug;
     use super::*;
 
-    fn setup_github() -> Github {
+    fn setup_github(branch: Option<&'static str>) -> Github {
         let gh_token = env::var("GITHUB_TOKEN")
             .expect("Please set GITHUB_TOKEN to your GitHub token so that the test can access \
             darkwisebear/dorkfs");
@@ -874,13 +880,13 @@ mod test {
                     "darkwisebear",
                     "dorkfs",
                     gh_token.as_str(),
-                    None).unwrap()
+                    branch).unwrap()
     }
 
     #[test]
     fn get_github_commit() {
         ::init_logging();
-        let github = setup_github();
+        let github = setup_github(None);
         let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
         debug!("Commit from GitHub: {:?}", obj);
     }
@@ -888,7 +894,7 @@ mod test {
     #[test]
     fn get_github_tree() {
         ::init_logging();
-        let github = setup_github();
+        let github = setup_github(None);
         let obj = github.get(&CacheRef::from_str("20325767a89a3f96949dee6f3cb29ad57f86c1c2000000000000000000000000").unwrap()).unwrap();
         debug!("Tree from GitHub: {:?}", obj);
     }
@@ -896,7 +902,7 @@ mod test {
     #[test]
     fn get_github_blob() {
         ::init_logging();
-        let github = setup_github();
+        let github = setup_github(None);
         let cache_ref = CacheRef::from_str("77bd95d183dbe757ebd53c0aa95d1a710b85460f000000000000000000000000").unwrap();
         let obj = github.get(&cache_ref).unwrap();
         debug!("Blob from GitHub: {:?}", obj);
@@ -943,5 +949,62 @@ mod test {
         } else {
             panic!("Unexpected deserialization result: {:?}", test3_parsed);
         }
+    }
+
+    fn hash_map_from_dir<D>(dir: D)
+        -> HashMap<String, DirectoryEntry> where D: Directory+Debug {
+        dir.into_iter().map(|entry| (entry.name.clone(), entry)).collect()
+    }
+
+    #[test]
+    fn change_file_and_commit() {
+        use std::io::Write;
+
+        ::init_logging();
+        let github = setup_github(Some("test"));
+        let head_commit_ref = github.get_head_commit()
+            .expect("Unable to get the head commit ref of the test branch")
+            .expect("No head commit in test branch");
+        let head_commit = github.get(&head_commit_ref)
+            .and_then(CacheObject::into_commit)
+            .expect("Unable to get the head commit of the test branch");
+        let mut root_tree = github.get(&head_commit.tree)
+            .and_then(CacheObject::into_directory)
+            .map(hash_map_from_dir)
+            .expect("Unable to get root tree of test branch");
+        let mut src_tree = github.get(&root_tree.get("src")
+            .expect("src dir not found in root tree").cache_ref)
+            .expect("Unable to retrieve src dir")
+            .into_directory().map(hash_map_from_dir)
+            .expect("src is not a directory");
+
+        let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
+        writeln!(temp_file, "Test executed on {}", ::time::now().rfc822z()).unwrap();
+        let file_cache_ref = github.add_file_by_path(
+            temp_file.into_temp_path().as_ref())
+            .expect("Unable to upload file contents");
+        src_tree.get_mut("hashfilecache.rs")
+            .expect("Cannot find github.rs in src").cache_ref = file_cache_ref;
+
+        let updated_dir = github.add_directory(
+            &mut src_tree.into_iter().map(|(_, v)| v))
+            .expect("Unable to upload updated src dir");
+        root_tree.get_mut("src").unwrap().cache_ref = updated_dir;
+
+        let updated_root = github.add_directory(
+            &mut root_tree.into_iter().map(|(_, v)| v))
+            .expect("Unable to upload updated root dir");
+
+        let new_commit = ::cache::Commit {
+            tree: updated_root,
+            parents: vec![head_commit_ref],
+            message: "Test commit from unit test".to_string()
+        };
+
+        let new_commit_ref = github.add_commit(new_commit)
+            .expect("Unable to upload commit");
+        assert_eq!(new_commit_ref, github.get_head_commit()
+            .expect("Error getting new head commit")
+            .expect("No new head commit"));
     }
 }
