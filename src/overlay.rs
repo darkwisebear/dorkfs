@@ -7,6 +7,7 @@ use std::hash::Hash;
 use std::fmt::Debug;
 use std::sync::{Arc, Weak, Mutex};
 use std::collections::HashMap;
+use std::error::Error as StdError;
 
 use failure::Error;
 
@@ -76,6 +77,77 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
                 file.seek(pos)
             }
             FSOverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlayPath {
+    base_path: PathBuf,
+    abs_fs_path: PathBuf,
+    rel_overlay_path: PathBuf
+}
+
+impl OverlayPath {
+    pub fn new<P: Into<PathBuf>>(base_path: P) -> Self {
+        let base_path = base_path.into();
+        Self {
+            abs_fs_path: base_path.clone(),
+            base_path,
+            rel_overlay_path: PathBuf::new()
+        }
+    }
+
+    pub fn with_overlay_path<P, Q>(base_path: P, rel_path: Q) -> Result<Self, Error>
+        where P: Into<PathBuf>,
+              Q: AsRef<Path> {
+        let mut path = OverlayPath::new(base_path);
+        for c in rel_path.as_ref().components() {
+            match c {
+                ::std::path::Component::Normal(c) => {
+                    path.push_overlay(c.to_str()
+                        .ok_or(format_err!("Unable to convert path component to UTF-8"))?
+                        .to_owned());
+                },
+                i => debug!("Dropping {:?} during conversion", i)
+            }
+        }
+        Ok(path)
+    }
+
+    pub fn overlay_path(&self) -> &Path {
+        self.rel_overlay_path.as_path()
+    }
+
+    pub fn rel_fs_path(&self) -> &Path {
+        self.abs_fs_path.strip_prefix(&self.base_path).unwrap()
+    }
+
+    pub fn abs_fs_path(&self) -> &Path {
+        self.abs_fs_path.as_path()
+    }
+
+    pub fn push_overlay<P: Into<PathBuf>>(&mut self, subdir: P) {
+        let mut subdir = subdir.into().into_os_string();
+        self.rel_overlay_path.push(&subdir);
+        subdir.push(".f");
+        self.abs_fs_path.push(subdir);
+    }
+
+    pub fn push_fs<P: Into<PathBuf>>(&mut self, subdir: P) {
+        let mut subdir = subdir.into();
+        self.abs_fs_path.push(&subdir);
+        subdir.set_extension("");
+        self.rel_overlay_path.push(subdir);
+    }
+
+    pub fn pop(&mut self) -> bool {
+        if self.rel_overlay_path.pop() {
+            let fs_path_pop_succeeded = self.abs_fs_path.pop();
+            assert!(fs_path_pop_succeeded);
+            true
+        } else {
+            false
         }
     }
 }
@@ -150,12 +222,20 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         }
     }
 
-    fn dir_entry_to_directory_entry(&self, dir_entry: DirEntry, file_path: &Path)
+    fn dir_entry_to_directory_entry(&self, dir_entry: DirEntry, mut overlay_path: OverlayPath)
         -> Result<cache::DirectoryEntry, Error> {
         let file_type = dir_entry.file_type()?;
+        let fs_name = os_string_to_string(dir_entry.file_name())?;
+        overlay_path.push_fs(fs_name);
+        let name = os_string_to_string(
+            overlay_path.overlay_path().file_name()
+                // Unwrapping is ok here as we just added at least one path component,
+                // so None cannot happen.
+                .unwrap()
+                .to_os_string())?;
 
         let (cache_ref, object_type) = if file_type.is_dir() {
-            let cache_ref  = self.generate_tree(dir_entry.path(), file_path)?;
+            let cache_ref  = self.generate_tree(overlay_path)?;
             (cache_ref, cache::ObjectType::Directory)
         } else if file_type.is_file() {
             let cache_ref = self.cache.add_file_by_path(dir_entry.path())?;
@@ -164,7 +244,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
         };
 
-        let name = os_string_to_string(dir_entry.file_name())?;
+        debug!("Add entry {}", name.as_str());
         Ok(cache::DirectoryEntry {
             cache_ref,
             object_type,
@@ -172,17 +252,16 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         })
     }
 
-    fn iter_directory<I,T,P,F,G>(&self, path: P, mut from_directory_entry: F, mut from_dir_entry: G)
+    fn iter_directory<I,T,F,G>(&self, overlay_path: OverlayPath, mut from_directory_entry: F, mut from_dir_entry: G)
         -> Result<I, Error>
         where I: FromIterator<T>,
               T: Eq+Hash,
-              P: AsRef<Path>,
               F: FnMut(DirectoryEntry) -> Result<T, Error>,
               G: FnMut(DirEntry) -> Result<T, Error> {
         // Get the directory contents from the cache if it's already there
         let dir_entries_result: Result<HashSet<T>, Error> =
-            if let Some(cache_dir_ref) = self.resolve_object_ref(path.as_ref())? {
-                debug!("Reading dir {:?} from cache", path.as_ref());
+            if let Some(cache_dir_ref) = self.resolve_object_ref(overlay_path.overlay_path())? {
+                debug!("Reading dir {:?} from cache", overlay_path.overlay_path());
                 let dir = self.cache.get(&cache_dir_ref)?.into_directory()?;
                 dir.into_iter().map(|e| from_directory_entry(e)).collect()
             } else {
@@ -192,10 +271,10 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         let mut dir_entries = dir_entries_result?;
 
         // Now merge the staged content into the directory
-        let abs_path = Self::file_path(&self.base_path).join(path.as_ref());
+        let abs_path = overlay_path.abs_fs_path();
         if abs_path.exists() {
             info!("Reading overlay path {}", abs_path.to_string_lossy());
-            for dir_entry in fs::read_dir(abs_path)? {
+            for dir_entry in fs::read_dir(&*abs_path)? {
                 let entry = from_dir_entry(dir_entry?)?;
                 dir_entries.insert(entry);
             }
@@ -204,27 +283,36 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(I::from_iter(dir_entries.into_iter()))
     }
 
+    fn dir_entry_to_overlay_dir_entry(dir_entry: fs::DirEntry) -> Result<OverlayDirEntry, Error> {
+        let mut overlay_path = OverlayPath::new("");
+        overlay_path.push_fs(os_string_to_string(dir_entry.file_name())?);
+        let name = os_string_to_string(overlay_path.overlay_path().as_os_str().to_owned())?;
+
+        let entry = OverlayDirEntry {
+            name,
+            metadata: Metadata::from_fs_metadata(dir_entry.metadata()?)?
+        };
+
+        Ok(entry)
+    }
+
     fn directory_entry_to_overlay_dir_entry(&self, dir_entry: DirectoryEntry)
         -> Result<OverlayDirEntry, Error> {
-        OverlayDirEntry::from_directory_entry(
-            dir_entry,
-            |dir_entry| {
-                self.cache.metadata(&dir_entry.cache_ref)
-                    .map_err(Error::from)
+        self.cache.metadata(&dir_entry.cache_ref)
+            .map_err(Error::from)
+            .and_then(Metadata::from_cache_metadata)
+            .map(move |metadata| OverlayDirEntry {
+                name: dir_entry.name,
+                metadata
             })
     }
 
-    fn generate_tree<P, Q>(&self, abs_path: P, file_path: Q) -> Result<CacheRef, Error>
-        where P: AsRef<Path>,
-              Q: AsRef<Path> {
-        let rel_path = abs_path.as_ref().strip_prefix(file_path.as_ref())
-            .expect("Path outside base path");
-
+    fn generate_tree(&self, overlay_path: OverlayPath) -> Result<CacheRef, Error> {
         let dir_entries: HashSet<DirectoryEntry> = self.iter_directory(
-            rel_path,
+            overlay_path.clone(),
             |e| Ok(e),
             |e| {
-                self.dir_entry_to_directory_entry(e, file_path.as_ref())
+                self.dir_entry_to_directory_entry(e, overlay_path.clone())
             })?;
 
         let directory = dir_entries.into_iter();
@@ -245,26 +333,35 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(new_head_file_path)
     }
 
-    fn clear_closed_files_in_path<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
-        let path = path.as_ref();
-        debug!("Clearing overlay path {:?}", path);
+    fn clear_closed_files_in_path(&mut self, path: &mut OverlayPath) -> Result<(), Error> {
+        debug!("Clearing overlay path {}", path.abs_fs_path().display());
 
-        for entry_result in fs::read_dir(path)? {
+        for entry_result in fs::read_dir(&*path.abs_fs_path())? {
             let entry = entry_result?;
             let file_type = entry.file_type()?;
-            let file_path = entry.path();
+            let file_name = os_string_to_string(entry.file_name())?;
+            path.push_fs(file_name);
 
             if file_type.is_dir() {
-                self.clear_closed_files_in_path(file_path)?;
+                self.clear_closed_files_in_path(path)?;
             } else {
-                if !self.overlay_files.contains_key(file_path.strip_prefix(path)?) {
-                    debug!("Removing overlay file {:?}", &file_path);
-                    fs::remove_file(file_path).ok();
+                if !self.overlay_files.contains_key(path.overlay_path()) {
+                    debug!("Removing overlay file {}", path.abs_fs_path().display());
+                    if let Err(ioerr) = fs::remove_file(&*path.abs_fs_path()) {
+                        warn!("Unable to remove overlay file {} during cleanup: {}",
+                              path.abs_fs_path().display(),
+                              ioerr.description());
+                    }
                 }
             }
         }
 
-        fs::remove_dir(path).ok();
+        path.pop();
+        if let Err(ioerr) = fs::remove_dir(&*path.abs_fs_path()) {
+            warn!("Unable to remove overlay directory {} during cleanup: {}",
+                  path.abs_fs_path().display(),
+                  ioerr.description());
+        }
 
         Ok(())
     }
@@ -274,12 +371,13 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
         debug!("Currently open files: {:?}", self.overlay_files.keys().collect::<Vec<&PathBuf>>());
 
-        let base_path = Self::file_path(&self.base_path);
-        self.clear_closed_files_in_path(base_path)
+        let mut base_path = OverlayPath::new(Self::file_path(&self.base_path));
+        self.clear_closed_files_in_path(&mut base_path)
     }
 
     pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
-        fs::create_dir_all(Self::file_path(&self.base_path).join(path))
+        let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
+        fs::create_dir_all(&*overlay_path.abs_fs_path())
             .map_err(|e| e.into())
     }
 }
@@ -333,8 +431,9 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
         let file_path = Self::file_path(&self.base_path);
         let meta_path = Self::meta_path(&self.base_path);
+        let overlay_path = OverlayPath::new(file_path);
 
-        let tree = self.generate_tree(&file_path, &file_path)?;
+        let tree = self.generate_tree(overlay_path)?;
         let parents = Vec::from_iter(self.head.take().into_iter());
         let commit = Commit {
             parents,
@@ -380,22 +479,27 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     type File = FSOverlayFile<C>;
 
     fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool)
-                                     -> Result<FSOverlayFile<C>, Error> {
-        let overlay_path = Self::file_path(&self.base_path).join(path.as_ref());
-        debug!("Trying to open {} in the overlay", overlay_path.to_string_lossy());
+        -> Result<FSOverlayFile<C>, Error> {
+        let overlay_path =
+            OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
+        let abs_fs_path = overlay_path.abs_fs_path();
+        let cache_path = overlay_path.overlay_path();
+
+        debug!("Trying to open {} in the overlay", abs_fs_path.to_string_lossy());
 
         // Check if the file is already part of the overlay
         let overlay_file = fs::OpenOptions::new()
             .read(true)
             .write(writable)
             .create(false)
-            .open(&overlay_path);
+            .open(&*abs_fs_path);
         match  overlay_file {
-            Ok(file) => Ok(self.add_fs_file(path.as_ref(), file)),
+            Ok(file) => Ok(self.add_fs_file(&cache_path, file)),
 
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
-                    let cache_ref = self.resolve_object_ref(path.as_ref())?;
+                    let cache_ref = self.resolve_object_ref(&cache_path)?;
+                    debug!("Opening cache ref {:?}", cache_ref);
                     let mut cache_file = if let Some(existing_ref) = cache_ref {
                         let cache_object = self.cache.get(&existing_ref)?;
                         Some(cache_object.into_file()?)
@@ -404,7 +508,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                     };
 
                     if writable {
-                        if let Some(parent_path) = overlay_path.parent() {
+                        if let Some(parent_path) = abs_fs_path.parent() {
                             fs::create_dir_all(parent_path)?;
                         }
 
@@ -412,12 +516,12 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                             .create(true)
                             .read(true)
                             .write(true)
-                            .open(&overlay_path)?;
+                            .open(&*abs_fs_path)?;
                         if let Some(mut cache_file) = cache_file {
                             io::copy(&mut cache_file, &mut new_file)?;
                             new_file.seek(SeekFrom::Start(0))?;
                         }
-                        Ok(self.add_fs_file(path.as_ref(), new_file))
+                        Ok(self.add_fs_file(&cache_path, new_file))
                     } else {
                         if let Some(cache_file) = cache_file {
                             Ok(FSOverlayFile::CacheFile(cache_file))
@@ -435,23 +539,26 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
         where I: FromIterator<OverlayDirEntry>,
               P: AsRef<Path> {
+        let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         self.iter_directory(
-            path,
+            overlay_path,
             |dir_entry| {
                 self.directory_entry_to_overlay_dir_entry(dir_entry)
             },
-            OverlayDirEntry::from_dir_entry)
+            Self::dir_entry_to_overlay_dir_entry)
     }
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
-        let file_path = Self::file_path(&self.base_path).join(path.as_ref());
+        let overlay_path =
+            OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
+        let abs_fs_path = overlay_path.abs_fs_path();
 
-        if file_path.exists() {
-            fs::symlink_metadata(file_path)
+        if abs_fs_path.exists() {
+            fs::symlink_metadata(&*abs_fs_path)
                 .map_err(|e| e.into())
                 .and_then(Metadata::from_fs_metadata)
         } else {
-            self.resolve_object_ref(path)
+            self.resolve_object_ref(overlay_path.overlay_path())
                 .and_then(|cache_ref| cache_ref.ok_or(format_err!("File not found!")))
                 .and_then(|cache_ref| self.cache.metadata(&cache_ref)
                     .map_err(Error::from))
@@ -491,6 +598,78 @@ mod test {
     use std::io::{Read, Write, Seek, SeekFrom};
     use std::collections::HashSet;
     use super::testutil::*;
+
+    #[cfg(target_os = "windows")]
+    mod overlay_path_win {
+        use overlay::OverlayPath;
+        use std::path::{Path, PathBuf};
+
+        #[test]
+        fn create_and_push() {
+            let mut path = OverlayPath::new("C:\\tmp");
+            path.push_overlay("sub1");
+            assert_eq!("C:\\tmp\\sub1.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1", path.overlay_path().to_str().unwrap());
+            path.push_overlay("sub2");
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2", path.overlay_path().to_str().unwrap());
+            path.push_overlay("file.txt");
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f\\file.txt.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f\\file.txt.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2\\file.txt", path.overlay_path().to_str().unwrap());
+        }
+
+        #[test]
+        fn create_and_push_fs() {
+            let mut path = OverlayPath::new("C:\\tmp");
+            path.push_fs("sub1.f");
+            assert_eq!("C:\\tmp\\sub1.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1", path.overlay_path().to_str().unwrap());
+            path.push_fs("sub2.f");
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2", path.overlay_path().to_str().unwrap());
+            path.push_fs("file.txt.f");
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f\\file.txt.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f\\file.txt.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2\\file.txt", path.overlay_path().to_str().unwrap());
+        }
+
+        #[test]
+        fn create_from_existing() {
+            let mut path = OverlayPath::with_overlay_path(Path::new("C:\\tmp"),
+                                                          Path::new("sub1\\sub2"))
+                .unwrap();
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2", path.overlay_path().to_str().unwrap());
+            path.push_overlay("file.txt");
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f\\file.txt.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f\\file.txt.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2\\file.txt", path.overlay_path().to_str().unwrap());
+        }
+
+        #[test]
+        fn  pop_path() {
+            let mut path = OverlayPath::with_overlay_path(Path::new("C:\\tmp"),
+                                                          Path::new("sub1\\sub2\\sub3\\file.txt"))
+                .unwrap();
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f\\sub3.f\\file.txt.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f\\sub3.f\\file.txt.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2\\sub3\\file.txt", path.overlay_path().to_str().unwrap());
+            path.pop();
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f\\sub3.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f\\sub3.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2\\sub3", path.overlay_path().to_str().unwrap());
+            path.pop();
+            assert_eq!("C:\\tmp\\sub1.f\\sub2.f", path.abs_fs_path().to_str().unwrap());
+            assert_eq!("sub1.f\\sub2.f", path.rel_fs_path().to_str().unwrap());
+            assert_eq!("sub1\\sub2", path.overlay_path().to_str().unwrap());
+        }
+    }
 
     #[test]
     fn create_root_commit() {
@@ -664,13 +843,17 @@ mod test {
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         check_file_content(&mut test_file, "What a test!");
 
-        overlay.commit("A test commit").expect("Unable to commit");
+        overlay.commit("A test commit").expect("Unable to create first commit");
         check_file_content(&mut test_file, "What a test!");
 
+        debug!("Adding additional content");
         write!(test_file, "Incredible!").expect("Couldn't write to test file");
+        debug!("Checking additional content");
         check_file_content(&mut test_file, "What a test!Incredible!");
 
-        overlay.commit("A test commit with parent").expect("Unable to commit");
+        debug!("Committing additional content");
+        overlay.commit("A test commit with parent")
+            .expect("Unable to create second commit");
         check_file_content(&mut test_file, "What a test!Incredible!");
     }
 }

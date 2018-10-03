@@ -66,7 +66,6 @@ impl Metadata {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
     pub name: String,
@@ -93,29 +92,6 @@ impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
             name: val.0.to_owned(),
             metadata: val.1.clone()
         }
-    }
-}
-
-impl OverlayDirEntry {
-    pub fn from_directory_entry<F>(dir_entry: DirectoryEntry, get_metadata: F)
-                               -> Result<OverlayDirEntry, Error>
-        where F: Fn(&DirectoryEntry) -> Result<cache::CacheObjectMetadata, Error> {
-        let metadata = Metadata::from_cache_metadata(get_metadata(&dir_entry)?)?;
-        let entry = OverlayDirEntry {
-            name: dir_entry.name,
-            metadata
-        };
-
-        Ok(entry)
-    }
-
-    pub fn from_dir_entry(dir_entry: fs::DirEntry) -> Result<OverlayDirEntry, Error> {
-        let entry = OverlayDirEntry {
-            name: os_string_to_string(dir_entry.file_name())?,
-            metadata: Metadata::from_fs_metadata(dir_entry.metadata()?)?
-        };
-
-        Ok(entry)
     }
 }
 
