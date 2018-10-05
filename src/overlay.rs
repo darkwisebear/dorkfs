@@ -197,7 +197,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             info!("Reading overlay path {}", abs_path.to_string_lossy());
             for dir_entry in fs::read_dir(abs_path)? {
                 let entry = from_dir_entry(dir_entry?)?;
-                dir_entries.insert(entry);
+                dir_entries.replace(entry);
             }
         }
 
@@ -674,5 +674,10 @@ mod test {
 
         overlay.commit("A test commit with parent").expect("Unable to commit");
         check_file_content(&mut test_file, "What a test!Incredible!");
+
+        // TODO: Do what the macro says to prevent a regression!
+        // Before I had "dir_entries.insert" instead of "replace", so the file wasn't updated on the
+        // server :(
+        unimplemented!("Drop and reopen file to check the committed contents!!");
     }
 }
