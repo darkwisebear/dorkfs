@@ -211,6 +211,7 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
             let mut result_string = String::from("On branch (HEAD)\n");
             for commit_result in log {
                 result_string.push_str(&commit_result?.to_string());
+                result_string.push('\n');
             }
 
             Ok(result_string)
@@ -289,6 +290,14 @@ impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'
             self.overlay.read().unwrap().metadata(path)
         }
     }
+
+    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+        if path.as_ref().starts_with(DORK_DIR_ENTRY) {
+            bail!("Cannot delete .dork special files")
+        } else {
+            self.overlay.read().unwrap().delete_file(path)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -346,5 +355,23 @@ mod test {
         let mut log_contents = String::new();
         log_file.read_to_string(&mut log_contents)
             .expect("Unable to read from log");
+    }
+
+    #[test]
+    fn dont_delete_control_files() {
+        ::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+        control_overlay.delete_file(".dork/log").unwrap_err();
+
+        let mut file = control_overlay.open_file("test.txt", true)
+            .expect("Unable to create test file");
+        file.write("Teststring".as_bytes())
+            .expect("Unable to write to test file");
+        drop(file);
+
+        control_overlay.delete_file("test.txt").unwrap();
     }
 }
