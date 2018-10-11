@@ -169,7 +169,8 @@ fn new_overlay<P, U, R, B>(workspace: P, rooturl: U, rootrepo: R, branch: Option
     let mut rootrepo_parts = rootrepo.as_ref().split('/');
     let org = rootrepo_parts.next().expect("Missing repo owner");
     let repo = rootrepo_parts.next().expect("Missing repo name");
-    let token = ::std::env::var("GITHUB_TOKEN").unwrap();
+    let token = ::std::env::var("GITHUB_TOKEN")
+        .expect("GITHUB_TOKEN needed in order to authenticate against GitHub");
     debug!("Connecting to GitHub at {} org {} repo {}", baseurl, org, repo);
     let b = if let Some(ref x) = branch { Some(x.as_ref()) } else { None };
     let github = github::Github::new(
