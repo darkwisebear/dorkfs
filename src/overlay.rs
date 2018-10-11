@@ -671,13 +671,12 @@ mod test {
 
         write!(test_file, "Incredible!").expect("Couldn't write to test file");
         check_file_content(&mut test_file, "What a test!Incredible!");
+        drop(test_file);
 
         overlay.commit("A test commit with parent").expect("Unable to commit");
-        check_file_content(&mut test_file, "What a test!Incredible!");
 
-        // TODO: Do what the macro says to prevent a regression!
-        // Before I had "dir_entries.insert" instead of "replace", so the file wasn't updated on the
-        // server :(
-        unimplemented!("Drop and reopen file to check the committed contents!!");
+        let mut test_file = overlay.open_file("test.txt", false)
+            .expect("Unable to create file");
+        check_file_content(&mut test_file, "What a test!Incredible!");
     }
 }
