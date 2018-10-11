@@ -337,6 +337,17 @@ impl<C> FilesystemMT for DorkFS<C> where
             })
         })
     }
+    fn unlink(&self, _req: RequestInfo, parent: &Path, name: &OsStr) -> ResultEmpty {
+        let path = parent.strip_prefix("/")
+            .expect("Expect absolute path")
+            .join(name);
+        let state = self.state.read().unwrap();
+        state.overlay.delete_file(path)
+            .map_err(|e| {
+                warn!("Unable to delete file: {}", e);
+                libc::ENOENT
+            })
+    }
 }
 
 

@@ -98,6 +98,12 @@ impl Serialize for CacheRef {
     }
 }
 
+impl CacheRef {
+    pub fn null() -> Self {
+        CacheRef([0u8; 32])
+    }
+}
+
 struct HexCharIterator<'a> {
     hex: &'a str
 }
