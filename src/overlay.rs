@@ -196,7 +196,11 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             Ok(mut file) => {
                 let mut head = String::new();
                 file.read_to_string(&mut head)?;
-                Some(head.parse()?)
+                if head == CacheRef::null().to_string() {
+                    None
+                } else {
+                    Some(head.parse()?)
+                }
             }
 
             Err(ioerr) => {
@@ -355,18 +359,26 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         self.cache.add_directory(directory).map_err(Into::into)
     }
 
-    fn create_new_head_commit(&mut self, commit_ref: &CacheRef) -> Result<PathBuf, Error> {
-        self.head = Some(commit_ref.clone());
-
+    fn pin_current_head(&mut self) -> Result<PathBuf, Error> {
         let meta_path = Self::meta_path(&self.base_path);
-        let new_head_file_path = meta_path.join("NEW_HEAD");
+        let head_file_path = meta_path.join("HEAD");
+        if !head_file_path.exists() {
+            let new_head_file_path = meta_path.join("NEW_HEAD");
+            fs::remove_file(&new_head_file_path).ok();
 
-        let mut new_head_file = File::create(&new_head_file_path)?;
-        new_head_file.write(commit_ref.to_string().as_bytes())?;
-        new_head_file.flush()?;
-        new_head_file.sync_all()?;
+            let commit_ref = self.head.unwrap_or_else(|| CacheRef::null());
 
-        Ok(new_head_file_path)
+            info!("Pinning HEAD to {}", commit_ref);
+
+            let mut new_head_file = File::create(&new_head_file_path)?;
+            new_head_file.write(commit_ref.to_string().as_bytes())?;
+            new_head_file.flush()?;
+            new_head_file.sync_all()?;
+
+            fs::rename(new_head_file_path, &head_file_path)?;
+        }
+
+        Ok(head_file_path)
     }
 
     fn clear_closed_files_in_path(&mut self, path: &mut OverlayPath) -> Result<(), Error> {
@@ -444,6 +456,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 new_file.seek(SeekFrom::Start(0))?;
             }
 
+            self.pin_current_head()?;
+
             Ok(self.add_fs_file(&cache_path, new_file))
         } else {
             if let Some(cache_file) = cache_file {
@@ -516,25 +530,32 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 
         let new_commit_ref = self.cache.add_commit(commit)?;
 
-        // Stage 1: create file "NEW_HEAD"
-        let new_head_path = self.create_new_head_commit(&new_commit_ref)?;
-
-        let head_file_path = meta_path.join("HEAD");
-
-        // Stage 2: Cleanup overlay content
+        // Stage 1: Cleanup overlay content
         self.clear_closed_files()?;
 
-        if let Err(e) = fs::remove_file(&head_file_path) {
-            if e.kind() != io::ErrorKind::NotFound {
-                error!("Unable to remove the old HEAD file: {}", e);
-                return Err(e.into());
-            } else {
-                info!("Creating new HEAD file");
+        // Stage 2: Remove version pinning if there is no open file left
+        if self.overlay_files.is_empty() {
+            // If there is no open file, we can assume that moving to the latest HEAD is just fine.
+            // In this case we unpin and get the latest HEAD from the cache if the cache supports
+            // that.
+            info!("Unpinning HEAD");
+            let head_file_path = meta_path.join("HEAD");
+            if let Err(ioerr) = fs::remove_file(head_file_path) {
+                if ioerr.kind() == io::ErrorKind::NotFound {
+                    info!("HEAD file couldn't be found");
+                } else {
+                    warn!("Unable to delete HEAD file: {}", ioerr);
+                }
             }
+            self.head = self.cache.get_head_commit()?.or(Some(new_commit_ref));
+        } else {
+            // If there are still open files, we just use our added commit as the new HEAD and pin
+            // the workspace to that reference so that open files do not accidentally overwrite
+            // stuff other people have committed in the meantime.
+            info!("Not unpinning as there are still open files in the overlay");
+            self.head = Some(new_commit_ref);
+            self.pin_current_head()?;
         }
-
-        // Stage 3: Replace old HEAD with NEW_HEAD
-        fs::rename(new_head_path, head_file_path)?;
 
         Ok(new_commit_ref)
     }
