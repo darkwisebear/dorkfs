@@ -277,7 +277,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     fn iter_directory<I,T,F,G>(&self,
                                overlay_path: OverlayPath,
-                               mut from_directory_entry: F,
+                               from_directory_entry: F,
                                mut from_dir_entry: G) -> Result<I, Error>
         where I: FromIterator<T>,
               T: Eq+Hash,
@@ -422,7 +422,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         let cache_ref = self.resolve_object_ref(&cache_path)?;
         debug!("Opening cache ref {:?}", cache_ref);
 
-        let mut cache_file = if let Some(existing_ref) = cache_ref {
+        let cache_file = if let Some(existing_ref) = cache_ref {
             let cache_object = self.cache.get(&existing_ref)?;
             Some(cache_object.into_file()?)
         } else {

@@ -9,14 +9,15 @@ use std::collections::hash_map::Entry;
 use std::default::Default;
 
 use http::{uri::InvalidUri, request};
-use hyper::{self, Uri, Chunk, Body, Request, Client, client:: HttpConnector};
+use hyper::{self, Uri, Chunk, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
 use hyper_tls::{self, HttpsConnector};
-use futures::{Stream, Future};
-use tokio::{runtime::Runtime, self};
-use serde_json::de::from_str as from_json_str;
+use futures::{Stream, Future, future};
+use tokio::{prelude::FutureExt, runtime::Runtime, self};
+use serde_json::de::from_slice as from_json_slice;
 use serde_json::ser::to_string as to_json_string;
 use failure;
 use base64;
+use bytes::Bytes;
 
 use cache::{DirectoryEntry, ReadonlyFile, CacheObject, CacheObjectMetadata, CacheError, CacheRef,
             self, CacheLayer, Directory, LayerError, Commit};
@@ -40,7 +41,13 @@ pub enum Error {
     #[fail(display = "Hyper error {}", _0)]
     HyperError(hyper::Error),
     #[fail(display = "Only Base64 encoding is supported for files")]
-    UnsupportedBlobEncoding
+    UnsupportedBlobEncoding,
+    #[fail(display = "Unable to fetch reference {}", _0)]
+    UnknownReference(String),
+    #[fail(display = "Operation timed out")]
+    TimeoutError,
+    #[fail(display = "Git operation failed: {}", _0)]
+    GitOperationFailure(StatusCode)
 }
 
 impl LayerError for Error {}
@@ -150,7 +157,7 @@ mod restv3 {
     }
 
     #[derive(Debug, Clone, Deserialize)]
-    pub struct GitObjectCreated {
+    pub struct GitObjectReference {
         pub url: String,
         pub sha: String
     }
@@ -210,6 +217,11 @@ mod restv3 {
                 parents
             }
         }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub(super) struct GitMergeResponse {
+        pub sha: String
     }
 }
 
@@ -475,14 +487,8 @@ impl CacheLayer for Github {
 
 
 impl Github {
-    fn push_chunk(mut string: String, data: Chunk) -> Result<String, Error> {
-        let s = str::from_utf8(data.as_ref())?;
-        string.push_str(s);
-        Ok(string)
-    }
-
     pub fn new(base_url: &str, org: &str, repo: &str, token: &str, branch: Option<&str>)
-        -> Result<Self, Error> {
+               -> Result<Self, Error> {
         let tokio = {
             let mut runtime = TOKIO_RUNTIME.lock().unwrap();
             match runtime.upgrade() {
@@ -502,7 +508,7 @@ impl Github {
         // already verified that the URL is fine.
         let uri: Uri = {
             if base_url.ends_with('/') {
-                (&base_url[0..base_url.len()-1]).parse()?
+                (&base_url[0..base_url.len() - 1]).parse()?
             } else {
                 base_url.parse()?
             }
@@ -536,13 +542,13 @@ impl Github {
 
     pub fn get_blob_data(&self, cache_ref: &CacheRef) -> cache::Result<Vec<u8>> {
         let path = format!("{base}/repos/{org}/{repo}/git/blobs/{sha}",
-                           base=self.rest_base_uri,
-                           org=self.org,
-                           repo=self.repo,
-                           sha=&cache_ref.to_string()[0..40]);
+                           base = self.rest_base_uri,
+                           org = self.org,
+                           repo = self.repo,
+                           sha = &cache_ref.to_string()[0..40]);
         let uri = Uri::from_shared(path.into()).unwrap(); // This shouldn't fail as we already
-                                                          // checked the validity URL during
-                                                          // construction
+        // checked the validity URL during
+        // construction
 
         info!("Retrieving git blob from {}", uri);
 
@@ -554,12 +560,11 @@ impl Github {
         // TODO: Explicitly handle the case when an object can't be found.
         // In case the object wasn't found (or isn't a blob) this call will fail with a weird
         // error. This should be handled explicitly.
-        let git_blob: restv3::GitBlob = from_json_str(response.as_str())?;
+        let git_blob: restv3::GitBlob = from_json_slice(response.body().as_ref())?;
         if git_blob.encoding.as_str() == "base64" {
             base64::decode_config(git_blob.content.as_str(), base64::MIME)
                 .map_err(|e|
                     CacheError::Custom("Base64 decodong failed", e.into()))
-
         } else {
             Err(Error::UnsupportedBlobEncoding.into())
         }
@@ -593,7 +598,7 @@ impl Github {
         request_builder.header("Accept", "application/vnd.github.v3+json");
         let response =
             self.issue_request(request_builder, obj_json.into())?;
-        let git_blob_created: restv3::GitObjectCreated = from_json_str(response.as_str())?;
+        let git_blob_created: restv3::GitObjectReference = from_json_slice(response.body().as_ref())?;
 
         sha_to_cache_ref(git_blob_created.sha)
             .map_err(|e|
@@ -602,7 +607,7 @@ impl Github {
     }
 
     fn fetch_remote_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
-        -> cache::Result<GraphQLQueryResponse> {
+                           -> cache::Result<GraphQLQueryResponse> {
         let query = format!("{{\"query\":\" \
 query {{ \
   repository(owner:\\\"{org}\\\",name:\\\"{repo}\\\") {{ \
@@ -648,11 +653,11 @@ query {{ \
     }} \
   }} \
 }}\" \
-}}", org = self.org, repo = self.repo, oid = &cache_ref.to_string()[0..40], get_contents=if get_blob_contents { "text" } else { "" });
+}}", org = self.org, repo = self.repo, oid = &cache_ref.to_string()[0..40], get_contents = if get_blob_contents { "text" } else { "" });
 
         let response = self.execute_graphql_query(query)?;
 
-        let mut get_response: GraphQLQueryResponse = from_json_str(response.as_str())?;
+        let mut get_response: GraphQLQueryResponse = from_json_slice(response.body().as_ref())?;
         debug!("Parsed response: {:?}", get_response);
 
         // If we've received a blob, set its oid since we may need it to get the object's
@@ -665,7 +670,7 @@ query {{ \
     }
 
     fn query_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
-        -> cache::Result<graphql::GitObject> {
+                    -> cache::Result<graphql::GitObject> {
         let mut cache =
             self.query_cache.lock().unwrap();
         let obj = {
@@ -706,7 +711,7 @@ query {{ \
     }
 
     fn ensure_git_object_data(&self, cache_ref: &CacheRef, object: &mut graphql::GitObject)
-        -> cache::Result<()> {
+                              -> cache::Result<()> {
         match object {
             graphql::GitObject::Blob {
                 ref mut text,
@@ -746,15 +751,15 @@ query {{ \
         Ok(())
     }
 
-    fn execute_graphql_query(&self, query: String) -> cache::Result<String> {
+    fn execute_graphql_query(&self, query: String) -> cache::Result<Response<Bytes>> {
         debug!("Sending query to GitHub at {}: {}", &self.graphql_uri, query);
 
         let request_builder = Request::post(self.graphql_uri.clone());
         self.issue_request(request_builder, Body::from(query))
     }
 
-    fn issue_request(&self, mut request_builder: request::Builder, body: Body)
-        -> cache::Result<String> {
+    fn build_request(&self, mut request_builder: request::Builder, body: Body)
+        -> impl Future<Item=Response<Bytes>, Error=Error> {
         let user_agent = format!("dorkfs/{}",
                                  option_env!("CARGO_PKG_VERSION").unwrap_or("(unknown)"));
         let request = request_builder
@@ -762,27 +767,46 @@ query {{ \
             .header("User-Agent", user_agent)
             .body(body).unwrap();
 
+        self.http_client.request(request)
+            .map_err(Error::HyperError)
+            .and_then(|response| {
+                let (parts, body) = response.into_parts();
+                let body =
+                    body.map_err(Error::HyperError).concat2();
+                (future::ok(parts), body)
+            })
+            .then(|r|
+                r.map(|(parts, body)|
+                    Response::from_parts(parts, body.into_bytes())))
+    }
+
+    fn execute_request<F, S>(&self, request_future: F) -> cache::Result<Response<S>>
+        where F: Future<Item=Response<S>, Error=Error>+Send+'static,
+              S: Send+'static {
         let (send, recv) = channel();
 
+        let finalizing_future = request_future
+            .timeout(::std::time::Duration::from_secs(60))
+            .then(move |r|
+                send.send(r.map_err(|e|
+                    e.into_inner().unwrap_or(Error::TimeoutError)))
+                    .map_err(|_|
+                        unreachable!("Unexpected send error during GitHub request")));
+
+        self.tokio.executor().spawn(finalizing_future);
+        recv.recv().expect("Unexpected receive error during GitHub request")
+            .map_err(Into::into)
+    }
+
+    fn issue_request(&self, request_builder: request::Builder, body: Body)
+        -> cache::Result<Response<Bytes>> {
         let request_future =
-            self.http_client.request(request)
-                .map_err(Error::HyperError)
-                .and_then(|response|
-                    response.into_body()
-                        .map_err(Error::HyperError)
-                        .fold(String::new(), Self::push_chunk))
-                .then(move |r|
-                    send.send(r)
-                        .map_err(|_|
-                            unreachable!("Unexpected send error during GitHub request")));
-
-        self.tokio.executor().spawn(request_future);
-        let response =
-            recv.recv().expect("Unexpected receive error during GitHub request")?;
-
-        debug!("Raw response: {}", response);
-
-        Ok(response)
+            self.build_request(request_builder, body);
+        let response = self.execute_request(request_future);
+        for response in response.iter() {
+            debug!("Raw response: {}", String::from_utf8_lossy(response.body().as_ref()));
+        }
+        response
     }
 
     fn get_ref_info(&self, branch: Option<&str>) -> Result<Option<(String, CacheRef)>, CacheError> {
@@ -805,8 +829,16 @@ query {{ \
   }} \
 }} \
 \"}}", ref_query = ref_query, org = self.org, repo = self.repo);
-        let response = self.execute_graphql_query(query)?;
-        let head_commit_response: GraphQLQueryResponse = from_json_str(response.as_str())?;
+        let response = self.execute_graphql_query(query)
+            .and_then(|response| {
+                if !response.status().is_success() {
+                    Err(Error::UnknownReference(
+                        branch.unwrap_or("(default)").to_string()).into())
+                } else {
+                    Ok(response.into_body())
+                }
+            })?;
+        let head_commit_response: GraphQLQueryResponse = from_json_slice(response.as_ref())?;
 
         let branch_ref = if branch.is_some() {
             head_commit_response.data.repository.branch_ref
@@ -831,18 +863,56 @@ query {{ \
         self.get_head_commit()?;
 
         if let HeadRef::Ref(ref mut current_cache_ref, ref ref_name) = *self.head_ref.lock().unwrap() {
-            if current_cache_ref.is_some() {
-                // Ref exists, we need to issue a PATCH
-                let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs/heads/{gitref}",
-                                  baseuri=self.rest_base_uri,
-                                  owner=self.org,
-                                  repo=self.repo,
-                                  gitref=ref_name);
-                let body = format!("{{ \"sha\": \"{sha}\" }}",
-                                   sha=cache_ref_to_sha(cache_ref.to_string()));
-                debug!("Updating ref with URL {} to {}", uri.as_str(), body.as_str());
-                let request = Request::patch(Uri::from_shared(uri.into()).unwrap());
-                self.issue_request(request, Body::from(body))
+            let new_head_ref = if current_cache_ref.is_some() {
+                // Ref exists, we need to issue a PATCH or a merge in case no fast-forward is
+                // possible.
+                let sha = cache_ref_to_sha(cache_ref.to_string());
+                let base_uri = format!("{baseuri}/repos/{owner}/{repo}",
+                                       baseuri=self.rest_base_uri,
+                                       owner=self.org,
+                                       repo=self.repo);
+                let update_uri = format!("{baseuri}/git/refs/heads/{gitref}",
+                                         baseuri=base_uri,
+                                         gitref=ref_name);
+                let update_body = format!(r#"{{"sha":"{sha}"}}"#,
+                                          sha=sha);
+                debug!("Updating ref with URL {} to {}", update_uri.as_str(), update_body.as_str());
+                let ff_ref_request =
+                    Request::patch(Uri::from_shared(update_uri.into()).unwrap());
+                let ff_ref_response =
+                    self.issue_request(ff_ref_request, Body::from(update_body))?;
+                let ff_ref_response_status = ff_ref_response.status();
+
+                if ff_ref_response_status.is_client_error() {
+                    debug!("Ref update failed with status {}, trying to auto-merge on the \
+                            server", ff_ref_response_status.as_u16());
+                    let merge_uri = format!("{baseuri}/merges", baseuri=base_uri);
+                    let merge_body =
+                        format!(r#"{{"base":"refs/heads/{base}","head":"{head}"}}"#,
+                                base=ref_name,
+                                head=sha);
+                    let merge_request =
+                        Request::post(Uri::from_shared(merge_uri.into()).unwrap());
+                    self.issue_request(merge_request, Body::from(merge_body))
+                        .and_then(|response| if response.status().is_success() {
+                            let body = response.into_body();
+                            let parsed_body =
+                                from_json_slice::<restv3::GitMergeResponse>(body.as_ref())
+                                    .map_err(CacheError::JsonError)?;
+                            sha_to_cache_ref(parsed_body.sha)
+                                .map_err((|e|
+                                    CacheError::Custom(
+                                        "Unable to parse cache ref of merge commit", e)))
+                        } else {
+                            Err(CacheError::LayerError(
+                                Error::GitOperationFailure(response.status()).into()))
+                        })
+                } else if ff_ref_response_status.is_success() {
+                    Ok(cache_ref)
+                } else {
+                    Err(CacheError::LayerError(
+                        Error::GitOperationFailure(ff_ref_response_status).into()))
+                }
             } else {
                 // Ref doesn't exist yet, we POST it
                 let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs",
@@ -850,13 +920,14 @@ query {{ \
                                   owner=self.org,
                                   repo=self.repo);
                 let request = Request::post(Uri::from_shared(uri.into()).unwrap());
-                let body = format!("{{ \"ref\": \"refs/heads/{gitref}\", \"sha\": \"{sha}\" }}",
+                let body = format!(r#"{{ "ref": "refs/heads/{gitref}", "sha": "{sha}" }}"#,
                                    gitref=ref_name,
                                    sha=cache_ref_to_sha(cache_ref.to_string()));
-                self.issue_request(request, Body::from(body))
+                self.issue_request(request, Body::from(body))?;
+                Ok(cache_ref)
             }?;
 
-            *current_cache_ref = Some(cache_ref);
+            *current_cache_ref = Some(new_head_ref);
             Ok(())
         } else {
             unreachable!()
@@ -866,10 +937,14 @@ query {{ \
 
 #[cfg(test)]
 mod test {
-    use cache::CacheLayer;
+    use cache::{CacheLayer, DirectoryEntry, ObjectType};
     use std::str::FromStr;
+    use std::iter::FromIterator;
     use std::env;
     use std::fmt::Debug;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use rand::{prelude::*, distributions::Alphanumeric};
     use super::*;
 
     fn setup_github(branch: Option<&'static str>) -> Github {
@@ -1006,5 +1081,62 @@ mod test {
         assert_eq!(new_commit_ref, github.get_head_commit()
             .expect("Error getting new head commit")
             .expect("No new head commit"));
+    }
+
+    fn create_test_commit<R: Rng>(mut rng: R, gh: &Github, parent_commit: CacheRef)
+        -> CacheRef {
+        let ascii = rng.sample_iter(&Alphanumeric);
+
+        let mut file1 = NamedTempFile::new().expect("Unable to open temp file");
+        writeln!(file1, "Test1").expect("Unable to write to first file");
+        let file1ref = gh.add_file_by_path(&file1.into_temp_path())
+            .expect("Unable to add test file");
+        let newdir1 = vec![DirectoryEntry {
+            object_type: ObjectType::File,
+            cache_ref: file1ref,
+            name: format!("test{}.txt", String::from_iter(ascii.take(8))) }];
+        let newdir1ref = gh.add_directory(&mut newdir1.into_iter())
+            .expect("Unbale to generate new root directory");
+        let newcommit1 = Commit {
+            parents: vec![parent_commit],
+            tree: newdir1ref,
+            message: "Commit on top of the test branch".to_string()
+        };
+
+        gh.add_commit(newcommit1)
+            .expect("Unable to create first commit")
+    }
+
+    #[test]
+    fn merge_concurrent_changes() {
+        ::init_logging();
+
+        let mut gh = setup_github(Some("mergetest"));
+        let mut rng = StdRng::from_entropy();
+
+        let current_head = gh.get_head_commit()
+            .expect("Unable to retrieve current HEAD")
+            .expect("This test needs at least one root commit to work.");
+
+        let commit1ref = create_test_commit(&mut rng, &gh, current_head);
+        let commit2ref = create_test_commit(&mut rng, &gh, current_head);
+
+        info!("Created parent commits {} and {}", commit1ref, commit2ref);
+
+        let new_head = gh.get_head_commit()
+            .expect("Unable to get new HEAD commit ref")
+            .unwrap();
+
+        info!("New HEAD after merge is {}", new_head);
+
+        let new_head_commit = gh.get(&new_head)
+            .expect("Unable to fetch new HEAD commit contents")
+            .into_commit()
+            .expect("Retrieved HEAD object is not a commit");
+
+        assert_eq!(2, new_head_commit.parents.len(), "New commit is not a merge commit");
+        assert!(new_head_commit.parents.contains(&commit1ref) &&
+                    new_head_commit.parents.contains(&commit2ref),
+                "New merge commit does not contain the two commits created");
     }
 }

@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::error::Error;
 use std::iter::FromIterator;
 
+use rand::{prelude::*, distributions::Alphanumeric};
 use serde_json;
 use serde::Serialize;
 
@@ -294,9 +295,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
     }
 
     fn generate_staging_path() -> PathBuf {
-        use rand::{weak_rng, Rng};
-
-        let rand_name: String = weak_rng().gen_ascii_chars().take(8).collect();
+        let rand_name: String = SmallRng::from_entropy().sample_iter(&Alphanumeric).take(8).collect();
         Path::new("staging").join(rand_name)
     }
 
