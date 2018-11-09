@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
 use std::iter::FromIterator;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Formatter};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::str;
+use std::marker::PhantomData;
 
 use failure::Error;
 
@@ -25,10 +26,19 @@ lazy_static! {
     ];
 }
 
+pub struct OverlayFileWrapper(Box<dyn OverlayFile+Send+Sync>);
+
+impl Debug for OverlayFileWrapper {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "<Dynamic overlay file object>")
+    }
+}
+
 #[derive(Debug)]
 pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     Commit(Option<Cursor<Vec<u8>>>, Arc<RwLock<O>>),
     Log(Cursor<Vec<u8>>),
+    SpecialFile(OverlayFileWrapper),
     OverlayFile(O::File)
 }
 
@@ -61,6 +71,7 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
             }
             ControlFile::Commit(None, ..) => Err(format_err!("Commit already done!")),
             ControlFile::Log(..) => Ok(()),
+            ControlFile::SpecialFile(OverlayFileWrapper(special_file)) => special_file.truncate(size),
             ControlFile::OverlayFile(ref mut file) => file.truncate(size)
         }
     }
@@ -94,9 +105,9 @@ impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
         }
     }
 
-    fn get_writer(&mut self) -> Result<&mut Write, io::Error> {
+    fn get_writer(&mut self) -> Result<&mut dyn Write, io::Error> {
         match *self {
-            ControlFile::Commit(Some(ref mut data), ..) => Ok(data as &mut Write),
+            ControlFile::Commit(Some(ref mut data), ..) => Ok(data as &mut dyn Write),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
 
             ControlFile::Log(_) => {
@@ -104,7 +115,10 @@ impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             }
 
-            ControlFile::OverlayFile(ref mut file) => Ok(file as &mut Write)
+            ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) =>
+                Ok(special_file as &mut dyn Write),
+
+            ControlFile::OverlayFile(ref mut file) => Ok(file as &mut dyn Write)
         }
     }
 }
@@ -117,6 +131,7 @@ impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             }
             ControlFile::Log(ref mut data) => data.read(buf),
+            ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) => special_file.read(buf),
             ControlFile::OverlayFile(ref mut file) => file.read(buf)
         }
     }
@@ -142,13 +157,19 @@ impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
             ControlFile::OverlayFile(ref mut file) => file.seek(pos),
             ControlFile::Commit(Some(ref mut buf), ..) => buf.seek(pos),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
+            ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) =>
+                special_file.seek(pos),
             ControlFile::Log(ref mut buf) => buf.seek(pos)
         }
     }
 }
 
-trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceController<'a> {
+pub trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceController<'a> {
     fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error>;
+    fn get_file<'a, 'b>(&'a self, _control_dir: &'b ControlDir<O>)
+        -> Result<Box<dyn OverlayFile+Send+Sync>, Error> {
+        bail!("This special file type cannot be accessed like a normal file")
+    }
 }
 
 #[derive(Debug)]
@@ -165,13 +186,70 @@ impl<O> SpecialFile<O> for ConstantSpecialFile where for<'a> O: Overlay+Workspac
     }
 }
 
+struct BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
+                                F: Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
+    update: F,
+    _marker: PhantomData<O>
+}
+
+impl<O, F> Debug for BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
+                                F: Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "Mem-buffered special file")
+    }
+}
+
+impl<O, F> SpecialFile<O> for BufferedFile<O, F>
+    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>,
+          F: Send+Sync+Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
+        let metadata = Metadata {
+            size: (self.update)(control_dir)?.len() as u64,
+            object_type: ObjectType::File
+        };
+
+        Ok(metadata)
+    }
+
+    fn get_file<'a, 'b>(&'a self, control_dir: &'b ControlDir<O>)
+        -> Result<Box<dyn OverlayFile+Send+Sync>, Error> {
+        Ok(Box::new(Cursor::new((self.update)(control_dir)?)) as Box<dyn OverlayFile+Send+Sync>)
+    }
+}
+
+impl<O, F> BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
+                                    F: Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
+    fn new(update: F) -> Self {
+        BufferedFile {
+            update,
+            _marker: PhantomData
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LogFile;
 
-impl<O> SpecialFile<O> for LogFile where for<'a> O: Overlay+WorkspaceController<'a> {
+impl<O> SpecialFile<O> for LogFile
+    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
         let metadata = Metadata {
             size: control_dir.generate_log_string()?.as_bytes().len() as u64,
+            object_type: ObjectType::File
+        };
+
+        Ok(metadata)
+    }
+}
+
+#[derive(Debug)]
+struct StatusFile;
+
+impl<O> SpecialFile<O> for StatusFile
+    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
+        let metadata = Metadata {
+            size: control_dir.generate_status_string()?.as_bytes().len() as u64,
             object_type: ObjectType::File
         };
 
@@ -185,14 +263,17 @@ pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     special_files: HashMap<&'static str, Box<SpecialFile<O>>>
 }
 
-impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
+impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     pub fn new(overlay: O) -> Self {
 
         let mut special_files = HashMap::new();
         special_files.insert("log",
-                             Box::new(LogFile) as Box<SpecialFile<O>>);
+                             Box::new(LogFile) as Box<dyn SpecialFile<O>>);
         special_files.insert("commit",
-                             Box::new(ConstantSpecialFile) as Box<SpecialFile<O>>);
+                             Box::new(ConstantSpecialFile) as Box<dyn SpecialFile<O>>);
+        special_files.insert("status",
+                             Box::new(BufferedFile::new(|control|
+                                 control.generate_status_string().map(String::into_bytes))) as Box<dyn SpecialFile<O>>);
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -219,9 +300,29 @@ impl<O> ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
             Ok(String::from("(No commit yet)"))
         }
     }
+
+    fn generate_status_string(&self) -> Result<String, Error> {
+        let overlay = self.get_overlay();
+        let mut status = String::new();
+
+        for file_status in overlay.get_status()? {
+            let WorkspaceFileStatus(path, state) = file_status?;
+            let state_string = match state {
+                FileState::New => "N ",
+                FileState::Modified => "M ",
+                FileState::Deleted => "D "
+            };
+            status.push_str(state_string);
+            status.push_str(path.display().to_string().as_str());
+            status.push('\n');
+        }
+
+        Ok(status)
+    }
 }
 
-impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
+impl<O> Overlay for ControlDir<O>
+    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     type File = ControlFile<O>;
 
     fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error> {
@@ -242,7 +343,17 @@ impl<O> Overlay for ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'
                         })
                 }
 
-                _ => bail!("Unable to open special file {}", dorkfile.to_string_lossy())
+                Some(filename) => {
+                    if let Some(special_file) = self.special_files.get(filename) {
+                        special_file.get_file(self)
+                            .map(OverlayFileWrapper)
+                            .map(ControlFile::SpecialFile)
+                    } else {
+                        bail!("Unable to open special file {}", dorkfile.to_string_lossy())
+                    }
+                }
+
+                None => bail!("No filename given!")
             }
         } else {
             self.overlay.write().unwrap().open_file(&path, writable)

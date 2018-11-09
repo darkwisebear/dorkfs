@@ -1,4 +1,4 @@
-use std::fs::{self, DirEntry, File};
+use std::fs::{self, ReadDir, DirEntry, File};
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, Weak, Mutex};
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::ffi::OsStr;
 
 use failure::Error;
 
@@ -514,6 +515,7 @@ impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
 
 impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C> {
     type Log = CacheLayerLog<'a, C>;
+    type StatusIter = FSStatusIter<'a, C>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
         let file_path = Self::file_path(&self.base_path);
@@ -566,6 +568,104 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 
     fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error> {
         CacheLayerLog::new(&self.cache, start_commit)
+    }
+
+    fn get_status<'b: 'a>(&'b self) -> Result<FSStatusIter<'b, C>, Error> {
+        FSStatusIter::new(OverlayPath::new(Self::file_path(&self.base_path)), self)
+    }
+}
+
+pub struct FSStatusIter<'a, C: CacheLayer+'a> {
+    read_dir: ReadDir,
+    cur_path: OverlayPath,
+    sub_dirs: Vec<OverlayPath>,
+    overlay: &'a FilesystemOverlay<C>
+}
+
+impl<'a, C: CacheLayer> FSStatusIter<'a, C> {
+    fn new(base_path: OverlayPath, overlay: &'a FilesystemOverlay<C>) -> Result<Self, Error> {
+        fs::read_dir(base_path.abs_fs_path())
+            .map(move |read_dir|
+                Self {
+                    read_dir,
+                    cur_path: base_path,
+                    sub_dirs: Vec::new(),
+                    overlay
+                })
+            .map_err(Into::into)
+    }
+}
+
+impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
+    type Item = Result<WorkspaceFileStatus, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        info!("Get next item for status iteration in {:?}", self.cur_path);
+        loop {
+            match self.read_dir.next() {
+                Some(Ok(entry)) => {
+                    let file_name = PathBuf::from(entry.file_name());
+                    debug!("Regular file entry {}", file_name.display());
+                    let mut path = self.cur_path.clone();
+                    path.push_fs(&file_name);
+
+                    match file_name.extension() {
+                        Some(ext) if ext == OsStr::new("f") => {
+                            match entry.file_type() {
+                                Ok(file_type) => if file_type.is_dir() {
+                                    self.sub_dirs.push(path);
+                                } else if file_type.is_file() {
+                                    let status = match self.overlay.resolve_object_ref(path.overlay_path()) {
+                                        Ok(obj_ref) => if obj_ref.is_some() {
+                                            FileState::Modified
+                                        } else {
+                                            FileState::New
+                                        },
+                                        Err(err) => break Some(Err(err.into()))
+                                    };
+
+                                    break Some(Ok(WorkspaceFileStatus(path.overlay_path().to_path_buf(), status)));
+                                } else if file_type.is_symlink() {
+                                    warn!("Cannot handle symlinks yet");
+                                }
+
+                                Err(err) => break Some(Err(err.into()))
+                            }
+                        }
+
+                        Some(ext) if ext == OsStr::new("d") => {
+                            break Some(Ok(WorkspaceFileStatus(path.overlay_path().to_path_buf(), FileState::Deleted)));
+                        }
+
+                        _ => warn!("Cannot handle file \"{}\" in the overlay", path.abs_fs_path().display())
+                    }
+                }
+
+                Some(Err(err)) => break Some(Err(err.into())),
+
+                None => {
+                    debug!("No more files in current dir, checking for subdirs to iterate...");
+                    match self.sub_dirs.pop() {
+                        Some(path) => {
+                            info!("Iterating {}", path.abs_fs_path().display());
+                            match fs::read_dir(path.abs_fs_path()) {
+                                Ok(read_dir) => {
+                                    self.read_dir = read_dir;
+                                    self.cur_path = path;
+                                }
+
+                                Err(err) => break Some(Err(err.into()))
+                            }
+                        }
+
+                        None => {
+                            info!("No further subdirs to iterate");
+                            break None
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -653,15 +753,22 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 .map_err(Into::into)
         }
     }
-
 }
 
 #[cfg(test)]
 pub mod testutil {
+    use std::{
+        io::{Read, Seek, SeekFrom},
+        path::{Path, PathBuf},
+        collections::HashMap
+    };
+
+    use types::{FileState, WorkspaceController};
     use hashfilecache::HashFileCache;
     use overlay::*;
-    use std::io::{Read, Seek, SeekFrom};
     use nullcache::NullCache;
+
+    use failure::Error;
 
     pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache<NullCache>> {
         let cache_dir = path.as_ref().join("cache");
@@ -680,15 +787,28 @@ pub mod testutil {
             .expect("Unable to read from test file");
         assert_eq!(expected_content, content.as_str());
     }
+
+    pub fn workspace_status_from_controller<'a, W: WorkspaceController<'a>>(controller: &'a W)
+        -> Result<HashMap<PathBuf, FileState>, Error> {
+        controller.get_status()
+            .and_then(|status|
+                          status.map(|status|
+                              status.map(|status| (status.0, status.1)))
+                              .collect())
+    }
 }
 
 #[cfg(test)]
 mod test {
+    use std::{
+        io::{Read, Write, Seek, SeekFrom},
+        collections::{HashSet, HashMap},
+        path::Path
+    };
     use tempfile::tempdir;
     use overlay::*;
-    use std::io::{Read, Write, Seek, SeekFrom};
-    use std::collections::HashSet;
     use super::testutil::*;
+    use types::{WorkspaceController, Overlay, OverlayDirEntry, FileState};
 
     #[cfg(target_os = "windows")]
     mod overlay_path_win {
@@ -881,6 +1001,10 @@ mod test {
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
 
+        let status =
+            workspace_status_from_controller(&overlay).unwrap();
+        assert_eq!(Some(&FileState::New), status.get(Path::new("a/nested/dir/test.txt")));
+
         overlay.commit("A test commit").expect("Unable to commit");
 
         for writable in &[true, false] {
@@ -934,6 +1058,11 @@ mod test {
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         check_file_content(&mut test_file, "What a test!");
 
+        let status =
+            workspace_status_from_controller(&overlay).unwrap();
+        assert_eq!(Some(&FileState::New),
+                   status.get(Path::new("test.txt")));
+
         overlay.commit("A test commit").expect("Unable to create first commit");
         check_file_content(&mut test_file, "What a test!");
 
@@ -941,6 +1070,12 @@ mod test {
         write!(test_file, "Incredible!").expect("Couldn't write to test file");
         debug!("Checking additional content");
         check_file_content(&mut test_file, "What a test!Incredible!");
+
+        let status =
+            workspace_status_from_controller(&overlay).unwrap();
+        assert_eq!(Some(&FileState::Modified),
+                   status.get(Path::new("test.txt")));
+
         drop(test_file);
 
         debug!("Committing additional content");
@@ -966,6 +1101,11 @@ mod test {
         overlay.commit("A test commit").expect("Unable to create first commit");
 
         overlay.delete_file("test.txt").expect("File deletion failed");
+
+        assert!(overlay.get_status().unwrap()
+            .any(|status|
+                status.ok() == Some(("test.txt", FileState::Deleted).into())));
+
         overlay.open_file("test.txt", false).expect_err("File can still be opened");
     }
 

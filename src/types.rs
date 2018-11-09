@@ -1,13 +1,13 @@
 use std::hash::{Hash, Hasher};
 use std::fs;
-use std::io::{Read, Write, Seek};
-use std::path::Path;
+use std::io::{Read, Write, Seek, Cursor};
+use std::path::{Path, PathBuf};
 use std::iter::FromIterator;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display, Formatter};
 
 use failure::Error;
 
-use cache::{self, ReferencedCommit, CacheRef, DirectoryEntry};
+use cache::{self, ReferencedCommit, CacheRef};
 use utility::os_string_to_string;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -100,6 +100,38 @@ pub trait OverlayFile: Read+Write+Seek {
     fn truncate(&mut self, size: u64) -> Result<(), Error>;
 }
 
+impl OverlayFile for Cursor<Vec<u8>> {
+    fn close(self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+        if self.position() as u64 > size {
+            self.set_position(size);
+        }
+        self.get_mut().truncate(size as usize);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FileState {
+    New,
+    Modified,
+    Deleted
+}
+
+impl Display for FileState {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let literal = match self {
+            FileState::New => "new",
+            FileState::Modified => "modified",
+            FileState::Deleted => "deleted"
+        };
+        f.write_str(literal)
+    }
+}
+
 pub trait Overlay: Debug {
     type File: OverlayFile;
 
@@ -116,10 +148,21 @@ pub trait Overlay: Debug {
 
 pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit, Error>> { }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceFileStatus(pub PathBuf, pub FileState);
+
+impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
+    fn from(val: (P, FileState)) -> Self {
+        WorkspaceFileStatus(val.0.as_ref().to_path_buf(), val.1)
+    }
+}
+
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog<'a>;
+    type StatusIter: Iterator<Item=Result<WorkspaceFileStatus, Error>>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>, Error>;
     fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
+    fn get_status<'b: 'a>(&'b self) -> Result<Self::StatusIter, Error>;
 }
