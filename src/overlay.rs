@@ -736,14 +736,23 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
-        let mut target_path = overlay_path.abs_fs_path().to_owned();
+        let source_path = overlay_path.abs_fs_path();
+        let mut target_path = source_path.to_owned();
         target_path.set_extension("d");
-        if overlay_path.abs_fs_path().exists() {
-            debug!("Deleting: Moving {} to {}",
-                   overlay_path.abs_fs_path().display(),
-                   target_path.display());
-            fs::rename(overlay_path.abs_fs_path(), target_path)
-                .map_err(Into::into)
+        if source_path.exists() {
+            // Check if the underlying cache already contains the file. If yes, we just delete the
+            // overlay file. Otherwise we rename the file such that a whiteout file exists.
+            if self.resolve_object_ref(overlay_path.overlay_path())?.is_none() {
+                debug!("Deleting: Remove overlay file {}", source_path.display());
+                if source_path.is_dir() {
+                    fs::remove_dir_all(source_path)
+                } else {
+                    fs::remove_file(source_path)
+                }
+            } else {
+                debug!("Deleting: Moving {} to {}", source_path.display(), target_path.display());
+                fs::rename(source_path, target_path)
+            }.map_err(Into::into)
         } else {
             debug!("Create whiteout file {}", target_path.display());
             target_path.parent()
