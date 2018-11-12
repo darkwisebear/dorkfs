@@ -26,9 +26,9 @@ lazy_static! {
     ];
 }
 
-pub struct OverlayFileWrapper(Box<dyn OverlayFile+Send+Sync>);
+pub struct DynamicOverlayFileWrapper(Box<dyn OverlayFile+Send+Sync>);
 
-impl Debug for OverlayFileWrapper {
+impl Debug for DynamicOverlayFileWrapper {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "<Dynamic overlay file object>")
     }
@@ -37,8 +37,8 @@ impl Debug for OverlayFileWrapper {
 #[derive(Debug)]
 pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     Commit(Option<Cursor<Vec<u8>>>, Arc<RwLock<O>>),
-    SpecialFile(OverlayFileWrapper),
-    OverlayFile(O::File)
+    DynamicOverlayFile(DynamicOverlayFileWrapper),
+    InnerOverlayFile(O::File)
 }
 
 // Due to https://github.com/rust-lang/rust/issues/27863 we cannot implement Drop for ControlFile
@@ -69,8 +69,9 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
                 Ok(())
             }
             ControlFile::Commit(None, ..) => Err(format_err!("Commit already done!")),
-            ControlFile::SpecialFile(OverlayFileWrapper(special_file)) => special_file.truncate(size),
-            ControlFile::OverlayFile(ref mut file) => file.truncate(size)
+            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(special_file)) =>
+                special_file.truncate(size),
+            ControlFile::InnerOverlayFile(ref mut file) => file.truncate(size)
         }
     }
 }
@@ -102,42 +103,37 @@ impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
             _ => Ok(())
         }
     }
-
-    fn get_writer(&mut self) -> Result<&mut dyn Write, io::Error> {
-        match *self {
-            ControlFile::Commit(Some(ref mut data), ..) => Ok(data as &mut dyn Write),
-            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
-            ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) =>
-                Ok(special_file as &mut dyn Write),
-
-            ControlFile::OverlayFile(ref mut file) => Ok(file as &mut dyn Write)
-        }
-    }
 }
 
 impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
-            ControlFile::Commit(..) => {
-                error!("Unable to read from commit");
-                Err(io::Error::from(io::ErrorKind::PermissionDenied))
-            }
-            ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) => special_file.read(buf),
-            ControlFile::OverlayFile(ref mut file) => file.read(buf)
+            ControlFile::Commit(Some(ref mut data), ..) => data.read(buf),
+            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
+            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
+                special_file.read(buf),
+            ControlFile::InnerOverlayFile(ref mut file) => file.read(buf)
         }
     }
 }
 
 impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
-        self.get_writer().and_then(|w| w.write(buf))
+        match *self {
+            ControlFile::Commit(Some(ref mut data), ..) => data.write(buf),
+            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
+            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
+                special_file.write(buf),
+            ControlFile::InnerOverlayFile(ref mut file) => file.write(buf)
+        }
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
-        if let Ok(writer) = self.get_writer() {
-            writer.flush()
-        } else {
-            Ok(())
+        match *self {
+            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
+                special_file.flush(),
+            ControlFile::InnerOverlayFile(ref mut file) => file.flush(),
+            ControlFile::Commit(..) => Ok(())
         }
     }
 }
@@ -145,10 +141,10 @@ impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a
 impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
-            ControlFile::OverlayFile(ref mut file) => file.seek(pos),
+            ControlFile::InnerOverlayFile(ref mut file) => file.seek(pos),
             ControlFile::Commit(Some(ref mut buf), ..) => buf.seek(pos),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
-            ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) =>
+            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.seek(pos)
         }
     }
@@ -300,8 +296,8 @@ impl<O> Overlay for ControlDir<O>
                 Some(filename) => {
                     if let Some(special_file) = self.special_files.get(filename) {
                         special_file.get_file(self)
-                            .map(OverlayFileWrapper)
-                            .map(ControlFile::SpecialFile)
+                            .map(DynamicOverlayFileWrapper)
+                            .map(ControlFile::DynamicOverlayFile)
                     } else {
                         bail!("Unable to open special file {}", dorkfile.to_string_lossy())
                     }
@@ -311,7 +307,7 @@ impl<O> Overlay for ControlDir<O>
             }
         } else {
             self.overlay.write().unwrap().open_file(&path, writable)
-                .map(ControlFile::OverlayFile)
+                .map(ControlFile::InnerOverlayFile)
         }
     }
 
