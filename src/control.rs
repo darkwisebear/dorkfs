@@ -4,7 +4,7 @@ use std::iter::FromIterator;
 use std::fmt::{self, Debug, Formatter};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, RwLock};
 use std::str;
 use std::marker::PhantomData;
 
@@ -235,21 +235,6 @@ impl<O> SpecialFile<O> for LogFile
     fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
         let metadata = Metadata {
             size: control_dir.generate_log_string()?.as_bytes().len() as u64,
-            object_type: ObjectType::File
-        };
-
-        Ok(metadata)
-    }
-}
-
-#[derive(Debug)]
-struct StatusFile;
-
-impl<O> SpecialFile<O> for StatusFile
-    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
-    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
-        let metadata = Metadata {
-            size: control_dir.generate_status_string()?.as_bytes().len() as u64,
             object_type: ObjectType::File
         };
 

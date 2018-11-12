@@ -8,7 +8,6 @@ use std::fmt::{self, Debug, Display, Formatter};
 use failure::Error;
 
 use cache::{self, ReferencedCommit, CacheRef};
-use utility::os_string_to_string;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ObjectType {

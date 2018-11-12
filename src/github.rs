@@ -9,7 +9,7 @@ use std::collections::hash_map::Entry;
 use std::default::Default;
 
 use http::{uri::InvalidUri, request};
-use hyper::{self, Uri, Chunk, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
+use hyper::{self, Uri, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
 use hyper_tls::{self, HttpsConnector};
 use futures::{Stream, Future, future};
 use tokio::{prelude::FutureExt, runtime::Runtime, self};
@@ -900,9 +900,8 @@ query {{ \
                                 from_json_slice::<restv3::GitMergeResponse>(body.as_ref())
                                     .map_err(CacheError::JsonError)?;
                             sha_to_cache_ref(parsed_body.sha)
-                                .map_err((|e|
-                                    CacheError::Custom(
-                                        "Unable to parse cache ref of merge commit", e)))
+                                .map_err(|e| CacheError::Custom(
+                                    "Unable to parse cache ref of merge commit", e))
                         } else {
                             Err(CacheError::LayerError(
                                 Error::GitOperationFailure(response.status()).into()))
