@@ -37,7 +37,6 @@ impl Debug for OverlayFileWrapper {
 #[derive(Debug)]
 pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     Commit(Option<Cursor<Vec<u8>>>, Arc<RwLock<O>>),
-    Log(Cursor<Vec<u8>>),
     SpecialFile(OverlayFileWrapper),
     OverlayFile(O::File)
 }
@@ -70,7 +69,6 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
                 Ok(())
             }
             ControlFile::Commit(None, ..) => Err(format_err!("Commit already done!")),
-            ControlFile::Log(..) => Ok(()),
             ControlFile::SpecialFile(OverlayFileWrapper(special_file)) => special_file.truncate(size),
             ControlFile::OverlayFile(ref mut file) => file.truncate(size)
         }
@@ -109,12 +107,6 @@ impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
         match *self {
             ControlFile::Commit(Some(ref mut data), ..) => Ok(data as &mut dyn Write),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
-
-            ControlFile::Log(_) => {
-                error!("Log is read-only!");
-                Err(io::Error::from(io::ErrorKind::PermissionDenied))
-            }
-
             ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) =>
                 Ok(special_file as &mut dyn Write),
 
@@ -130,7 +122,6 @@ impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
                 error!("Unable to read from commit");
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             }
-            ControlFile::Log(ref mut data) => data.read(buf),
             ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) => special_file.read(buf),
             ControlFile::OverlayFile(ref mut file) => file.read(buf)
         }
@@ -158,8 +149,7 @@ impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
             ControlFile::Commit(Some(ref mut buf), ..) => buf.seek(pos),
             ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
             ControlFile::SpecialFile(OverlayFileWrapper(ref mut special_file)) =>
-                special_file.seek(pos),
-            ControlFile::Log(ref mut buf) => buf.seek(pos)
+                special_file.seek(pos)
         }
     }
 }
@@ -228,21 +218,6 @@ impl<O, F> BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
 }
 
 #[derive(Debug)]
-struct LogFile;
-
-impl<O> SpecialFile<O> for LogFile
-    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
-    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
-        let metadata = Metadata {
-            size: control_dir.generate_log_string()?.as_bytes().len() as u64,
-            object_type: ObjectType::File
-        };
-
-        Ok(metadata)
-    }
-}
-
-#[derive(Debug)]
 pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     overlay: Arc<RwLock<O>>,
     special_files: HashMap<&'static str, Box<SpecialFile<O>>>
@@ -253,12 +228,15 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
 
         let mut special_files = HashMap::new();
         special_files.insert("log",
-                             Box::new(LogFile) as Box<dyn SpecialFile<O>>);
+                             Box::new(BufferedFile::new(|control|
+                                 control.generate_log_string().map(String::into_bytes)))
+                                 as Box<dyn SpecialFile<O>>);
         special_files.insert("commit",
                              Box::new(ConstantSpecialFile) as Box<dyn SpecialFile<O>>);
         special_files.insert("status",
                              Box::new(BufferedFile::new(|control|
-                                 control.generate_status_string().map(String::into_bytes))) as Box<dyn SpecialFile<O>>);
+                                 control.generate_status_string().map(String::into_bytes)))
+                                 as Box<dyn SpecialFile<O>>);
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -317,15 +295,6 @@ impl<O> Overlay for ControlDir<O>
                     info!("Open commit special file");
                     Ok(ControlFile::Commit(Some(Cursor::new(Vec::new())),
                                            Arc::clone(&self.overlay)))
-                }
-
-                Some("log") => {
-                    info!("Open log special file");
-                    self.generate_log_string()
-                        .map(|full_log_string| {
-                            let byte_vec = Vec::from(full_log_string);
-                            ControlFile::Log(Cursor::new(byte_vec))
-                        })
                 }
 
                 Some(filename) => {
