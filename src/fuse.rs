@@ -11,7 +11,6 @@ use time::{get_time, Timespec};
 use fuse_mt::*;
 use libc;
 
-use hashfilecache::HashFileCache;
 use control::*;
 use overlay::*;
 use types;

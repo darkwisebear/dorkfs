@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::borrow::{Cow, Borrow};
+
 use failure::Error;
 
 pub fn os_string_to_string(s: OsString) -> Result<String, Error> {
@@ -61,6 +62,7 @@ impl<T: Debug> OpenHandleSet<T> {
             .map(|(_, ref mut obj)| obj)
     }
 
+    #[allow(dead_code)]
     pub fn get_named<S: AsRef<OsStr>>(&self, name: S) -> Option<&T> {
         self.object_names.get(name.as_ref())
             .and_then(|handle| self.get(*handle))
@@ -81,3 +83,4 @@ impl<T: Debug> OpenHandleSet<T> {
             })
     }
 }
+

@@ -12,6 +12,13 @@ extern crate rand;
 extern crate tiny_keccak;
 #[macro_use] extern crate lazy_static;
 extern crate tempfile;
+extern crate hyper;
+extern crate hyper_tls;
+extern crate http;
+extern crate futures;
+extern crate tokio;
+extern crate base64;
+extern crate bytes;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;
@@ -26,6 +33,9 @@ mod types;
 mod utility;
 mod control;
 mod hashfilecache;
+mod github;
+#[cfg(test)]
+mod nullcache;
 
 use std::path::Path;
 use std::str::FromStr;
@@ -113,6 +123,11 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .takes_value(true)
             .required(true)
             .help("Mountpoint that shows the checked out contents"))
+        .arg(Arg::with_name("rootrepo")
+            .takes_value(true)
+            .required(true)
+            .help("Connection specification to the root repository. For GitHub this string has \
+            the following form: github;<GitHub API URL>;<org>/<repo>[;branch]"))
         .arg(Arg::with_name("uid")
             .takes_value(true)
             .default_value("0")
@@ -142,11 +157,32 @@ fn mount_fuse<C>(
     dorkfs.mount(mountpoint).unwrap();
 }
 
-fn new_overlay<P: AsRef<Path>>(workspace: P) -> Result<FilesystemOverlay<HashFileCache>, Error> {
-    let cachedir = workspace.as_ref().join("cache");
+fn new_overlay<P, U, R, B>(workspace: P, rooturl: U, rootrepo: R, branch: Option<B>)
+    -> Result<FilesystemOverlay<cache::BoxedCacheLayer>, Error>
+    where P: AsRef<Path>,
+          U: AsRef<str>,
+          R: AsRef<str>,
+          B: AsRef<str> {
     let overlaydir = workspace.as_ref().join("overlay");
-    let cache = HashFileCache::new(cachedir)?;
-    FilesystemOverlay::new(cache, overlaydir)
+    let cachedir = workspace.as_ref().join("cache");
+
+    let baseurl = rooturl.as_ref().to_owned();
+    let mut rootrepo_parts = rootrepo.as_ref().split('/');
+    let org = rootrepo_parts.next().expect("Missing repo owner");
+    let repo = rootrepo_parts.next().expect("Missing repo name");
+    let token = ::std::env::var("GITHUB_TOKEN")
+        .expect("GITHUB_TOKEN needed in order to authenticate against GitHub");
+    debug!("Connecting to GitHub at {} org {} repo {}", baseurl, org, repo);
+    let b = if let Some(ref x) = branch { Some(x.as_ref()) } else { None };
+    let github = github::Github::new(
+        baseurl.as_str(),
+        org,
+        repo,
+        token.as_str(),
+        b)?;
+
+    let cached_github = HashFileCache::new(github, cachedir)?;
+    FilesystemOverlay::new(cache::boxed(cached_github), overlaydir)
 }
 
 pub fn init_logging() {
@@ -159,21 +195,31 @@ fn main() {
 
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
+    let rootrepo = args.value_of("rootrepo").expect("No root URL given");
 
-    let fs = new_overlay(cachedir)
-        .expect("Unable to create workspace");
+    let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
+    let umask = args.value_of("umask")
+        .map(parse_umask)
+        .expect("Unparsable umask");
+    let uid = resolve_uid(args.value_of("uid").unwrap())
+        .expect("Cannot parse UID");
+    let gid = resolve_gid(args.value_of("gid").unwrap())
+        .expect("Cannot parse GID");
 
-    #[cfg(target_os = "linux")]
-        {
-            let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
-            let umask = args.value_of("umask")
-                .map(parse_umask)
-                .expect("Unparsable umask");
-            let uid = resolve_uid(args.value_of("uid").unwrap())
-                .expect("Cannot parse UID");
-            let gid = resolve_gid(args.value_of("gid").unwrap())
-                .expect("Cannot parse GID");
+    let mut rootrepo_parts = rootrepo.split(';');
 
+    match rootrepo_parts.next().expect("No driver specified") {
+        "github" => {
+            let fs = new_overlay(
+                cachedir,
+                rootrepo_parts.next().expect("Missing base URL"),
+                rootrepo_parts.next().expect("Missing root repo specification"),
+                rootrepo_parts.next())
+                .expect("Unable to create workspace");
+
+            #[cfg(target_os = "linux")]
             mount_fuse(mountpoint, fs, uid, gid, umask);
         }
+        _ => panic!("Unknown root repo driver!")
+    }
 }

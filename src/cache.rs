@@ -2,11 +2,12 @@ use std::path::{Component, Path};
 use std::ffi::OsStr;
 use std::io;
 use std::fmt::{Debug, Display, Formatter, self};
-use std::fs;
 use std::result;
 use std::string::ToString;
 use std::str::FromStr;
 use std::hash::{Hash, Hasher};
+use std::iter::FromIterator;
+use std::vec;
 
 use serde_json;
 use failure::{Fail, Error};
@@ -38,6 +39,12 @@ pub enum CacheError {
     #[fail(display = "Unparsable reference {}: {}", _0, _1)]
     UnparsableCacheRef(String, Error),
 
+    #[fail(display = "Object creation failed: read only cache layer")]
+    WriteProtectedError,
+
+    #[fail(display = "Runtime error {}: {}", _0, _1)]
+    Custom(&'static str, Error),
+
     #[fail(display = "Layer error: {}", _0)]
     LayerError(Error)
 }
@@ -62,7 +69,7 @@ impl<E: LayerError> From<E> for CacheError {
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct CacheRef(pub [u8; 32]);
 
 impl Display for CacheRef {
@@ -158,7 +165,7 @@ impl<'de> Deserialize<'de> for CacheRef {
     }
 }
 
-pub trait ReadonlyFile: io::Read+io::Seek {}
+pub trait ReadonlyFile: io::Read+io::Seek+Debug {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ObjectType {
@@ -183,25 +190,6 @@ impl<'a, F: ReadonlyFile, D: Directory> From<&'a CacheObject<F, D>> for ObjectTy
             &CacheObject::File(..) => ObjectType::File,
             &CacheObject::Directory(..) => ObjectType::Directory,
             &CacheObject::Commit(..) => ObjectType::Commit
-        }
-    }
-}
-
-impl ObjectType {
-    pub fn as_identifier(&self) -> &'static [u8; 1] {
-        match *self {
-            ObjectType::File => &[b'F'],
-            ObjectType::Directory => &[b'D'],
-            ObjectType::Commit => &[b'C']
-        }
-    }
-
-    pub fn from_identifier(id: &[u8; 1]) -> Result<ObjectType> {
-        match id[0] {
-            b'F' => Ok(ObjectType::File),
-            b'D' => Ok(ObjectType::Directory),
-            b'C' => Ok(ObjectType::Commit),
-            obj_type => Err(CacheError::UnknownObjectType(obj_type))
         }
     }
 }
@@ -271,7 +259,7 @@ pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     Commit(Commit),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CacheObjectMetadata {
     pub size: u64,
     pub object_type: ObjectType
@@ -303,15 +291,16 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     }
 }
 
-pub trait CacheLayer {
+pub trait CacheLayer: Debug {
     type File: ReadonlyFile+Debug;
     type Directory: Directory+Debug;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;
-    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef>;
-    fn add_directory<I: Iterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef>;
+    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef>;
+    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef>;
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
+    fn get_head_commit(&self) -> Result<Option<CacheRef>> { Ok(None) }
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
@@ -354,6 +343,113 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
     Ok(objs.last().cloned())
 }
 
+impl ReadonlyFile for Box<ReadonlyFile+Send+Sync> {}
+
+#[derive(Clone, Debug)]
+pub struct DirectoryWrapper(vec::IntoIter<DirectoryEntry>);
+
+impl DirectoryWrapper {
+    fn new<D: Directory>(dir: D) -> Self {
+        DirectoryWrapper(Vec::from_iter(dir.into_iter()).into_iter())
+    }
+}
+
+impl Directory for DirectoryWrapper {}
+
+impl IntoIterator for DirectoryWrapper {
+    type Item = DirectoryEntry;
+    type IntoIter = vec::IntoIter<DirectoryEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0
+    }
+}
+
+pub type BoxedCacheLayer =
+    Box<CacheLayer<File=Box<ReadonlyFile+Send+Sync+'static>, Directory=DirectoryWrapper>+Send+Sync>;
+
+#[derive(Debug)]
+struct CacheLayerWrapper<C: CacheLayer+Send+Sync> {
+    inner: C
+}
+
+impl<C: CacheLayer+Send+Sync> CacheLayerWrapper<C> {
+    fn new(inner: C) -> Self {
+        Self { inner }
+    }
+}
+
+pub fn boxed<C>(inner: C) -> BoxedCacheLayer where C: CacheLayer+Send+Sync+'static,
+                                                   C::File: Send+Sync {
+    Box::new(CacheLayerWrapper::new(inner)) as BoxedCacheLayer
+}
+
+impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
+                                                  C::File: Send+Sync+'static {
+    type File = Box<ReadonlyFile+Send+Sync>;
+    type Directory = DirectoryWrapper;
+
+    fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
+        let obj = match self.inner.get(cache_ref)? {
+            CacheObject::File(file) =>
+                CacheObject::File(Box::new(file) as Box<ReadonlyFile+Send+Sync>),
+            CacheObject::Directory(dir) => CacheObject::Directory(DirectoryWrapper::new(dir)),
+            CacheObject::Commit(commit) => CacheObject::Commit(commit)
+        };
+        Ok(obj)
+    }
+
+    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
+        self.inner.metadata(cache_ref)
+    }
+
+    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
+        self.inner.add_file_by_path(source_path)
+    }
+
+    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
+        self.inner.add_directory(items)
+    }
+
+    fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
+        self.inner.add_commit(commit)
+    }
+
+    fn get_head_commit(&self) -> Result<Option<CacheRef>> {
+        self.inner.get_head_commit()
+    }
+}
+
+impl<C, F, D> CacheLayer for Box<C> where C: CacheLayer<File=F, Directory=D>+?Sized,
+                                          F: ReadonlyFile+Send+Sync,
+                                          D: Directory+Debug {
+    type File = F;
+    type Directory = D;
+
+    fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
+        (**self).get(cache_ref)
+    }
+
+    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
+        (**self).metadata(cache_ref)
+    }
+
+    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
+        (**self).add_file_by_path(source_path)
+    }
+
+    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
+        (**self).add_directory(items)
+    }
+
+    fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
+        (**self).add_commit(commit)
+    }
+
+    fn get_head_commit(&self) -> Result<Option<CacheRef>> {
+        (**self).get_head_commit()
+    }
+}
 #[cfg(test)]
 mod test {
     #[test]
@@ -364,5 +460,18 @@ mod test {
         let iter = HexCharIterator::new("123456789abcdef");
         let bytes: Result<Vec<u8>, Error> = iter.collect();
         assert_eq!(vec![0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf], bytes.unwrap());
+    }
+
+    #[test]
+    fn check_thread_safety() {
+        use nullcache::NullCache;
+        use super::{boxed, CacheLayer};
+
+        fn bounds_test<F: FnOnce()+Send+Sync+'static>(f: F) {
+            f()
+        }
+
+        let test_cache_layer = boxed(NullCache);
+        bounds_test(move || assert!(test_cache_layer.get_head_commit().is_ok()));
     }
 }

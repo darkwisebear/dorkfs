@@ -205,7 +205,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
-                    None
+                    cache.get_head_commit()?
                 } else {
                     return Err(ioerr.into());
                 }
@@ -249,7 +249,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 let cache_ref = self.generate_tree(overlay_path)?;
                 (cache_ref, cache::ObjectType::Directory)
             } else if file_type.is_file() {
-                let cache_ref = self.cache.add_file_by_path(dir_entry.path())?;
+                let cache_ref = self.cache.add_file_by_path(&dir_entry.path())?;
                 (cache_ref, cache::ObjectType::File)
             } else {
                 unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
@@ -281,7 +281,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     fn iter_directory<I,T,F,G>(&self,
                                overlay_path: OverlayPath,
-                               mut from_directory_entry: F,
+                               from_directory_entry: F,
                                mut from_dir_entry: G) -> Result<I, Error>
         where I: FromIterator<T>,
               T: Eq+Hash,
@@ -290,7 +290,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         // Get the directory contents from the cache if it's already there
         let dir_entries_result: Result<HashSet<T>, Error> =
             if let Some(cache_dir_ref) = self.resolve_object_ref(overlay_path.overlay_path())? {
-                debug!("Reading dir {} from cache", overlay_path.overlay_path().display());
+                debug!("Reading dir {} with ref {} from cache", overlay_path.overlay_path().display(), &cache_dir_ref);
                 let dir = self.cache.get(&cache_dir_ref)?
                     .into_directory()?;
                 dir.into_iter().map(from_directory_entry).collect()
@@ -355,8 +355,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 self.dir_entry_to_directory_entry(e, overlay_path.clone())
             })?;
 
-        let directory = dir_entries.into_iter();
-        self.cache.add_directory(directory).map_err(Into::into)
+        let mut directory = dir_entries.into_iter();
+        self.cache.add_directory(&mut directory).map_err(Into::into)
     }
 
     fn pin_current_head(&mut self) -> Result<PathBuf, Error> {
@@ -434,7 +434,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         let cache_ref = self.resolve_object_ref(&cache_path)?;
         debug!("Opening cache ref {:?}", cache_ref);
 
-        let mut cache_file = if let Some(existing_ref) = cache_ref {
+        let cache_file = if let Some(existing_ref) = cache_ref {
             let cache_object = self.cache.get(&existing_ref)?;
             Some(cache_object.into_file()?)
         } else {
@@ -661,12 +661,14 @@ pub mod testutil {
     use hashfilecache::HashFileCache;
     use overlay::*;
     use std::io::{Read, Seek, SeekFrom};
+    use nullcache::NullCache;
 
-    pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache> {
+    pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache<NullCache>> {
         let cache_dir = path.as_ref().join("cache");
         let overlay_dir = path.as_ref().join("overlay");
 
-        let cache = HashFileCache::new(&cache_dir).expect("Unable to create cache");
+        let cache = HashFileCache::new(NullCache, &cache_dir)
+            .expect("Unable to create cache");
         FilesystemOverlay::new(cache, &overlay_dir)
             .expect("Unable to create overlay")
     }
@@ -939,10 +941,14 @@ mod test {
         write!(test_file, "Incredible!").expect("Couldn't write to test file");
         debug!("Checking additional content");
         check_file_content(&mut test_file, "What a test!Incredible!");
+        drop(test_file);
 
         debug!("Committing additional content");
         overlay.commit("A test commit with parent")
             .expect("Unable to create second commit");
+
+        let mut test_file = overlay.open_file("test.txt", false)
+            .expect("Unable to create file");
         check_file_content(&mut test_file, "What a test!Incredible!");
     }
 
