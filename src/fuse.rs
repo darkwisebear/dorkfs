@@ -190,7 +190,7 @@ impl<C> FilesystemMT for DorkFS<C> where
         self.state.write().unwrap().open_handles.remove(fh)
             .ok_or(libc::EBADF)
             .and_then(|handle| {
-                if let OpenObject::File(file) = handle {
+                if let OpenObject::File(mut file) = handle {
                     file.close().
                         map_err(|e| {
                             error!("Unable to successfully close file {}: {}",

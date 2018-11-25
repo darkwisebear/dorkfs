@@ -1,6 +1,6 @@
 use std::hash::{Hash, Hasher};
 use std::fs;
-use std::io::{Read, Write, Seek, Cursor};
+use std::io::{Read, Write, Seek};
 use std::path::{Path, PathBuf};
 use std::iter::FromIterator;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -95,22 +95,8 @@ impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
 }
 
 pub trait OverlayFile: Read+Write+Seek {
-    fn close(self) -> Result<(), Error>;
+    fn close(&mut self) -> Result<(), Error>;
     fn truncate(&mut self, size: u64) -> Result<(), Error>;
-}
-
-impl OverlayFile for Cursor<Vec<u8>> {
-    fn close(self) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn truncate(&mut self, size: u64) -> Result<(), Error> {
-        if self.position() as u64 > size {
-            self.set_position(size);
-        }
-        self.get_mut().truncate(size as usize);
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

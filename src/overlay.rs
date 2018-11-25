@@ -23,7 +23,7 @@ pub enum FSOverlayFile<C: CacheLayer+Debug> {
 }
 
 impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
-    fn close(self) -> Result<(), Error> {
+    fn close(&mut self) -> Result<(), Error> {
         Ok(())
     }
 

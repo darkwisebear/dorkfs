@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::str;
-use std::marker::PhantomData;
 
 use failure::Error;
 
@@ -36,7 +35,6 @@ impl Debug for DynamicOverlayFileWrapper {
 
 #[derive(Debug)]
 pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    Commit(Option<Cursor<Vec<u8>>>, Arc<RwLock<O>>),
     DynamicOverlayFile(DynamicOverlayFileWrapper),
     InnerOverlayFile(O::File)
 }
@@ -54,21 +52,16 @@ pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 // }
 
 impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn close(mut self) -> Result<(), Error> {
-        self.execute_commit()
+    fn close(&mut self) -> Result<(), Error> {
+        match self {
+            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut overlay_file)) =>
+                overlay_file.close(),
+            ControlFile::InnerOverlayFile(_) => Ok(())
+        }
     }
 
     fn truncate(&mut self, size: u64) -> Result<(), Error> {
         match self {
-            ControlFile::Commit(Some(ref mut buf), ..) => {
-                let max_pos = u64::min(buf.position(), size);
-                buf.set_position(max_pos);
-
-                buf.get_mut().truncate(size as usize);
-
-                Ok(())
-            }
-            ControlFile::Commit(None, ..) => Err(format_err!("Commit already done!")),
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(special_file)) =>
                 special_file.truncate(size),
             ControlFile::InnerOverlayFile(ref mut file) => file.truncate(size)
@@ -76,40 +69,9 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
     }
 }
 
-impl<O> ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn execute_commit(&mut self) -> Result<(), Error> {
-        match self {
-            ControlFile::Commit(ref mut buf, ref control_dir) => {
-                if let Some(buf) = buf.take() {
-                    info!("Executing commit");
-                    let contents = buf.get_ref().as_slice();
-                    str::from_utf8(contents)
-                        .map_err(Error::from)
-                        .and_then(|commit_msg| {
-                            if !commit_msg.is_empty() {
-                                info!("Commit message: {}", commit_msg);
-                                let mut controller = control_dir.write().unwrap();
-                                controller.commit(commit_msg).map(|_| ())
-                            } else {
-                                info!("Aborting commit due to empty commit message.");
-                                Ok(())
-                            }
-                        })
-                } else {
-                    debug!("Commit already executed");
-                    Ok(())
-                }
-            }
-            _ => Ok(())
-        }
-    }
-}
-
 impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
-            ControlFile::Commit(Some(ref mut data), ..) => data.read(buf),
-            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.read(buf),
             ControlFile::InnerOverlayFile(ref mut file) => file.read(buf)
@@ -120,8 +82,6 @@ impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
 impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         match *self {
-            ControlFile::Commit(Some(ref mut data), ..) => data.write(buf),
-            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.write(buf),
             ControlFile::InnerOverlayFile(ref mut file) => file.write(buf)
@@ -132,8 +92,7 @@ impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a
         match *self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.flush(),
-            ControlFile::InnerOverlayFile(ref mut file) => file.flush(),
-            ControlFile::Commit(..) => Ok(())
+            ControlFile::InnerOverlayFile(ref mut file) => file.flush()
         }
     }
 }
@@ -142,11 +101,21 @@ impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
             ControlFile::InnerOverlayFile(ref mut file) => file.seek(pos),
-            ControlFile::Commit(Some(ref mut buf), ..) => buf.seek(pos),
-            ControlFile::Commit(None, ..) => Err(io::Error::from(io::ErrorKind::NotConnected)),
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.seek(pos)
         }
+    }
+}
+
+pub trait SpecialFileOps: Clone+Debug {
+    fn init<O>(&self, _control_dir: &O) -> Result<Vec<u8>, Error>
+        where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
+        Ok(Vec::new())
+    }
+
+    fn close<O>(&self, _control_dir: &mut O, _buffer: &[u8]) -> Result<(), Error>
+        where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
+        Ok(())
     }
 }
 
@@ -159,38 +128,16 @@ pub trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceCont
 }
 
 #[derive(Debug)]
-struct ConstantSpecialFile;
-
-impl<O> SpecialFile<O> for ConstantSpecialFile where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn metadata(&self, _control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
-        let metadata = Metadata {
-            size: 0,
-            object_type: ObjectType::File
-        };
-
-        Ok(metadata)
-    }
+struct BufferedFileFactory<F: SpecialFileOps> {
+    ops: F
 }
 
-struct BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
-                                F: Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
-    update: F,
-    _marker: PhantomData<O>
-}
-
-impl<O, F> Debug for BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
-                                F: Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Mem-buffered special file")
-    }
-}
-
-impl<O, F> SpecialFile<O> for BufferedFile<O, F>
-    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>,
-          F: Send+Sync+Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
+impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
+    where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static,
+          F: SpecialFileOps+Send+Sync+'static {
     fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
         let metadata = Metadata {
-            size: (self.update)(control_dir)?.len() as u64,
+            size: self.ops.init(control_dir.get_overlay().deref())?.len() as u64,
             object_type: ObjectType::File
         };
 
@@ -199,17 +146,69 @@ impl<O, F> SpecialFile<O> for BufferedFile<O, F>
 
     fn get_file<'a, 'b>(&'a self, control_dir: &'b ControlDir<O>)
         -> Result<Box<dyn OverlayFile+Send+Sync>, Error> {
-        Ok(Box::new(Cursor::new((self.update)(control_dir)?)) as Box<dyn OverlayFile+Send+Sync>)
+        let file = BufferedFile {
+            buf: Cursor::new(self.ops.init(control_dir.get_overlay().deref())?),
+            ops: self.ops.clone(),
+            overlay: Arc::clone(&control_dir.overlay)
+        };
+        Ok(Box::new(file) as Box<dyn OverlayFile+Send+Sync>)
     }
 }
 
-impl<O, F> BufferedFile<O, F> where for<'a> O: Overlay+WorkspaceController<'a>,
-                                    F: Fn(&ControlDir<O>) -> Result<Vec<u8>, Error> {
-    fn new(update: F) -> Self {
-        BufferedFile {
-            update,
-            _marker: PhantomData
+impl<F: SpecialFileOps+Send+Sync> BufferedFileFactory<F> {
+    fn new(ops: F) -> Self {
+        BufferedFileFactory {
+            ops
         }
+    }
+}
+
+#[derive(Debug)]
+struct BufferedFile<F, O> where F: SpecialFileOps, for <'a> O: Overlay+WorkspaceController<'a> {
+    buf: Cursor<Vec<u8>>,
+    ops: F,
+    overlay: Arc<RwLock<O>>
+}
+
+impl<F, O> Read for BufferedFile<F, O> where F: SpecialFileOps,
+                                             for<'a> O: Overlay+WorkspaceController<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.buf.read(buf)
+    }
+}
+
+impl<F, O> Write for BufferedFile<F, O> where F: SpecialFileOps,
+                                              for<'a> O: Overlay+WorkspaceController<'a> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.buf.flush()
+    }
+}
+
+impl<F, O> Seek for BufferedFile<F, O> where F: SpecialFileOps,
+                                             for<'a> O: Overlay+WorkspaceController<'a> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.buf.seek(pos)
+    }
+}
+
+impl<F, O> OverlayFile for BufferedFile<F, O>
+    where F: SpecialFileOps,
+          for<'a> O: Overlay+WorkspaceController<'a>+Send+Sync+'static {
+    fn close(&mut self) -> Result<(), Error> {
+        self.ops.close(&mut *self.overlay.write().unwrap(),
+                       self.buf.get_ref().as_slice())
+    }
+
+    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+        if self.buf.position() as u64 > size {
+            self.buf.set_position(size);
+        }
+        self.buf.get_mut().truncate(size as usize);
+        Ok(())
     }
 }
 
@@ -219,32 +218,12 @@ pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     special_files: HashMap<&'static str, Box<SpecialFile<O>>>
 }
 
-impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
-    pub fn new(overlay: O) -> Self {
+#[derive(Debug, Clone)]
+struct LogFileOps;
 
-        let mut special_files = HashMap::new();
-        special_files.insert("log",
-                             Box::new(BufferedFile::new(|control|
-                                 control.generate_log_string().map(String::into_bytes)))
-                                 as Box<dyn SpecialFile<O>>);
-        special_files.insert("commit",
-                             Box::new(ConstantSpecialFile) as Box<dyn SpecialFile<O>>);
-        special_files.insert("status",
-                             Box::new(BufferedFile::new(|control|
-                                 control.generate_status_string().map(String::into_bytes)))
-                                 as Box<dyn SpecialFile<O>>);
-        ControlDir {
-            overlay: Arc::new(RwLock::new(overlay)),
-            special_files
-        }
-    }
-
-    pub fn get_overlay<'a>(&'a self) -> impl Deref<Target=O>+'a {
-        self.overlay.read().unwrap()
-    }
-
-    fn generate_log_string(&self) -> Result<String, Error> {
-        let workspace_controller = self.get_overlay();
+impl LogFileOps {
+    fn generate_log_string<O>(workspace_controller: &O) -> Result<String, Error>
+        where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         if let Some(head_ref) = workspace_controller.get_current_head_ref()? {
             let log = workspace_controller.get_log(&head_ref)?;
 
@@ -259,9 +238,21 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
             Ok(String::from("(No commit yet)"))
         }
     }
+}
 
-    fn generate_status_string(&self) -> Result<String, Error> {
-        let overlay = self.get_overlay();
+impl SpecialFileOps for LogFileOps {
+    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>, Error>
+        where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
+        Self::generate_log_string(control_dir).map(String::into_bytes)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceStatusFileOps;
+
+impl WorkspaceStatusFileOps {
+    fn generate_status_string<O>(overlay: &O) -> Result<String, Error>
+        where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
         let mut status = String::new();
 
         for file_status in overlay.get_status()? {
@@ -280,6 +271,54 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
     }
 }
 
+impl SpecialFileOps for WorkspaceStatusFileOps {
+    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>, Error>
+        where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
+        Self::generate_status_string(control_dir).map(String::into_bytes)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommitFileOps;
+
+impl SpecialFileOps for CommitFileOps {
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error>
+        where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
+        str::from_utf8(buffer)
+            .map_err(Into::into)
+            .and_then(|message| {
+            control_dir.commit(message)
+                .map(|cache_ref|
+                    info!("Successfully committed {} through commit file", cache_ref))
+                .map_err(Into::into)
+        })
+    }
+}
+
+impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
+    pub fn new(overlay: O) -> Self {
+
+        let mut special_files = HashMap::new();
+        special_files.insert("log",
+                             Box::new(BufferedFileFactory::new(LogFileOps))
+                                 as Box<dyn SpecialFile<O>>);
+        special_files.insert("commit",
+                             Box::new(BufferedFileFactory::new(CommitFileOps))
+                                 as Box<dyn SpecialFile<O>>);
+        special_files.insert("status",
+                             Box::new(BufferedFileFactory::new(WorkspaceStatusFileOps))
+                                 as Box<dyn SpecialFile<O>>);
+        ControlDir {
+            overlay: Arc::new(RwLock::new(overlay)),
+            special_files
+        }
+    }
+
+    pub fn get_overlay<'a>(&'a self) -> impl Deref<Target=O>+'a {
+        self.overlay.read().unwrap()
+    }
+}
+
 impl<O> Overlay for ControlDir<O>
     where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     type File = ControlFile<O>;
@@ -287,12 +326,6 @@ impl<O> Overlay for ControlDir<O>
     fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error> {
         if let Ok(ref dorkfile) = path.as_ref().strip_prefix(DORK_DIR_ENTRY) {
             match dorkfile.to_str() {
-                Some("commit") => {
-                    info!("Open commit special file");
-                    Ok(ControlFile::Commit(Some(Cursor::new(Vec::new())),
-                                           Arc::clone(&self.overlay)))
-                }
-
                 Some(filename) => {
                     if let Some(special_file) = self.special_files.get(filename) {
                         special_file.get_file(self)
