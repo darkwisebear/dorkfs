@@ -164,7 +164,8 @@ pub struct FilesystemOverlay<C: CacheLayer> {
     cache: C,
     head: Option<CacheRef>,
     overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
-    base_path: PathBuf
+    base_path: PathBuf,
+    branch: String
 }
 
 impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
@@ -182,7 +183,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         FSOverlayFile::FsFile(file)
     }
 
-    pub fn new<P: AsRef<Path>>(cache: C, base_path: P) -> Result<Self, Error> {
+    pub fn new<P: AsRef<Path>>(cache: C, base_path: P, branch: &str) -> Result<Self, Error> {
         fs::create_dir_all(Self::file_path(base_path.as_ref()))?;
         let meta_path = Self::meta_path(base_path.as_ref());
         fs::create_dir_all(&meta_path)?;
@@ -206,7 +207,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
             Err(ioerr) => {
                 if ioerr.kind() == io::ErrorKind::NotFound {
-                    cache.get_head_commit()?
+                    cache.get_head_commit(branch)?
                 } else {
                     return Err(ioerr.into());
                 }
@@ -217,7 +218,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             cache,
             head,
             overlay_files: HashMap::new(),
-            base_path: base_path.as_ref().to_owned()
+            base_path: base_path.as_ref().to_owned(),
+            branch: branch.to_owned()
         })
     }
 
@@ -530,7 +532,9 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
             message: message.to_owned()
         };
 
-        let new_commit_ref = self.cache.add_commit(commit)?;
+        let new_commit_ref = self.cache.add_commit(commit)
+            .and_then(|cache_ref|
+                self.cache.merge_commit(&self.branch, cache_ref))?;
 
         // Stage 1: Cleanup overlay content
         self.clear_closed_files()?;
@@ -549,7 +553,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
                     warn!("Unable to delete HEAD file: {}", ioerr);
                 }
             }
-            self.head = self.cache.get_head_commit()?.or(Some(new_commit_ref));
+            self.head = self.cache.get_head_commit(&self.branch)?.or(Some(new_commit_ref));
         } else {
             // If there are still open files, we just use our added commit as the new HEAD and pin
             // the workspace to that reference so that open files do not accidentally overwrite
@@ -785,7 +789,7 @@ pub mod testutil {
 
         let cache = HashFileCache::new(NullCache, &cache_dir)
             .expect("Unable to create cache");
-        FilesystemOverlay::new(cache, &overlay_dir)
+        FilesystemOverlay::new(cache, &overlay_dir, "irrelevant")
             .expect("Unable to create overlay")
     }
 
@@ -811,7 +815,7 @@ pub mod testutil {
 mod test {
     use std::{
         io::{Read, Write, Seek, SeekFrom},
-        collections::{HashSet, HashMap},
+        collections::HashSet,
         path::Path
     };
     use tempfile::tempdir;
@@ -822,7 +826,7 @@ mod test {
     #[cfg(target_os = "windows")]
     mod overlay_path_win {
         use overlay::OverlayPath;
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
 
         #[test]
         fn create_and_push() {

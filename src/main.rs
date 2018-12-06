@@ -40,6 +40,7 @@ mod nullcache;
 use std::path::Path;
 use std::str::FromStr;
 use std::fmt::Debug;
+use std::borrow::Cow;
 
 use failure::Error;
 
@@ -178,11 +179,14 @@ fn new_overlay<P, U, R, B>(workspace: P, rooturl: U, rootrepo: R, branch: Option
         baseurl.as_str(),
         org,
         repo,
-        token.as_str(),
-        b)?;
+        token.as_str())?;
 
-    let cached_github = HashFileCache::new(github, cachedir)?;
-    FilesystemOverlay::new(cache::boxed(cached_github), overlaydir)
+    let branch = b.map(|s| Cow::Borrowed(s))
+        .unwrap_or_else(|| Cow::Owned(github.get_default_branch().unwrap()));
+
+    let cached_github =
+        cache::boxed(HashFileCache::new(github, cachedir)?);
+    FilesystemOverlay::new(cached_github, overlaydir, branch.as_ref())
 }
 
 pub fn init_logging() {

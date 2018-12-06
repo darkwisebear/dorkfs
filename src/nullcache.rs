@@ -137,4 +137,12 @@ impl CacheLayer for NullCache {
 
         Ok(CacheRef(keccak.into()))
     }
+
+    fn get_head_commit(&self, _branch: &str) -> Result<Option<CacheRef>, CacheError> {
+        Ok(None)
+    }
+
+    fn merge_commit(&self, _branch: &str, cache_ref: CacheRef) -> Result<CacheRef, CacheError> {
+        Ok(cache_ref)
+    }
 }

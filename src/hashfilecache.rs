@@ -230,8 +230,12 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         Ok(cache_ref)
     }
 
-    fn get_head_commit(&self) -> Result<Option<CacheRef>> {
-        self.cache.get_head_commit()
+    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
+        self.cache.get_head_commit(branch)
+    }
+
+    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+        self.cache.merge_commit(branch, cache_ref)
     }
 }
 

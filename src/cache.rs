@@ -300,7 +300,9 @@ pub trait CacheLayer: Debug {
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef>;
     fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef>;
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
-    fn get_head_commit(&self) -> Result<Option<CacheRef>> { Ok(None) }
+
+    fn get_head_commit(&self, _branch: &str) -> Result<Option<CacheRef>>;
+    fn merge_commit(&self, _branch: &str, cache_ref: CacheRef) -> Result<CacheRef>;
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
@@ -415,8 +417,12 @@ impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
         self.inner.add_commit(commit)
     }
 
-    fn get_head_commit(&self) -> Result<Option<CacheRef>> {
-        self.inner.get_head_commit()
+    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
+        self.inner.get_head_commit(branch)
+    }
+
+    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+        self.inner.merge_commit(branch, cache_ref)
     }
 }
 
@@ -446,8 +452,12 @@ impl<C, F, D> CacheLayer for Box<C> where C: CacheLayer<File=F, Directory=D>+?Si
         (**self).add_commit(commit)
     }
 
-    fn get_head_commit(&self) -> Result<Option<CacheRef>> {
-        (**self).get_head_commit()
+    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
+        (**self).get_head_commit(branch)
+    }
+
+    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+        (**self).merge_commit(branch, cache_ref)
     }
 }
 #[cfg(test)]
@@ -472,6 +482,6 @@ mod test {
         }
 
         let test_cache_layer = boxed(NullCache);
-        bounds_test(move || assert!(test_cache_layer.get_head_commit().is_ok()));
+        bounds_test(move || assert!(test_cache_layer.get_head_commit("(unused)").is_ok()));
     }
 }
