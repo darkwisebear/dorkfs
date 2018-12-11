@@ -18,18 +18,21 @@ use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit
 
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
-    FsFile(Arc<Mutex<File>>),
+    FsFile(Option<Arc<Mutex<File>>>),
     CacheFile(C::File)
 }
 
 impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
     fn close(&mut self) -> Result<(), Error> {
+        if let FSOverlayFile::FsFile(ref mut file) = *self {
+            file.take();
+        }
         Ok(())
     }
 
     fn truncate(&mut self, size: u64) -> Result<(), Error> {
         if let FSOverlayFile::FsFile(ref mut file) = *self {
-            let mut file = file.lock().unwrap();
+            let file = file.as_ref().unwrap().lock().unwrap();
             file.set_len(size).map_err(Error::from)
         } else {
             Ok(())
@@ -40,8 +43,8 @@ impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
 impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         match *self {
-            FSOverlayFile::FsFile(ref mut read) => {
-                let mut file = read.lock().unwrap();
+            FSOverlayFile::FsFile(ref mut file) => {
+                let mut file = file.as_mut().unwrap().lock().unwrap();
                 file.read(buf)
             }
             FSOverlayFile::CacheFile(ref mut read) => read.read(buf),
@@ -52,8 +55,8 @@ impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
 impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         match *self {
-            FSOverlayFile::FsFile(ref mut write) => {
-                let mut file = write.lock().unwrap();
+            FSOverlayFile::FsFile(ref mut file) => {
+                let mut file = file.as_mut().unwrap().lock().unwrap();
                 file.write(buf)
             }
             FSOverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
@@ -61,8 +64,8 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
-        if let FSOverlayFile::FsFile(ref mut write) = *self {
-            let mut file = write.lock().unwrap();
+        if let FSOverlayFile::FsFile(ref mut file) = *self {
+            let mut file = file.as_mut().unwrap().lock().unwrap();
             file.flush()
         } else {
             Ok(())
@@ -73,8 +76,8 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
 impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
         match *self {
-            FSOverlayFile::FsFile(ref mut seek) => {
-                let mut file = seek.lock().unwrap();
+            FSOverlayFile::FsFile(ref mut file) => {
+                let mut file = file.as_mut().unwrap().lock().unwrap();
                 file.seek(pos)
             }
             FSOverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
@@ -180,7 +183,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     fn add_fs_file<P: AsRef<Path>>(&mut self, path: P, file: File) -> FSOverlayFile<C> {
         let file = Arc::new(Mutex::new(file));
         self.overlay_files.insert(path.as_ref().to_owned(), Arc::downgrade(&file));
-        FSOverlayFile::FsFile(file)
+        FSOverlayFile::FsFile(Some(file))
     }
 
     pub fn new<P: AsRef<Path>>(cache: C, base_path: P, branch: &str) -> Result<Self, Error> {
@@ -570,33 +573,74 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         Ok(self.head)
     }
 
-    fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error> {
+    fn get_current_branch(&self) -> Result<Option<&str>, Error> {
+        Ok(Some(self.branch.as_ref()))
+    }
+
+    fn switch_branch(&mut self, new_branch: &str) -> Result<CacheRef, Error> {
+        self.get_status()
+            .and_then(|mut status_iter|
+                match status_iter.next() {
+                    Some(item) => {
+                        Err(format_err!("Cannot switch if the workspace isn't clean: {:?}", item))
+                    }
+                    None => Ok(())
+                })
+            .and_then(|_| self.cache.get_head_commit(new_branch)
+                .map_err(Into::into)
+                .and_then(|cache_ref|
+                    cache_ref.ok_or(format_err!("Branch doesn't exist"))))
+            .map(|new_cache_ref| {
+                self.branch = new_branch.to_string();
+                self.head = Some(new_cache_ref);
+                new_cache_ref
+            })
+    }
+
+    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
+        -> Result<(), Error> {
+        let base_ref = match repo_ref {
+            Some(RepoRef::CacheRef(cache_ref)) => cache_ref,
+            Some(RepoRef::Branch(branch)) => self.cache.get_head_commit(branch)
+                .map_err(Into::into)
+                .and_then(|cache_ref|
+                    cache_ref.ok_or(format_err!("Branch {} doesn't exsit", branch)))?,
+            None => self.head.ok_or(format_err!("No HEAD in current workspace set"))?,
+        };
+
+        self.cache.create_branch(new_branch, base_ref)
+            .map_err(Into::into)
+    }
+
+    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log, Error> {
         CacheLayerLog::new(&self.cache, start_commit)
     }
 
-    fn get_status<'b: 'a>(&'b self) -> Result<FSStatusIter<'b, C>, Error> {
-        FSStatusIter::new(OverlayPath::new(Self::file_path(&self.base_path)), self)
+    fn get_status(&'a self) -> Result<FSStatusIter<'a, C>, Error> {
+        let path = OverlayPath::new(Self::file_path(&self.base_path));
+        Ok(FSStatusIter::new(path, self))
     }
 }
 
 pub struct FSStatusIter<'a, C: CacheLayer+'a> {
-    read_dir: ReadDir,
-    cur_path: OverlayPath,
+    cur_dir: Option<(ReadDir, OverlayPath)>,
     sub_dirs: Vec<OverlayPath>,
     overlay: &'a FilesystemOverlay<C>
 }
 
 impl<'a, C: CacheLayer> FSStatusIter<'a, C> {
-    fn new(base_path: OverlayPath, overlay: &'a FilesystemOverlay<C>) -> Result<Self, Error> {
-        fs::read_dir(base_path.abs_fs_path())
-            .map(move |read_dir|
-                Self {
-                    read_dir,
-                    cur_path: base_path,
-                    sub_dirs: Vec::new(),
-                    overlay
-                })
-            .map_err(Into::into)
+    fn new(base_path: OverlayPath, overlay: &'a FilesystemOverlay<C>) -> Self {
+        let sub_dirs = if base_path.abs_fs_path().exists() {
+            vec![base_path]
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            cur_dir: None,
+            sub_dirs,
+            overlay
+        }
     }
 }
 
@@ -604,13 +648,19 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
     type Item = Result<WorkspaceFileStatus, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        info!("Get next item for status iteration in {:?}", self.cur_path);
         loop {
-            match self.read_dir.next() {
-                Some(Ok(entry)) => {
+            let next_item =
+                match self.cur_dir {
+                    Some((ref mut read_dir, ref path)) => read_dir.next()
+                        .map(|item|
+                            item.map(|item| (item, path.clone()))),
+                    None => None
+                };
+
+            match next_item {
+                Some(Ok((entry, mut path))) => {
                     let file_name = PathBuf::from(entry.file_name());
                     debug!("Regular file entry {}", file_name.display());
-                    let mut path = self.cur_path.clone();
                     path.push_fs(&file_name);
 
                     match file_name.extension() {
@@ -619,16 +669,21 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
                                 Ok(file_type) => if file_type.is_dir() {
                                     self.sub_dirs.push(path);
                                 } else if file_type.is_file() {
-                                    let status = match self.overlay.resolve_object_ref(path.overlay_path()) {
-                                        Ok(obj_ref) => if obj_ref.is_some() {
-                                            FileState::Modified
-                                        } else {
-                                            FileState::New
-                                        },
-                                        Err(err) => break Some(Err(err.into()))
-                                    };
-
-                                    break Some(Ok(WorkspaceFileStatus(path.overlay_path().to_path_buf(), status)));
+                                    let object_ref =
+                                        self.overlay.resolve_object_ref(path.overlay_path());
+                                    let status =
+                                        match object_ref {
+                                            Ok(obj_ref) => if obj_ref.is_some() {
+                                                FileState::Modified
+                                            } else {
+                                                FileState::New
+                                            },
+                                            Err(err) => break Some(Err(err.into()))
+                                        };
+                                    let workspace_file_status = WorkspaceFileStatus(
+                                        path.overlay_path().to_path_buf(),
+                                        status);
+                                    break Some(Ok(workspace_file_status));
                                 } else if file_type.is_symlink() {
                                     warn!("Cannot handle symlinks yet");
                                 }
@@ -638,7 +693,10 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
                         }
 
                         Some(ext) if ext == OsStr::new("d") => {
-                            break Some(Ok(WorkspaceFileStatus(path.overlay_path().to_path_buf(), FileState::Deleted)));
+                            let workspace_file_status = WorkspaceFileStatus(
+                                path.overlay_path().to_path_buf(),
+                                FileState::Deleted);
+                            break Some(Ok(workspace_file_status));
                         }
 
                         _ => warn!("Cannot handle file \"{}\" in the overlay", path.abs_fs_path().display())
@@ -647,26 +705,14 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
 
                 Some(Err(err)) => break Some(Err(err.into())),
 
-                None => {
-                    debug!("No more files in current dir, checking for subdirs to iterate...");
-                    match self.sub_dirs.pop() {
-                        Some(path) => {
-                            info!("Iterating {}", path.abs_fs_path().display());
-                            match fs::read_dir(path.abs_fs_path()) {
-                                Ok(read_dir) => {
-                                    self.read_dir = read_dir;
-                                    self.cur_path = path;
-                                }
-
-                                Err(err) => break Some(Err(err.into()))
-                            }
-                        }
-
-                        None => {
-                            info!("No further subdirs to iterate");
-                            break None
+                None => match self.sub_dirs.pop() {
+                    Some(sub_dir) => {
+                        match fs::read_dir(sub_dir.abs_fs_path()) {
+                            Ok(read_dir) => self.cur_dir = Some((read_dir, sub_dir)),
+                            Err(err) => break Some(Err(err.into()))
                         }
                     }
+                    None => break None
                 }
             }
         }
@@ -787,9 +833,9 @@ pub mod testutil {
         let cache_dir = path.as_ref().join("cache");
         let overlay_dir = path.as_ref().join("overlay");
 
-        let cache = HashFileCache::new(NullCache, &cache_dir)
+        let cache = HashFileCache::new(NullCache::default(), &cache_dir)
             .expect("Unable to create cache");
-        FilesystemOverlay::new(cache, &overlay_dir, "irrelevant")
+        FilesystemOverlay::new(cache, &overlay_dir, "master")
             .expect("Unable to create overlay")
     }
 

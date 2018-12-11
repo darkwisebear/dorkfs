@@ -17,6 +17,15 @@ pub enum ObjectType {
     Pipe
 }
 
+// This is basically a placeholder until creating a branch from a ref other than the
+// current HEAD is supported
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepoRef<'a> {
+    CacheRef(CacheRef),
+    Branch(&'a str)
+}
+
 impl ObjectType {
     fn from_file_type(file_type: fs::FileType) -> Result<ObjectType, Error> {
         if file_type.is_file() {
@@ -144,10 +153,14 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
 
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog<'a>;
-    type StatusIter: Iterator<Item=Result<WorkspaceFileStatus, Error>>;
+    type StatusIter: Iterator<Item=Result<WorkspaceFileStatus, Error>>+'a;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef, Error>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>, Error>;
-    fn get_log<'b: 'a>(&'b self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
-    fn get_status<'b: 'a>(&'b self) -> Result<Self::StatusIter, Error>;
+    fn get_current_branch(&self) -> Result<Option<&str>, Error>;
+    fn switch_branch(&mut self, branch: &str) -> Result<CacheRef, Error>;
+    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
+        -> Result<(), Error>;
+    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
+    fn get_status(&'a self) -> Result<Self::StatusIter, Error>;
 }

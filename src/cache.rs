@@ -301,8 +301,9 @@ pub trait CacheLayer: Debug {
     fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef>;
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
 
-    fn get_head_commit(&self, _branch: &str) -> Result<Option<CacheRef>>;
-    fn merge_commit(&self, _branch: &str, cache_ref: CacheRef) -> Result<CacheRef>;
+    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>>;
+    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef>;
+    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()>;
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
@@ -421,8 +422,12 @@ impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
         self.inner.get_head_commit(branch)
     }
 
-    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
         self.inner.merge_commit(branch, cache_ref)
+    }
+
+    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
+        self.inner.create_branch(branch, cache_ref)
     }
 }
 
@@ -456,8 +461,12 @@ impl<C, F, D> CacheLayer for Box<C> where C: CacheLayer<File=F, Directory=D>+?Si
         (**self).get_head_commit(branch)
     }
 
-    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
         (**self).merge_commit(branch, cache_ref)
+    }
+
+    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
+        (**self).create_branch(branch, cache_ref)
     }
 }
 #[cfg(test)]
@@ -481,7 +490,7 @@ mod test {
             f()
         }
 
-        let test_cache_layer = boxed(NullCache);
+        let test_cache_layer = boxed(NullCache::default());
         bounds_test(move || assert!(test_cache_layer.get_head_commit("(unused)").is_ok()));
     }
 }

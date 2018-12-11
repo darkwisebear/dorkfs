@@ -462,11 +462,14 @@ impl CacheLayer for Github {
                 ref_info_result.map(|(_, cache_ref)| cache_ref))
     }
 
-    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> cache::Result<CacheRef> {
+    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> cache::Result<CacheRef> {
         self.update_branch_head(branch, cache_ref)
     }
-}
 
+    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<(), CacheError> {
+        self.create_git_ref(branch, cache_ref)
+    }
+}
 
 impl Github {
     pub fn new(base_url: &str, org: &str, repo: &str, token: &str)
@@ -900,18 +903,29 @@ query {{ \
                     Error::GitOperationFailure(ff_ref_response_status).into()))
             }
         } else {
-            // Ref doesn't exist yet, we POST it
-            let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs",
-                              baseuri=self.rest_base_uri,
-                              owner=self.org,
-                              repo=self.repo);
-            let request = Request::post(Uri::from_shared(uri.into()).unwrap());
-            let body = format!(r#"{{ "ref": "refs/heads/{gitref}", "sha": "{sha}" }}"#,
-                               gitref=branch,
-                               sha=cache_ref_to_sha(cache_ref.to_string()));
-            self.issue_request(request, Body::from(body))?;
-            Ok(cache_ref)
+            self.create_git_ref(branch, cache_ref)
+                .map(|_| cache_ref)
         }
+    }
+
+    fn create_git_ref(&self, branch: &str, cache_ref: CacheRef) -> cache::Result<()> {
+        // Ref doesn't exist yet, we POST it
+        let uri = format!("{baseuri}/repos/{owner}/{repo}/git/refs",
+                          baseuri = self.rest_base_uri,
+                          owner = self.org,
+                          repo = self.repo);
+        let request = Request::post(Uri::from_shared(uri.into()).unwrap());
+        let body = format!(r#"{{ "ref": "refs/heads/{gitref}", "sha": "{sha}" }}"#,
+                           gitref = branch,
+                           sha = cache_ref_to_sha(cache_ref.to_string()));
+        self.issue_request(request, Body::from(body))
+            .and_then(|response|
+                if response.status() != StatusCode::CREATED {
+                    Err(CacheError::LayerError(Error::GitOperationFailure(response.status())
+                        .into()))
+                } else {
+                    Ok(())
+                })
     }
 }
 
@@ -1015,7 +1029,7 @@ mod test {
         use std::io::Write;
 
         ::init_logging();
-        let github = setup_github();
+        let mut github = setup_github();
         let head_commit_ref = github.get_head_commit("test")
             .expect("Unable to get the head commit ref of the test branch")
             .expect("No head commit in test branch");
@@ -1091,7 +1105,7 @@ mod test {
     fn merge_concurrent_changes() {
         ::init_logging();
 
-        let gh = setup_github();
+        let mut gh = setup_github();
         let mut rng = StdRng::from_entropy();
 
         let current_head = gh.get_head_commit("mergetest")

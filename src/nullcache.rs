@@ -1,8 +1,11 @@
-use std::path::Path;
-use std::iter::IntoIterator;
-use std::vec::IntoIter;
-use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::fs::File;
+use std::{
+    path::Path,
+    iter::IntoIterator,
+    vec::IntoIter,
+    io::{self, Read, Write, Seek, SeekFrom},
+    fs::File,
+    collections::HashMap
+};
 
 use tiny_keccak::Keccak;
 
@@ -90,8 +93,10 @@ impl IntoIterator for NullDirectory {
 
 impl Directory for NullDirectory {}
 
-#[derive(Debug)]
-pub struct NullCache;
+#[derive(Debug, Default)]
+pub struct NullCache {
+    branches: HashMap<String, CacheRef>
+}
 
 impl CacheLayer for NullCache {
     type File = NullFile;
@@ -138,11 +143,17 @@ impl CacheLayer for NullCache {
         Ok(CacheRef(keccak.into()))
     }
 
-    fn get_head_commit(&self, _branch: &str) -> Result<Option<CacheRef>, CacheError> {
-        Ok(None)
+    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>, CacheError> {
+        Ok(self.branches.get(branch).cloned())
     }
 
-    fn merge_commit(&self, _branch: &str, cache_ref: CacheRef) -> Result<CacheRef, CacheError> {
+    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef, CacheError> {
+        self.branches.insert(branch.to_string(), cache_ref);
         Ok(cache_ref)
+    }
+
+    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<(), CacheError> {
+        self.branches.insert(branch.to_string(), cache_ref);
+        Ok(())
     }
 }

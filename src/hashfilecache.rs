@@ -234,8 +234,12 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         self.cache.get_head_commit(branch)
     }
 
-    fn merge_commit(&self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
         self.cache.merge_commit(branch, cache_ref)
+    }
+
+    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
+        self.cache.create_branch(branch, cache_ref)
     }
 }
 

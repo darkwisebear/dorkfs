@@ -56,7 +56,7 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
         match self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut overlay_file)) =>
                 overlay_file.close(),
-            ControlFile::InnerOverlayFile(_) => Ok(())
+            ControlFile::InnerOverlayFile(ref mut overlay_file) => overlay_file.close()
         }
     }
 
@@ -212,12 +212,6 @@ impl<F, O> OverlayFile for BufferedFile<F, O>
     }
 }
 
-#[derive(Debug)]
-pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    overlay: Arc<RwLock<O>>,
-    special_files: HashMap<&'static str, Box<SpecialFile<O>>>
-}
-
 #[derive(Debug, Clone)]
 struct LogFileOps;
 
@@ -295,6 +289,48 @@ impl SpecialFileOps for CommitFileOps {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BranchFileOps;
+
+impl SpecialFileOps for BranchFileOps {
+    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>, Error>
+        where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+        control_dir.get_current_branch()
+            .map(|branch| branch.unwrap_or("(detached)").as_bytes().to_vec())
+    }
+
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error>
+        where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+        let target_branch = str::from_utf8(buffer)?;
+        if Some(target_branch) != control_dir.get_current_branch()? {
+            control_dir.switch_branch(target_branch.trim())
+                .map(|cache_ref|
+                    info!("Successfully switched to branch {} ({})", target_branch, cache_ref))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CreateBranchFileOps;
+
+impl SpecialFileOps for CreateBranchFileOps {
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error>
+        where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+        str::from_utf8(buffer)
+            .map_err(Into::into)
+            .and_then(|target_branch|
+                control_dir.create_branch(target_branch.trim(), None))
+    }
+}
+
+#[derive(Debug)]
+pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
+    overlay: Arc<RwLock<O>>,
+    special_files: HashMap<&'static str, Box<SpecialFile<O>>>
+}
+
 impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     pub fn new(overlay: O) -> Self {
 
@@ -308,6 +344,12 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
         special_files.insert("status",
                              Box::new(BufferedFileFactory::new(WorkspaceStatusFileOps))
                                  as Box<dyn SpecialFile<O>>);
+        special_files.insert("current_branch",
+                             Box::new(BufferedFileFactory::new(BranchFileOps))
+                                 as Box<dyn SpecialFile<O>>);
+        special_files.insert("create_branch",
+                             Box::new(BufferedFileFactory::new(CreateBranchFileOps))
+                                 as Box<dyn SpecialFile<O>>);
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -316,6 +358,11 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
 
     pub fn get_overlay<'a>(&'a self) -> impl Deref<Target=O>+'a {
         self.overlay.read().unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn get_overlay_mut<'a>(&'a self) -> impl ::std::ops::DerefMut<Target=O>+'a {
+        self.overlay.write().unwrap()
     }
 }
 
@@ -434,6 +481,99 @@ mod test {
             .expect("No head commit available")
             .expect("Error while retrieving head commit");
         assert_eq!("Test commit message", head_commit.message.as_str());
+    }
+
+    #[test]
+    fn switch_between_branches() {
+        ::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut file1 =
+            control_overlay.open_file("file1.txt", true)
+                .expect("Unable to open test file");
+        file1.write(b"Test 1")
+            .expect("Unable to write to test file");
+        file1.close().expect("Couldn't close test file");
+
+        control_overlay.get_overlay_mut()
+            .commit("Commit to first branch")
+            .expect("Unable to create first commit");
+
+        let mut create_branch =
+            control_overlay.open_file(".dork/create_branch", true)
+                .expect("Unable to open create_branch special file");
+        create_branch.write_all(b"feature")
+            .expect("Create branch \"feature\" failed");
+        create_branch.close().unwrap();
+
+        let mut switch_branch =
+            control_overlay.open_file(".dork/current_branch", false)
+                .expect("Unable to open current_branch for reading");
+        let mut content = Vec::new();
+        switch_branch.read_to_end(&mut content).unwrap();
+        assert_eq!(b"master", content.as_slice());
+        switch_branch.close().unwrap();
+
+        let mut switch_branch =
+            control_overlay.open_file(".dork/current_branch", true)
+                .expect("Unable to open current_branch for reading");
+        switch_branch.write_all(b"feature").unwrap();
+        switch_branch.close().unwrap();
+
+        let mut switch_branch =
+            control_overlay.open_file(".dork/current_branch", false)
+                .expect("Unable to open current_branch for reading");
+        let mut content = Vec::new();
+        switch_branch.read_to_end(&mut content).unwrap();
+        assert_eq!(b"feature", content.as_slice());
+        switch_branch.close().unwrap();
+
+        control_overlay.get_overlay_mut().switch_branch("feature")
+            .expect("Should work since our working copy is clean");
+
+        let mut file2 =
+            control_overlay.open_file("file2.txt", true)
+                .expect("Unable to open test file");
+        file2.write(b"Test 2")
+            .expect("Unable to write to test file");
+        file2.close().expect("Couldn't close test file");
+
+        control_overlay.get_overlay_mut().commit("Commit to second branch")
+            .expect("Unable to create second commit");
+
+        control_overlay.get_overlay_mut().switch_branch("master").unwrap();
+
+        let mut file1 =
+            control_overlay.open_file("file1.txt", false)
+                .expect("Unable to open first test file");
+        let mut content = Vec::new();
+        file1.read_to_end(&mut content)
+            .expect("Unable to read from first file");
+        assert_eq!(b"Test 1", content.as_slice());
+
+        control_overlay.open_file("file2.txt", false)
+            .expect_err("File 2 is there but it shouldn't");
+
+        control_overlay.get_overlay_mut().switch_branch("feature").unwrap();
+
+        let mut file1 =
+            control_overlay.open_file("file1.txt", false)
+                .expect("Unable to open first test file");
+        let mut content = Vec::new();
+        file1.read_to_end(&mut content)
+            .expect("Unable to read from first file");
+        assert_eq!(b"Test 1", content.as_slice());
+
+        let mut file2 =
+            control_overlay.open_file("file2.txt", false)
+                .expect("Unable to open second test file");
+        let mut content = Vec::new();
+        file2.read_to_end(&mut content)
+            .expect("Unable to read from second file");
+        assert_eq!(b"Test 2", content.as_slice());
     }
 
     #[test]
