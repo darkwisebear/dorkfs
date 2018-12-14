@@ -483,7 +483,7 @@ mod test {
 
     #[test]
     fn check_thread_safety() {
-        use nullcache::NullCache;
+        use crate::nullcache::NullCache;
         use super::{boxed, CacheLayer};
 
         fn bounds_test<F: FnOnce()+Send+Sync+'static>(f: F) {

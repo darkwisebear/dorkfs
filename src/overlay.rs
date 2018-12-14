@@ -12,9 +12,9 @@ use std::ffi::OsStr;
 
 use failure::Error;
 
-use types::*;
-use utility::*;
-use cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject};
+use crate::types::*;
+use crate::utility::*;
+use crate::cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject};
 
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
@@ -822,10 +822,10 @@ pub mod testutil {
         collections::HashMap
     };
 
-    use types::{FileState, WorkspaceController};
-    use hashfilecache::HashFileCache;
-    use overlay::*;
-    use nullcache::NullCache;
+    use crate::types::{FileState, WorkspaceController};
+    use crate::hashfilecache::HashFileCache;
+    use crate::overlay::*;
+    use crate::nullcache::NullCache;
 
     use failure::Error;
 
@@ -865,9 +865,9 @@ mod test {
         path::Path
     };
     use tempfile::tempdir;
-    use overlay::*;
+    use crate::overlay::*;
     use super::testutil::*;
-    use types::{WorkspaceController, Overlay, OverlayDirEntry, FileState};
+    use crate::types::{WorkspaceController, Overlay, OverlayDirEntry, FileState};
 
     #[cfg(target_os = "windows")]
     mod overlay_path_win {
@@ -943,7 +943,7 @@ mod test {
 
     #[test]
     fn create_root_commit() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -996,7 +996,7 @@ mod test {
 
     #[test]
     fn two_commits() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1025,7 +1025,7 @@ mod test {
 
     #[test]
     fn reopen_workspace() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1048,7 +1048,7 @@ mod test {
 
     #[test]
     fn commit_directories() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1085,7 +1085,7 @@ mod test {
 
     #[test]
     fn commit_empty_directory() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1107,7 +1107,7 @@ mod test {
 
     #[test]
     fn modify_file_after_commit() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1148,7 +1148,7 @@ mod test {
 
     #[test]
     fn delete_file_after_commit() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1170,7 +1170,7 @@ mod test {
 
     #[test]
     fn delete_file_from_workspace() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1187,7 +1187,7 @@ mod test {
 
     #[test]
     fn delete_file_from_repository() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1204,7 +1204,7 @@ mod test {
 
     #[test]
     fn delete_dir_from_workspace() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
@@ -1224,7 +1224,7 @@ mod test {
 
     #[test]
     fn delete_directory_in_overlay() {
-        ::init_logging();
+        crate::init_logging();
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());

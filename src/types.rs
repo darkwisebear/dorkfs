@@ -7,7 +7,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use failure::Error;
 
-use cache::{self, ReferencedCommit, CacheRef};
+use crate::cache::{self, ReferencedCommit, CacheRef};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ObjectType {

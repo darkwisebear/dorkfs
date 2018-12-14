@@ -44,9 +44,9 @@ use std::borrow::Cow;
 
 use failure::Error;
 
-use hashfilecache::HashFileCache;
-use overlay::FilesystemOverlay;
-use cache::CacheLayer;
+use crate::hashfilecache::HashFileCache;
+use crate::overlay::FilesystemOverlay;
+use crate::cache::CacheLayer;
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')

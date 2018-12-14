@@ -9,7 +9,7 @@ use std::str;
 
 use failure::Error;
 
-use types::*;
+use crate::types::*;
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
 
@@ -444,15 +444,15 @@ impl<O> Overlay for ControlDir<O>
 #[cfg(test)]
 mod test {
     use tempfile::tempdir;
-    use overlay::testutil::open_working_copy;
-    use types::{Overlay, OverlayFile, WorkspaceController};
+    use crate::overlay::testutil::open_working_copy;
+    use crate::types::{Overlay, OverlayFile, WorkspaceController};
     use std::io::{Read, Write};
     use std::iter::Iterator;
-    use cache::ReferencedCommit;
+    use crate::cache::ReferencedCommit;
 
     #[test]
     fn commit_via_file() {
-        ::init_logging();
+        crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
@@ -485,7 +485,7 @@ mod test {
 
     #[test]
     fn switch_between_branches() {
-        ::init_logging();
+        crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
@@ -578,7 +578,7 @@ mod test {
 
     #[test]
     fn fetch_empty_log() {
-        ::init_logging();
+        crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
@@ -593,7 +593,7 @@ mod test {
 
     #[test]
     fn dont_delete_control_files() {
-        ::init_logging();
+        crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);

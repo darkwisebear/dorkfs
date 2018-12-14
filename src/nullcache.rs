@@ -9,7 +9,7 @@ use std::{
 
 use tiny_keccak::Keccak;
 
-use cache::{self, CacheLayer, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
+use crate::cache::{self, CacheLayer, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
             DirectoryEntry, ReadonlyFile, Directory, Commit};
 
 pub struct HashWriter {

@@ -19,7 +19,7 @@ use failure;
 use base64;
 use bytes::Bytes;
 
-use cache::{DirectoryEntry, ReadonlyFile, CacheObject, CacheObjectMetadata, CacheError, CacheRef,
+use crate::cache::{DirectoryEntry, ReadonlyFile, CacheObject, CacheObjectMetadata, CacheError, CacheRef,
             self, CacheLayer, Directory, LayerError, Commit};
 
 lazy_static! {
@@ -138,7 +138,7 @@ pub struct Github {
 }
 
 mod restv3 {
-    use cache::{DirectoryEntry, ObjectType, Commit};
+    use crate::cache::{DirectoryEntry, ObjectType, Commit};
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct GitBlob {
@@ -222,7 +222,7 @@ mod graphql {
     use std::fmt::{self, Formatter};
     use std::sync::Arc;
 
-    use cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType};
+    use crate::cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType};
     use failure::Error;
     use serde::{Deserializer, de::Visitor};
     use super::{GithubBlob, GithubTree};
@@ -931,7 +931,7 @@ query {{ \
 
 #[cfg(test)]
 mod test {
-    use cache::{CacheLayer, DirectoryEntry, ObjectType};
+    use crate::cache::{CacheLayer, DirectoryEntry, ObjectType};
     use std::str::FromStr;
     use std::iter::FromIterator;
     use std::env;
@@ -953,7 +953,7 @@ mod test {
 
     #[test]
     fn get_github_commit() {
-        ::init_logging();
+        crate::init_logging();
         let github = setup_github();
         let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
         debug!("Commit from GitHub: {:?}", obj);
@@ -961,7 +961,7 @@ mod test {
 
     #[test]
     fn get_github_tree() {
-        ::init_logging();
+        crate::init_logging();
         let github = setup_github();
         let obj = github.get(&CacheRef::from_str("20325767a89a3f96949dee6f3cb29ad57f86c1c2000000000000000000000000").unwrap()).unwrap();
         debug!("Tree from GitHub: {:?}", obj);
@@ -969,7 +969,7 @@ mod test {
 
     #[test]
     fn get_github_blob() {
-        ::init_logging();
+        crate::init_logging();
         let github = setup_github();
         let cache_ref = CacheRef::from_str("77bd95d183dbe757ebd53c0aa95d1a710b85460f000000000000000000000000").unwrap();
         let obj = github.get(&cache_ref).unwrap();
@@ -1028,7 +1028,7 @@ mod test {
     fn change_file_and_commit() {
         use std::io::Write;
 
-        ::init_logging();
+        crate::init_logging();
         let mut github = setup_github();
         let head_commit_ref = github.get_head_commit("test")
             .expect("Unable to get the head commit ref of the test branch")
@@ -1063,7 +1063,7 @@ mod test {
             &mut root_tree.into_iter().map(|(_, v)| v))
             .expect("Unable to upload updated root dir");
 
-        let new_commit = ::cache::Commit {
+        let new_commit = crate::cache::Commit {
             tree: updated_root,
             parents: vec![head_commit_ref],
             message: "Test commit from unit test".to_string()
@@ -1103,7 +1103,7 @@ mod test {
 
     #[test]
     fn merge_concurrent_changes() {
-        ::init_logging();
+        crate::init_logging();
 
         let mut gh = setup_github();
         let mut rng = StdRng::from_entropy();

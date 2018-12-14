@@ -11,7 +11,7 @@ use rand::{prelude::*, distributions::Alphanumeric};
 use serde_json;
 use serde::Serialize;
 
-use cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
+use crate::cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
             CacheObject, ObjectType, CacheObjectMetadata, Commit};
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -11,12 +11,12 @@ use time::{get_time, Timespec};
 use fuse_mt::*;
 use libc;
 
-use control::*;
-use overlay::*;
-use types;
-use types::*;
-use cache::CacheLayer;
-use utility::OpenHandleSet;
+use crate::control::*;
+use crate::overlay::*;
+use crate::types;
+use crate::types::*;
+use crate::cache::CacheLayer;
+use crate::utility::OpenHandleSet;
 
 lazy_static! {
     static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
