@@ -12,7 +12,7 @@ use fuse_mt::*;
 use libc;
 
 use crate::control::*;
-use crate::overlay::*;
+use crate::overlay::{self, *};
 use crate::types;
 use crate::cache::CacheLayer;
 use crate::utility::OpenHandleSet;
@@ -336,14 +336,22 @@ impl<C> FilesystemMT for DorkFS<C> where
         })
     }
     fn unlink(&self, _req: RequestInfo, parent: &Path, name: &OsStr) -> ResultEmpty {
-        let path = parent.strip_prefix("/")
-            .expect("Expect absolute path")
-            .join(name);
-        let state = self.state.read().unwrap();
-        state.overlay.delete_file(path)
+        self.delete_file(parent, name)
             .map_err(|e| {
                 warn!("Unable to delete file: {}", e);
                 libc::ENOENT
+            })
+    }
+
+    fn rmdir(&self, _req: RequestInfo, parent: &Path, name: &OsStr) -> Result<(), i32> {
+        self.delete_file(parent, name)
+            .map_err(|e| match e {
+                overlay::Error::FileNotFound => libc::ENOENT,
+                overlay::Error::NonemptyDirectory => libc::ENOTEMPTY,
+                e => {
+                    warn!("Unable to remove directory: {}", e);
+                    libc::ENOENT
+                }
             })
     }
 }
@@ -403,5 +411,13 @@ impl<C> DorkFS<C> where
             name: OsString::from(dir_entry.name.clone()),
             kind
         }
+    }
+
+    fn delete_file(&self, parent: &Path, name: &OsStr) -> overlay::Result<()> {
+        let path = parent.strip_prefix("/")
+            .expect("Expect absolute path")
+            .join(name);
+        let state = self.state.read().unwrap();
+        state.overlay.delete_file(path)
     }
 }

@@ -939,6 +939,12 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     }
 
     fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        if self.metadata(path.as_ref())?.object_type == ObjectType::Directory {
+            if !self.list_directory::<Vec<_>, _>(path.as_ref())?.is_empty() {
+                return Err(Error::NonemptyDirectory)
+            }
+        }
+
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let source_path = overlay_path.abs_fs_path();
@@ -950,7 +956,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
             if self.resolve_object_ref(overlay_path.overlay_path())?.is_none() {
                 debug!("Deleting: Remove overlay file {}", source_path.display());
                 if source_path.is_dir() {
-                    fs::remove_dir_all(source_path)
+                    fs::remove_dir(source_path)
                 } else {
                     fs::remove_file(source_path)
                 }
@@ -1384,6 +1390,7 @@ mod test {
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
+        overlay.delete_file("a/dir/test.txt").expect("File deletion failed");
         overlay.delete_file("a/dir").expect("Dir deletion failed");
         overlay.open_file("a/dr/test.txt", false)
             .expect_err("File can still be opened");
@@ -1405,6 +1412,7 @@ mod test {
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
         overlay.commit("A test commit").expect("Unable to create first commit");
+        overlay.delete_file("a/dir/test.txt").expect("File deletion failed");
         overlay.delete_file("a/dir").expect("Dir deletion failed");
         overlay.commit("Committing deleted dir").expect("Unable to create second commit");
         overlay.open_file("a/dir/test.txt", false)
