@@ -9,7 +9,10 @@ use std::str;
 
 use failure::Error;
 
-use crate::types::*;
+use crate::{
+    types::*,
+    overlay::*
+};
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
 
@@ -476,12 +479,20 @@ impl<O> Overlay for ControlDir<O>
 
 #[cfg(test)]
 mod test {
+    use std::{
+        io::{Read, Write},
+        iter::Iterator
+    };
+
     use tempfile::tempdir;
-    use crate::overlay::testutil::open_working_copy;
-    use crate::types::{Overlay, OverlayFile, WorkspaceController};
-    use std::io::{Read, Write};
-    use std::iter::Iterator;
-    use crate::cache::ReferencedCommit;
+
+    use crate::{
+        cache::ReferencedCommit,
+        overlay::{
+            testutil::open_working_copy,
+            Overlay, OverlayFile, WorkspaceController
+        }
+    };
 
     #[test]
     fn commit_via_file() {

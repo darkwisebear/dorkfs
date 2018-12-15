@@ -14,7 +14,6 @@ use libc;
 use crate::control::*;
 use crate::overlay::*;
 use crate::types;
-use crate::types::*;
 use crate::cache::CacheLayer;
 use crate::utility::OpenHandleSet;
 

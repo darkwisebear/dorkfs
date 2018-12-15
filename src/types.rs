@@ -1,13 +1,8 @@
-use std::hash::{Hash, Hasher};
 use std::fs;
-use std::io::{Read, Write, Seek};
-use std::path::{Path, PathBuf};
-use std::iter::FromIterator;
-use std::fmt::{self, Debug, Display, Formatter};
 
 use failure::Error;
 
-use crate::cache::{self, ReferencedCommit, CacheRef};
+use crate::cache::{self, CacheRef};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ObjectType {
@@ -72,96 +67,4 @@ impl Metadata {
 
         Ok(metadata)
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct OverlayDirEntry {
-    pub name: String,
-    pub metadata: Metadata
-}
-
-impl PartialEq for OverlayDirEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.name.eq(&other.name)
-    }
-}
-
-impl Eq for OverlayDirEntry {}
-
-impl Hash for OverlayDirEntry {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.name.hash(hasher);
-    }
-}
-
-impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
-    fn from(val: (&'a str, &'a Metadata)) -> OverlayDirEntry {
-        OverlayDirEntry {
-            name: val.0.to_owned(),
-            metadata: val.1.clone()
-        }
-    }
-}
-
-pub trait OverlayFile: Read+Write+Seek {
-    fn close(&mut self) -> Result<(), Error>;
-    fn truncate(&mut self, size: u64) -> Result<(), Error>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FileState {
-    New,
-    Modified,
-    Deleted
-}
-
-impl Display for FileState {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let literal = match self {
-            FileState::New => "new",
-            FileState::Modified => "modified",
-            FileState::Deleted => "deleted"
-        };
-        f.write_str(literal)
-    }
-}
-
-pub trait Overlay: Debug {
-    type File: OverlayFile;
-
-    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error>;
-    fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
-        where I: FromIterator<OverlayDirEntry>,
-              P: AsRef<Path>;
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error>;
-    fn exists<P: AsRef<Path>>(&self, path: P) -> bool {
-        self.metadata(path).is_ok()
-    }
-    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error>;
-    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error>;
-}
-
-pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit, Error>> { }
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WorkspaceFileStatus(pub PathBuf, pub FileState);
-
-impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
-    fn from(val: (P, FileState)) -> Self {
-        WorkspaceFileStatus(val.0.as_ref().to_path_buf(), val.1)
-    }
-}
-
-pub trait WorkspaceController<'a>: Debug {
-    type Log: WorkspaceLog<'a>;
-    type StatusIter: Iterator<Item=Result<WorkspaceFileStatus, Error>>+'a;
-
-    fn commit(&mut self, message: &str) -> Result<CacheRef, Error>;
-    fn get_current_head_ref(&self) -> Result<Option<CacheRef>, Error>;
-    fn get_current_branch(&self) -> Result<Option<&str>, Error>;
-    fn switch_branch(&mut self, branch: &str) -> Result<CacheRef, Error>;
-    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
-        -> Result<(), Error>;
-    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
-    fn get_status(&'a self) -> Result<Self::StatusIter, Error>;
 }
