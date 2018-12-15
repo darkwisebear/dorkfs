@@ -2,7 +2,7 @@ use std::path::Path;
 use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
 use std::iter::FromIterator;
 use std::fmt::{self, Debug, Formatter};
-use std::collections::HashMap;
+use std::collections::{hash_map, HashMap};
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::str;
@@ -303,7 +303,7 @@ impl SpecialFileOps for BranchFileOps {
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         let target_branch = str::from_utf8(buffer)?;
         if Some(target_branch) != control_dir.get_current_branch()? {
-            control_dir.switch_branch(target_branch.trim())
+            control_dir.switch_branch(target_branch.trim_end_matches('\n'))
                 .map(|cache_ref|
                     info!("Successfully switched to branch {} ({})", target_branch, cache_ref))
         } else {
@@ -321,35 +321,60 @@ impl SpecialFileOps for CreateBranchFileOps {
         str::from_utf8(buffer)
             .map_err(Into::into)
             .and_then(|target_branch|
-                control_dir.create_branch(target_branch.trim(), None))
+                control_dir.create_branch(target_branch.trim_end_matches('\n'), None))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RevertFileOps;
+
+impl SpecialFileOps for RevertFileOps {
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error> where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+        str::from_utf8(buffer)
+            .map(|p| Path::new(p.trim_end_matches('\n')))
+            .map_err(Into::into)
+            .and_then(|overlay_path| control_dir.revert_file(overlay_path))
+    }
+}
+
+#[derive(Debug)]
+struct SpecialFileRegistry<O>(HashMap<&'static str, Box<SpecialFile<O>>>)
+    where for<'a> O: Overlay+WorkspaceController<'a>;
+
+impl<O> SpecialFileRegistry<O> where for<'a> O: Overlay+WorkspaceController<'a>+Send+Sync+'static {
+    fn new() -> Self {
+        SpecialFileRegistry(HashMap::new())
+    }
+
+    fn insert_buffered<T>(&mut self, name: &'static str, ops: T)
+        where T: SpecialFileOps+Send+Sync+'static {
+        self.0.insert(name, Box::new(BufferedFileFactory::new(ops)) as _);
+    }
+
+    fn get(&self, name: &str) -> Option<&dyn SpecialFile<O>> {
+        self.0.get(name).map(Box::as_ref)
+    }
+
+    fn iter<'a>(&'a self) -> hash_map::Iter<'a, &'static str, Box<dyn SpecialFile<O>>> {
+        self.0.iter()
     }
 }
 
 #[derive(Debug)]
 pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     overlay: Arc<RwLock<O>>,
-    special_files: HashMap<&'static str, Box<SpecialFile<O>>>
+    special_files: SpecialFileRegistry<O>
 }
 
 impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     pub fn new(overlay: O) -> Self {
-
-        let mut special_files = HashMap::new();
-        special_files.insert("log",
-                             Box::new(BufferedFileFactory::new(LogFileOps))
-                                 as Box<dyn SpecialFile<O>>);
-        special_files.insert("commit",
-                             Box::new(BufferedFileFactory::new(CommitFileOps))
-                                 as Box<dyn SpecialFile<O>>);
-        special_files.insert("status",
-                             Box::new(BufferedFileFactory::new(WorkspaceStatusFileOps))
-                                 as Box<dyn SpecialFile<O>>);
-        special_files.insert("current_branch",
-                             Box::new(BufferedFileFactory::new(BranchFileOps))
-                                 as Box<dyn SpecialFile<O>>);
-        special_files.insert("create_branch",
-                             Box::new(BufferedFileFactory::new(CreateBranchFileOps))
-                                 as Box<dyn SpecialFile<O>>);
+        let mut special_files = SpecialFileRegistry::new();
+        special_files.insert_buffered("log", LogFileOps);
+        special_files.insert_buffered("commit", CommitFileOps);
+        special_files.insert_buffered("status", WorkspaceStatusFileOps);
+        special_files.insert_buffered("current_branch", BranchFileOps);
+        special_files.insert_buffered("create_branch", CreateBranchFileOps);
+        special_files.insert_buffered("revert", RevertFileOps);
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -409,7 +434,7 @@ impl<O> Overlay for ControlDir<O>
                 }).collect()
             }
 
-            _ => self.overlay.read().unwrap().list_directory(&path)
+            _ => self.overlay.read().unwrap().list_directory(path)
         }
     }
 
@@ -437,6 +462,14 @@ impl<O> Overlay for ControlDir<O>
             bail!("Cannot delete .dork special files")
         } else {
             self.overlay.read().unwrap().delete_file(path)
+        }
+    }
+
+    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+        if path.as_ref().starts_with(DORK_DIR_ENTRY) {
+            bail!("Cannot revert .dork special files")
+        } else {
+            self.overlay.read().unwrap().revert_file(path)
         }
     }
 }
@@ -607,5 +640,71 @@ mod test {
         drop(file);
 
         control_overlay.delete_file("test.txt").unwrap();
+    }
+
+    #[test]
+    fn revert_file() {
+        crate::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut file1 =
+            control_overlay.open_file("file1.txt", true)
+                .expect("Unable to open test file");
+        file1.write(b"Test 1")
+            .expect("Unable to write to test file");
+        file1.close().expect("Couldn't close test file");
+        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+
+        let mut revert_file =
+            control_overlay.open_file(".dork/revert", true)
+                .expect("Unable to open revert file");
+        revert_file.write_all(b"file1.txt")
+            .expect("unable to write to revert file");
+        revert_file.close().unwrap();
+        assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
+    }
+
+    #[test]
+    fn revert_directory() {
+        crate::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut file1 =
+            control_overlay.open_file("file1.txt", true)
+                .expect("Unable to open test file");
+        file1.write(b"Test 1")
+            .expect("Unable to write to test file");
+        file1.close().expect("Couldn't close test file");
+        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+
+        let mut file2 =
+            control_overlay.open_file("dir/file2.txt", true)
+                .expect("Unable to open test file");
+        file2.write(b"Test 2")
+            .expect("Unable to write to test file");
+        file2.close().expect("Couldn't close test file");
+        assert_eq!(2, control_overlay.get_overlay().get_status().unwrap().count());
+
+        let mut revert_file =
+            control_overlay.open_file(".dork/revert", true)
+                .expect("Unable to open revert file");
+        revert_file.write_all(b"file1.txt")
+            .expect("unable to write to revert file");
+        revert_file.close().unwrap();
+        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+
+        let mut revert_file =
+            control_overlay.open_file(".dork/revert", true)
+                .expect("Unable to open revert file");
+        revert_file.write_all(b"dir")
+            .expect("unable to write to revert dir");
+        revert_file.close().unwrap();
+        assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
     }
 }

@@ -131,6 +131,10 @@ impl OverlayPath {
         self.abs_fs_path.as_path()
     }
 
+    pub fn into_abs_fs_path(self) -> PathBuf {
+        self.abs_fs_path
+    }
+
     pub fn push_overlay<P: Into<PathBuf>>(&mut self, subdir: P) {
         let mut subdir = subdir.into().into_os_string();
         self.rel_overlay_path.push(&subdir);
@@ -812,6 +816,22 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 .map_err(Into::into)
         }
     }
+
+    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+        OverlayPath::with_overlay_path(
+            Self::file_path(&self.base_path), path.as_ref())
+            .map(OverlayPath::into_abs_fs_path)
+            .and_then(|fs_path|
+                if fs_path.is_dir() {
+                    info!("Reverting directory {} in {}",
+                          path.as_ref().display(), fs_path.display());
+                    fs::remove_dir_all(fs_path)
+                } else {
+                    info!("Reverting file {} in {}",
+                          path.as_ref().display(), fs_path.display());
+                    fs::remove_file(fs_path)
+                }.map_err(Into::into))
+    }
 }
 
 #[cfg(test)]
@@ -871,7 +891,7 @@ mod test {
 
     #[cfg(target_os = "windows")]
     mod overlay_path_win {
-        use overlay::OverlayPath;
+        use crate::overlay::OverlayPath;
         use std::path::Path;
 
         #[test]

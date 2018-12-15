@@ -138,6 +138,7 @@ pub trait Overlay: Debug {
         self.metadata(path).is_ok()
     }
     fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error>;
+    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error>;
 }
 
 pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit, Error>> { }
