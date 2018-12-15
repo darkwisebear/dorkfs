@@ -10,11 +10,62 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 
-use failure::Error;
-
 use crate::types::*;
 use crate::utility::*;
-use crate::cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject};
+use crate::cache::{
+    self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject, CacheError
+};
+
+#[derive(Debug, Fail)]
+pub enum Error {
+    #[fail(display = "Directory not empty")]
+    NonemptyDirectory,
+
+    #[fail(display = "File not found")]
+    FileNotFound,
+
+    #[fail(display = "IO error: {}", _0)]
+    IoError(io::Error),
+
+    #[fail(display = "Cache error: {}", _0)]
+    CacheError(CacheError),
+
+    #[fail(display = "{}", _0)]
+    Generic(failure::Error)
+}
+
+impl Error {
+    pub fn from_fail<E: failure::Fail>(e: E) -> Self {
+        Error::Generic(failure::Error::from(e))
+    }
+
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::IoError(e)
+    }
+}
+
+impl From<CacheError> for Error {
+    fn from(e: CacheError) -> Self {
+        Error::CacheError(e)
+    }
+}
+
+impl From<failure::Error> for Error {
+    fn from(e: failure::Error) -> Self {
+        Error::Generic(e)
+    }
+}
+
+impl From<&'static str> for Error {
+    fn from(e: &'static str) -> Self {
+        Error::Generic(failure::err_msg(e))
+    }
+}
+
+pub type Result<T> = ::std::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
@@ -46,8 +97,8 @@ impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
 }
 
 pub trait OverlayFile: Read+Write+Seek {
-    fn close(&mut self) -> Result<(), Error>;
-    fn truncate(&mut self, size: u64) -> Result<(), Error>;
+    fn close(&mut self) -> Result<()>;
+    fn truncate(&mut self, size: u64) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,19 +122,19 @@ impl Display for FileState {
 pub trait Overlay: Debug {
     type File: OverlayFile;
 
-    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error>;
-    fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
+    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File>;
+    fn list_directory<I,P>(&self, path: P) -> Result<I>
         where I: FromIterator<OverlayDirEntry>,
               P: AsRef<Path>;
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error>;
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
     fn exists<P: AsRef<Path>>(&self, path: P) -> bool {
         self.metadata(path).is_ok()
     }
-    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error>;
-    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error>;
+    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<()>;
+    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<()>;
 }
 
-pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit, Error>> { }
+pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit>> { }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceFileStatus(pub PathBuf, pub FileState);
@@ -96,16 +147,16 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
 
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog<'a>;
-    type StatusIter: Iterator<Item=Result<WorkspaceFileStatus, Error>>+'a;
+    type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
 
-    fn commit(&mut self, message: &str) -> Result<CacheRef, Error>;
-    fn get_current_head_ref(&self) -> Result<Option<CacheRef>, Error>;
-    fn get_current_branch(&self) -> Result<Option<&str>, Error>;
-    fn switch_branch(&mut self, branch: &str) -> Result<CacheRef, Error>;
+    fn commit(&mut self, message: &str) -> Result<CacheRef>;
+    fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
+    fn get_current_branch(&self) -> Result<Option<&str>>;
+    fn switch_branch(&mut self, branch: &str) -> Result<CacheRef>;
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
-                     -> Result<(), Error>;
-    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log, Error>;
-    fn get_status(&'a self) -> Result<Self::StatusIter, Error>;
+                     -> Result<()>;
+    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
+    fn get_status(&'a self) -> Result<Self::StatusIter>;
 }
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
@@ -114,14 +165,14 @@ pub enum FSOverlayFile<C: CacheLayer+Debug> {
 }
 
 impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
-    fn close(&mut self) -> Result<(), Error> {
+    fn close(&mut self) -> Result<()> {
         if let FSOverlayFile::FsFile(ref mut file) = *self {
             file.take();
         }
         Ok(())
     }
 
-    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+    fn truncate(&mut self, size: u64) -> Result<()> {
         if let FSOverlayFile::FsFile(ref mut file) = *self {
             let file = file.as_ref().unwrap().lock().unwrap();
             file.set_len(size).map_err(Error::from)
@@ -132,7 +183,7 @@ impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
 }
 
 impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             FSOverlayFile::FsFile(ref mut file) => {
                 let mut file = file.as_mut().unwrap().lock().unwrap();
@@ -144,7 +195,7 @@ impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
 }
 
 impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match *self {
             FSOverlayFile::FsFile(ref mut file) => {
                 let mut file = file.as_mut().unwrap().lock().unwrap();
@@ -154,7 +205,7 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
         }
     }
 
-    fn flush(&mut self) -> Result<(), io::Error> {
+    fn flush(&mut self) -> io::Result<()> {
         if let FSOverlayFile::FsFile(ref mut file) = *self {
             let mut file = file.as_mut().unwrap().lock().unwrap();
             file.flush()
@@ -165,7 +216,7 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
 }
 
 impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match *self {
             FSOverlayFile::FsFile(ref mut file) => {
                 let mut file = file.as_mut().unwrap().lock().unwrap();
@@ -193,7 +244,7 @@ impl OverlayPath {
         }
     }
 
-    pub fn with_overlay_path<P, Q>(base_path: P, rel_path: Q) -> Result<Self, Error>
+    pub fn with_overlay_path<P, Q>(base_path: P, rel_path: Q) -> Result<Self>
         where P: Into<PathBuf>,
               Q: AsRef<Path> {
         let mut path = OverlayPath::new(base_path);
@@ -281,7 +332,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         FSOverlayFile::FsFile(Some(file))
     }
 
-    pub fn new<P: AsRef<Path>>(cache: C, base_path: P, branch: &str) -> Result<Self, Error> {
+    pub fn new<P: AsRef<Path>>(cache: C, base_path: P, branch: &str) -> Result<Self> {
         fs::create_dir_all(Self::file_path(base_path.as_ref()))?;
         let meta_path = Self::meta_path(base_path.as_ref());
         fs::create_dir_all(&meta_path)?;
@@ -321,12 +372,13 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         })
     }
 
-    fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>, Error> {
+    fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>> {
         match self.head {
             Some(head) => {
                 let commit = self.cache.get(&head)?.into_commit()
                     .expect("Head ref is not a commit");
                 cache::resolve_object_ref(&self.cache, &commit, path)
+                    .map_err(Error::Generic)
             }
 
             None => Ok(None)
@@ -334,7 +386,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn dir_entry_to_directory_entry(&self, dir_entry: DirEntry, mut overlay_path: OverlayPath)
-        -> Result<OverlayOperation<cache::DirectoryEntry>, Error> {
+        -> Result<OverlayOperation<cache::DirectoryEntry>> {
         let fs_name = os_string_to_string(dir_entry.file_name())?;
         let file_type = dir_entry.file_type()?;
         overlay_path.push_fs(&fs_name);
@@ -383,13 +435,13 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     fn iter_directory<I,T,F,G>(&self,
                                overlay_path: OverlayPath,
                                from_directory_entry: F,
-                               mut from_dir_entry: G) -> Result<I, Error>
+                               mut from_dir_entry: G) -> Result<I>
         where I: FromIterator<T>,
               T: Eq+Hash,
-              F: FnMut(DirectoryEntry) -> Result<T, Error>,
-              G: FnMut(DirEntry) -> Result<OverlayOperation<T>, Error> {
+              F: FnMut(DirectoryEntry) -> Result<T>,
+              G: FnMut(DirEntry) -> Result<OverlayOperation<T>> {
         // Get the directory contents from the cache if it's already there
-        let dir_entries_result: Result<HashSet<T>, Error> =
+        let dir_entries_result: Result<HashSet<T>> =
             if let Some(cache_dir_ref) = self.resolve_object_ref(overlay_path.overlay_path())? {
                 debug!("Reading dir {} with ref {} from cache", overlay_path.overlay_path().display(), &cache_dir_ref);
                 let dir = self.cache.get(&cache_dir_ref)?
@@ -419,7 +471,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(I::from_iter(dir_entries.into_iter()))
     }
 
-    fn dir_entry_to_overlay_dir_entry(dir_entry: fs::DirEntry) -> Result<OverlayOperation<OverlayDirEntry>, Error> {
+    fn dir_entry_to_overlay_dir_entry(dir_entry: fs::DirEntry) -> Result<OverlayOperation<OverlayDirEntry>> {
         let mut overlay_path = OverlayPath::new("");
         let fs_name = os_string_to_string(dir_entry.file_name())?;
         overlay_path.push_fs(&fs_name);
@@ -438,17 +490,18 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn directory_entry_to_overlay_dir_entry(&self, dir_entry: DirectoryEntry)
-        -> Result<OverlayDirEntry, Error> {
+        -> Result<OverlayDirEntry> {
         self.cache.metadata(&dir_entry.cache_ref)
             .map_err(Error::from)
-            .and_then(Metadata::from_cache_metadata)
+            .and_then(|meta| Metadata::from_cache_metadata(meta)
+                .map_err(Error::Generic))
             .map(move |metadata| OverlayDirEntry {
                 name: dir_entry.name,
                 metadata
             })
     }
 
-    fn generate_tree(&self, overlay_path: OverlayPath) -> Result<CacheRef, Error> {
+    fn generate_tree(&self, overlay_path: OverlayPath) -> Result<CacheRef> {
         let dir_entries: HashSet<DirectoryEntry> = self.iter_directory(
             overlay_path.clone(),
             |e| Ok(e),
@@ -460,7 +513,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         self.cache.add_directory(&mut directory).map_err(Into::into)
     }
 
-    fn pin_current_head(&mut self) -> Result<PathBuf, Error> {
+    fn pin_current_head(&mut self) -> Result<PathBuf> {
         let meta_path = Self::meta_path(&self.base_path);
         let head_file_path = meta_path.join("HEAD");
         if !head_file_path.exists() {
@@ -482,7 +535,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(head_file_path)
     }
 
-    fn clear_closed_files_in_path(&mut self, path: &mut OverlayPath) -> Result<(), Error> {
+    fn clear_closed_files_in_path(&mut self, path: &mut OverlayPath) -> Result<()> {
         debug!("Clearing overlay path {}", path.abs_fs_path().display());
 
         for entry_result in fs::read_dir(&*path.abs_fs_path())? {
@@ -515,7 +568,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(())
     }
 
-    fn clear_closed_files(&mut self) -> Result<(), Error> {
+    fn clear_closed_files(&mut self) -> Result<()> {
         self.overlay_files.retain(|_, file| file.upgrade().is_some());
 
         debug!("Currently open files: {:?}", self.overlay_files.keys().collect::<Vec<&PathBuf>>());
@@ -524,14 +577,14 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         self.clear_closed_files_in_path(&mut base_path)
     }
 
-    pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+    pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         fs::create_dir_all(&*overlay_path.abs_fs_path())
             .map_err(|e| e.into())
     }
 
     fn open_cache_file(&mut self, writable: bool, abs_fs_path: &Path, cache_path: &Path)
-                       -> Result<FSOverlayFile<C>, Error> {
+                       -> Result<FSOverlayFile<C>> {
         let cache_ref = self.resolve_object_ref(&cache_path)?;
         debug!("Opening cache ref {:?}", cache_ref);
 
@@ -564,7 +617,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             if let Some(cache_file) = cache_file {
                 Ok(FSOverlayFile::CacheFile(cache_file))
             } else {
-                bail!("File not found!");
+                Err(format_err!("File not found!").into())
             }
         }
     }
@@ -576,7 +629,7 @@ pub struct CacheLayerLog<'a, C: CacheLayer+'a> {
 }
 
 impl<'a, C: CacheLayer+'a> CacheLayerLog<'a, C> {
-    fn new<'b>(cache: &'a C, commit_ref: &'b CacheRef) -> Result<Self, Error> {
+    fn new<'b>(cache: &'a C, commit_ref: &'b CacheRef) -> Result<Self> {
         let log = CacheLayerLog {
             cache,
             next_cache_ref: Some(commit_ref.clone())
@@ -589,7 +642,7 @@ impl<'a, C: CacheLayer+'a> CacheLayerLog<'a, C> {
 impl<'a, C: CacheLayer+'a> WorkspaceLog<'a> for CacheLayerLog<'a, C> { }
 
 impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
-    type Item = Result<ReferencedCommit, Error>;
+    type Item = Result<ReferencedCommit>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_cache_ref.take().and_then(|cache_ref| {
@@ -606,8 +659,8 @@ impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
                     Some(Ok(ReferencedCommit(cache_ref, commit)))
                 }
 
-                Ok(_) => Some(Err(format_err!("Current ref {} doesn't reference a commit", cache_ref))),
-                Err(e) => Some(Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e)))
+                Ok(_) => Some(Err(format_err!("Current ref {} doesn't reference a commit", cache_ref).into())),
+                Err(e) => Some(Err(format_err!("Error retrieving cache object for ref {}: {}", cache_ref, e).into()))
             }
         })
     }
@@ -617,7 +670,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     type Log = CacheLayerLog<'a, C>;
     type StatusIter = FSStatusIter<'a, C>;
 
-    fn commit(&mut self, message: &str) -> Result<CacheRef, Error> {
+    fn commit(&mut self, message: &str) -> Result<CacheRef> {
         let file_path = Self::file_path(&self.base_path);
         let meta_path = Self::meta_path(&self.base_path);
         let overlay_path = OverlayPath::new(file_path);
@@ -664,27 +717,28 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         Ok(new_commit_ref)
     }
 
-    fn get_current_head_ref(&self) -> Result<Option<CacheRef>, Error> {
+    fn get_current_head_ref(&self) -> Result<Option<CacheRef>> {
         Ok(self.head)
     }
 
-    fn get_current_branch(&self) -> Result<Option<&str>, Error> {
+    fn get_current_branch(&self) -> Result<Option<&str>> {
         Ok(Some(self.branch.as_ref()))
     }
 
-    fn switch_branch(&mut self, new_branch: &str) -> Result<CacheRef, Error> {
+    fn switch_branch(&mut self, new_branch: &str) -> Result<CacheRef> {
         self.get_status()
             .and_then(|mut status_iter|
                 match status_iter.next() {
                     Some(item) => {
-                        Err(format_err!("Cannot switch if the workspace isn't clean: {:?}", item))
+                        Err(format_err!("Cannot switch if the workspace isn't clean: {:?}", item)
+                            .into())
                     }
                     None => Ok(())
                 })
             .and_then(|_| self.cache.get_head_commit(new_branch)
                 .map_err(Into::into)
                 .and_then(|cache_ref|
-                    cache_ref.ok_or(format_err!("Branch doesn't exist"))))
+                    cache_ref.ok_or(format_err!("Branch doesn't exist").into())))
             .map(|new_cache_ref| {
                 self.branch = new_branch.to_string();
                 self.head = Some(new_cache_ref);
@@ -693,25 +747,25 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     }
 
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
-        -> Result<(), Error> {
+        -> Result<()> {
         let base_ref = match repo_ref {
             Some(RepoRef::CacheRef(cache_ref)) => cache_ref,
             Some(RepoRef::Branch(branch)) => self.cache.get_head_commit(branch)
-                .map_err(Into::into)
+                .map_err(Error::CacheError)
                 .and_then(|cache_ref|
-                    cache_ref.ok_or(format_err!("Branch {} doesn't exsit", branch)))?,
-            None => self.head.ok_or(format_err!("No HEAD in current workspace set"))?,
+                    cache_ref.ok_or(format_err!("Branch {} doesn't exsit", branch).into()))?,
+            None => self.head.ok_or(Error::Generic(format_err!("No HEAD in current workspace set")))?,
         };
 
         self.cache.create_branch(new_branch, base_ref)
             .map_err(Into::into)
     }
 
-    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log, Error> {
+    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log> {
         CacheLayerLog::new(&self.cache, start_commit)
     }
 
-    fn get_status(&'a self) -> Result<FSStatusIter<'a, C>, Error> {
+    fn get_status(&'a self) -> Result<FSStatusIter<'a, C>> {
         let path = OverlayPath::new(Self::file_path(&self.base_path));
         Ok(FSStatusIter::new(path, self))
     }
@@ -740,7 +794,7 @@ impl<'a, C: CacheLayer> FSStatusIter<'a, C> {
 }
 
 impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
-    type Item = Result<WorkspaceFileStatus, Error>;
+    type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -818,7 +872,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     type File = FSOverlayFile<C>;
 
     fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool)
-        -> Result<FSOverlayFile<C>, Error> {
+        -> Result<FSOverlayFile<C>> {
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let abs_fs_path = overlay_path.abs_fs_path();
@@ -839,8 +893,12 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 if ioerr.kind() == io::ErrorKind::NotFound {
                     let mut whiteout_path = abs_fs_path.to_owned();
                     whiteout_path.set_extension("d");
-                    ensure!(!whiteout_path.exists(), "File was deleted in the workspace");
-                    self.open_cache_file(writable, abs_fs_path, cache_path)
+                    if whiteout_path.exists() {
+                        Err(format_err!("File was deleted in the workspace").into())
+                    } else {
+                        self.open_cache_file(writable, abs_fs_path, cache_path)
+                            .map_err(Into::into)
+                    }
                 } else {
                     Err(ioerr.into())
                 }
@@ -848,7 +906,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         }
     }
 
-    fn list_directory<I,P>(&self, path: P) -> Result<I, Error>
+    fn list_directory<I,P>(&self, path: P) -> Result<I>
         where I: FromIterator<OverlayDirEntry>,
               P: AsRef<Path> {
         let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
@@ -860,7 +918,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
             Self::dir_entry_to_overlay_dir_entry)
     }
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let abs_fs_path = overlay_path.abs_fs_path();
@@ -868,17 +926,19 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         if abs_fs_path.exists() {
             fs::symlink_metadata(&*abs_fs_path)
                 .map_err(|e| e.into())
-                .and_then(Metadata::from_fs_metadata)
+                .and_then(|meta| Metadata::from_fs_metadata(meta)
+                    .map_err(Into::into))
         } else {
             self.resolve_object_ref(overlay_path.overlay_path())
-                .and_then(|cache_ref| cache_ref.ok_or(format_err!("File not found!")))
+                .and_then(|cache_ref|
+                    cache_ref.ok_or(format_err!("File not found!").into()))
                 .and_then(|cache_ref| self.cache.metadata(&cache_ref)
                     .map_err(Error::from))
-                .and_then(Metadata::from_cache_metadata)
+                .and_then(|meta| Metadata::from_cache_metadata(meta).map_err(Into::into))
         }
     }
 
-    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let source_path = overlay_path.abs_fs_path();
@@ -908,7 +968,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         }
     }
 
-    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         OverlayPath::with_overlay_path(
             Self::file_path(&self.base_path), path.as_ref())
             .map(OverlayPath::into_abs_fs_path)
@@ -958,7 +1018,7 @@ pub mod testutil {
     }
 
     pub fn workspace_status_from_controller<'a, W: WorkspaceController<'a>>(controller: &'a W)
-        -> Result<HashMap<PathBuf, FileState>, Error> {
+        -> Result<HashMap<PathBuf, FileState>> {
         controller.get_status()
             .and_then(|status|
                           status.map(|status|

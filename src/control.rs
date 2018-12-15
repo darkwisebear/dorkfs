@@ -7,11 +7,9 @@ use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::str;
 
-use failure::Error;
-
 use crate::{
     types::*,
-    overlay::*
+    overlay::{self, *}
 };
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
@@ -55,7 +53,7 @@ pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 // }
 
 impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn close(&mut self) -> Result<(), Error> {
+    fn close(&mut self) -> overlay::Result<()> {
         match self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut overlay_file)) =>
                 overlay_file.close(),
@@ -63,7 +61,7 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
         }
     }
 
-    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+    fn truncate(&mut self, size: u64) -> overlay::Result<()> {
         match self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(special_file)) =>
                 special_file.truncate(size),
@@ -73,7 +71,7 @@ impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceControl
 }
 
 impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.read(buf),
@@ -83,7 +81,7 @@ impl<O> Read for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
 }
 
 impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match *self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.write(buf),
@@ -91,7 +89,7 @@ impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a
         }
     }
 
-    fn flush(&mut self) -> Result<(), io::Error> {
+    fn flush(&mut self) -> io::Result<()> {
         match *self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
                 special_file.flush(),
@@ -101,7 +99,7 @@ impl<O> Write for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a
 }
 
 impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, io::Error> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match *self {
             ControlFile::InnerOverlayFile(ref mut file) => file.seek(pos),
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut special_file)) =>
@@ -111,22 +109,22 @@ impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
 }
 
 pub trait SpecialFileOps: Clone+Debug {
-    fn init<O>(&self, _control_dir: &O) -> Result<Vec<u8>, Error>
+    fn init<O>(&self, _control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         Ok(Vec::new())
     }
 
-    fn close<O>(&self, _control_dir: &mut O, _buffer: &[u8]) -> Result<(), Error>
+    fn close<O>(&self, _control_dir: &mut O, _buffer: &[u8]) -> overlay::Result<()>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         Ok(())
     }
 }
 
 pub trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error>;
+    fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata>;
     fn get_file<'a, 'b>(&'a self, _control_dir: &'b ControlDir<O>)
-        -> Result<Box<dyn OverlayFile+Send+Sync>, Error> {
-        bail!("This special file type cannot be accessed like a normal file")
+        -> overlay::Result<Box<dyn OverlayFile+Send+Sync>> {
+        Err(format_err!("This special file type cannot be accessed like a normal file").into())
     }
 }
 
@@ -138,7 +136,7 @@ struct BufferedFileFactory<F: SpecialFileOps> {
 impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
     where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static,
           F: SpecialFileOps+Send+Sync+'static {
-    fn metadata(&self, control_dir: &ControlDir<O>) -> Result<Metadata, Error> {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
         let metadata = Metadata {
             size: self.ops.init(control_dir.get_overlay().deref())?.len() as u64,
             object_type: ObjectType::File
@@ -148,7 +146,7 @@ impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
     }
 
     fn get_file<'a, 'b>(&'a self, control_dir: &'b ControlDir<O>)
-        -> Result<Box<dyn OverlayFile+Send+Sync>, Error> {
+        -> overlay::Result<Box<dyn OverlayFile+Send+Sync>> {
         let file = BufferedFile {
             buf: Cursor::new(self.ops.init(control_dir.get_overlay().deref())?),
             ops: self.ops.clone(),
@@ -201,12 +199,12 @@ impl<F, O> Seek for BufferedFile<F, O> where F: SpecialFileOps,
 impl<F, O> OverlayFile for BufferedFile<F, O>
     where F: SpecialFileOps,
           for<'a> O: Overlay+WorkspaceController<'a>+Send+Sync+'static {
-    fn close(&mut self) -> Result<(), Error> {
+    fn close(&mut self) -> overlay::Result<()> {
         self.ops.close(&mut *self.overlay.write().unwrap(),
                        self.buf.get_ref().as_slice())
     }
 
-    fn truncate(&mut self, size: u64) -> Result<(), Error> {
+    fn truncate(&mut self, size: u64) -> overlay::Result<()> {
         if self.buf.position() as u64 > size {
             self.buf.set_position(size);
         }
@@ -219,7 +217,7 @@ impl<F, O> OverlayFile for BufferedFile<F, O>
 struct LogFileOps;
 
 impl LogFileOps {
-    fn generate_log_string<O>(workspace_controller: &O) -> Result<String, Error>
+    fn generate_log_string<O>(workspace_controller: &O) -> overlay::Result<String>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         if let Some(head_ref) = workspace_controller.get_current_head_ref()? {
             let log = workspace_controller.get_log(&head_ref)?;
@@ -238,7 +236,7 @@ impl LogFileOps {
 }
 
 impl SpecialFileOps for LogFileOps {
-    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>, Error>
+    fn init<O>(&self, control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         Self::generate_log_string(control_dir).map(String::into_bytes)
     }
@@ -248,7 +246,7 @@ impl SpecialFileOps for LogFileOps {
 struct WorkspaceStatusFileOps;
 
 impl WorkspaceStatusFileOps {
-    fn generate_status_string<O>(overlay: &O) -> Result<String, Error>
+    fn generate_status_string<O>(overlay: &O) -> overlay::Result<String>
         where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
         let mut status = String::new();
 
@@ -269,7 +267,7 @@ impl WorkspaceStatusFileOps {
 }
 
 impl SpecialFileOps for WorkspaceStatusFileOps {
-    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>, Error>
+    fn init<O>(&self, control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         Self::generate_status_string(control_dir).map(String::into_bytes)
     }
@@ -279,10 +277,10 @@ impl SpecialFileOps for WorkspaceStatusFileOps {
 struct CommitFileOps;
 
 impl SpecialFileOps for CommitFileOps {
-    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error>
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> overlay::Result<()>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         str::from_utf8(buffer)
-            .map_err(Into::into)
+            .map_err(overlay::Error::from_fail)
             .and_then(|message| {
             control_dir.commit(message)
                 .map(|cache_ref|
@@ -296,15 +294,16 @@ impl SpecialFileOps for CommitFileOps {
 struct BranchFileOps;
 
 impl SpecialFileOps for BranchFileOps {
-    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>, Error>
+    fn init<O>(&self, control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         control_dir.get_current_branch()
             .map(|branch| branch.unwrap_or("(detached)").as_bytes().to_vec())
     }
 
-    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error>
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> overlay::Result<()>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
-        let target_branch = str::from_utf8(buffer)?;
+        let target_branch = str::from_utf8(buffer)
+            .map_err(overlay::Error::from_fail)?;
         if Some(target_branch) != control_dir.get_current_branch()? {
             control_dir.switch_branch(target_branch.trim_end_matches('\n'))
                 .map(|cache_ref|
@@ -319,10 +318,10 @@ impl SpecialFileOps for BranchFileOps {
 struct CreateBranchFileOps;
 
 impl SpecialFileOps for CreateBranchFileOps {
-    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error>
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> overlay::Result<()>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         str::from_utf8(buffer)
-            .map_err(Into::into)
+            .map_err(overlay::Error::from_fail)
             .and_then(|target_branch|
                 control_dir.create_branch(target_branch.trim_end_matches('\n'), None))
     }
@@ -332,10 +331,11 @@ impl SpecialFileOps for CreateBranchFileOps {
 struct RevertFileOps;
 
 impl SpecialFileOps for RevertFileOps {
-    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> Result<(), Error> where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+    fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> overlay::Result<()>
+        where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         str::from_utf8(buffer)
             .map(|p| Path::new(p.trim_end_matches('\n')))
-            .map_err(Into::into)
+            .map_err(overlay::Error::from_fail)
             .and_then(|overlay_path| control_dir.revert_file(overlay_path))
     }
 }
@@ -398,7 +398,7 @@ impl<O> Overlay for ControlDir<O>
     where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
     type File = ControlFile<O>;
 
-    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File, Error> {
+    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> overlay::Result<Self::File> {
         if let Ok(ref dorkfile) = path.as_ref().strip_prefix(DORK_DIR_ENTRY) {
             match dorkfile.to_str() {
                 Some(filename) => {
@@ -407,11 +407,12 @@ impl<O> Overlay for ControlDir<O>
                             .map(DynamicOverlayFileWrapper)
                             .map(ControlFile::DynamicOverlayFile)
                     } else {
-                        bail!("Unable to open special file {}", dorkfile.to_string_lossy())
+                        return Err(overlay::Error::from(format_err!("Unable to open special file {}",
+                                                                    dorkfile.to_string_lossy())));
                     }
                 }
 
-                None => bail!("No filename given!")
+                None => return Err("No filename given!".into())
             }
         } else {
             self.overlay.write().unwrap().open_file(&path, writable)
@@ -419,8 +420,9 @@ impl<O> Overlay for ControlDir<O>
         }
     }
 
-    fn list_directory<I, P>(&self, path: P) -> Result<I, Error> where I: FromIterator<OverlayDirEntry>,
-                                                                      P: AsRef<Path> {
+    fn list_directory<I, P>(&self, path: P) -> overlay::Result<I>
+        where I: FromIterator<OverlayDirEntry>,
+              P: AsRef<Path> {
         match path.as_ref().to_str() {
             Some("") => {
                 let root_dir: Vec<OverlayDirEntry> =
@@ -441,7 +443,7 @@ impl<O> Overlay for ControlDir<O>
         }
     }
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata, Error> {
+    fn metadata<P: AsRef<Path>>(&self, path: P) -> overlay::Result<Metadata> {
         if path.as_ref() == Path::new(DORK_DIR_ENTRY) {
             Ok(Metadata {
                 size: 0,
@@ -449,10 +451,10 @@ impl<O> Overlay for ControlDir<O>
             })
         } else if path.as_ref().starts_with(DORK_DIR_ENTRY) {
             let file_name = path.as_ref().strip_prefix(DORK_DIR_ENTRY).unwrap();
-            file_name.to_str().ok_or(format_err!("Unable to decode to UTF-8"))
+            file_name.to_str().ok_or("Unable to decode to UTF-8".into())
                 .and_then(|s| {
                     self.special_files.get(s)
-                        .ok_or(format_err!("File entry not found!"))
+                        .ok_or("File entry not found!".into())
                         .and_then(|special_file| special_file.metadata(self))
                 })
         } else {
@@ -460,17 +462,17 @@ impl<O> Overlay for ControlDir<O>
         }
     }
 
-    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+    fn delete_file<P: AsRef<Path>>(&self, path: P) -> overlay::Result<()> {
         if path.as_ref().starts_with(DORK_DIR_ENTRY) {
-            bail!("Cannot delete .dork special files")
+            Err("Cannot delete .dork special files".into())
         } else {
             self.overlay.read().unwrap().delete_file(path)
         }
     }
 
-    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
+    fn revert_file<P: AsRef<Path>>(&self, path: P) -> overlay::Result<()> {
         if path.as_ref().starts_with(DORK_DIR_ENTRY) {
-            bail!("Cannot revert .dork special files")
+            Err("Cannot revert .dork special files".into())
         } else {
             self.overlay.read().unwrap().revert_file(path)
         }

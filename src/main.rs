@@ -187,6 +187,7 @@ fn new_overlay<P, U, R, B>(workspace: P, rooturl: U, rootrepo: R, branch: Option
     let cached_github =
         cache::boxed(HashFileCache::new(github, cachedir)?);
     FilesystemOverlay::new(cached_github, overlaydir, branch.as_ref())
+        .map_err(Into::into)
 }
 
 pub fn init_logging() {
