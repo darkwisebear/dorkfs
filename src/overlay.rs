@@ -621,6 +621,25 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             }
         }
     }
+
+    fn contains_files<P: AsRef<Path>>(path: P) -> Result<bool> {
+        path.as_ref().read_dir().map_err(Error::IoError)
+            .map(|mut dir_iter| dir_iter.next().and_then(io::Result::ok))
+            .map(|entry| entry.is_some())
+    }
+
+    fn unpin_head(&self) {
+        let meta_path = Self::meta_path(&self.base_path);
+        info!("Unpinning HEAD");
+        let head_file_path = meta_path.join("HEAD");
+        if let Err(ioerr) = fs::remove_file(head_file_path) {
+            if ioerr.kind() == io::ErrorKind::NotFound {
+                info!("HEAD file couldn't be found");
+            } else {
+                warn!("Unable to delete HEAD file: {}", ioerr);
+            }
+        }
+    }
 }
 
 pub struct CacheLayerLog<'a, C: CacheLayer+'a> {
@@ -695,15 +714,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
             // If there is no open file, we can assume that moving to the latest HEAD is just fine.
             // In this case we unpin and get the latest HEAD from the cache if the cache supports
             // that.
-            info!("Unpinning HEAD");
-            let head_file_path = meta_path.join("HEAD");
-            if let Err(ioerr) = fs::remove_file(head_file_path) {
-                if ioerr.kind() == io::ErrorKind::NotFound {
-                    info!("HEAD file couldn't be found");
-                } else {
-                    warn!("Unable to delete HEAD file: {}", ioerr);
-                }
-            }
+            self.unpin_head();
             self.head = self.cache.get_head_commit(&self.branch)?.or(Some(new_commit_ref));
         } else {
             // If there are still open files, we just use our added commit as the new HEAD and pin
@@ -975,19 +986,56 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     }
 
     fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        OverlayPath::with_overlay_path(
-            Self::file_path(&self.base_path), path.as_ref())
-            .map(OverlayPath::into_abs_fs_path)
-            .and_then(|fs_path|
-                if fs_path.is_dir() {
-                    info!("Reverting directory {} in {}",
-                          path.as_ref().display(), fs_path.display());
-                    fs::remove_dir_all(fs_path)
-                } else {
-                    info!("Reverting file {} in {}",
-                          path.as_ref().display(), fs_path.display());
-                    fs::remove_file(fs_path)
-                }.map_err(Into::into))
+        use std::path::Component::Normal;
+
+        let path = path.as_ref();
+        if !path.is_relative() {
+            return Err("Can only operate on relative paths".into());
+        }
+
+        let mut cur_path = Self::file_path(&self.base_path);
+        let mut num_components = 0;
+        for component in path.components() {
+            if let Normal(part) = component {
+                num_components+=1;
+                let mut part = part.to_owned();
+                part.push(".d");
+                cur_path.push(part);
+                debug!("Check existence of {}", cur_path.display());
+                if cur_path.exists() {
+                    let mut restored_path = cur_path.clone();
+                    restored_path.set_extension("f");
+                    debug!("Restoring {} to {}", cur_path.display(), restored_path.display());
+                    fs::rename(&cur_path, restored_path).map_err(Error::IoError)?;
+                }
+                cur_path.set_extension("f");
+            } else {
+                return Err("Unable to iterate through the overlay path".into());
+            }
+        }
+
+        debug!("Remove overlay file {}", cur_path.display());
+        if cur_path.is_dir() {
+            fs::remove_dir_all(&cur_path)
+        } else {
+            fs::remove_file(&cur_path)
+        }.map_err(Error::IoError)?;
+
+        // Now check for all parent directories in the overlay whether they still contain files.
+        // If not, we can safely remove them.
+        for _ in 1..num_components {
+            cur_path.pop();
+            let contains_files = Self::contains_files(&cur_path)?;
+            debug!("{} contains {}files",
+                   cur_path.display(),
+                   if contains_files { "" } else { "no " });
+            if !contains_files {
+                debug!("Removing overlay directory {}", cur_path.display());
+                fs::remove_dir(&cur_path).map_err(Error::IoError)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1042,7 +1090,7 @@ mod test {
         iter::FromIterator
     };
     use tempfile::tempdir;
-    use crate::overlay::{Overlay, OverlayDirEntry, FileState, WorkspaceController};
+    use crate::overlay::{Overlay, OverlayFile, OverlayDirEntry, FileState, WorkspaceController};
     use super::testutil::*;
 
     #[cfg(target_os = "windows")]
@@ -1417,5 +1465,166 @@ mod test {
         overlay.commit("Committing deleted dir").expect("Unable to create second commit");
         overlay.open_file("a/dir/test.txt", false)
             .expect_err("File can still be opened");
+    }
+
+    trait DirComparator {
+        fn compare(&self, contents: &[&str]) -> bool;
+    }
+
+    trait DirLister {
+        type Dir;
+        fn dir<P>(self, path: P) -> Self::Dir where P: AsRef<Path>;
+    }
+
+    struct OverlayDir(Vec<OverlayDirEntry>);
+
+    impl<'a, F, O> DirLister for &'a O where F: OverlayFile, O: Overlay<File=F> {
+        type Dir = OverlayDir;
+
+        fn dir<P>(self, path: P) -> <Self as DirLister>::Dir where P: AsRef<Path> {
+            OverlayDir(self.list_directory(path).unwrap())
+        }
+    }
+
+    impl DirComparator for OverlayDir {
+        fn compare(&self, contents: &[&str]) -> bool {
+            let mut dir: Vec<&str> = self.0.iter()
+                .map(|e| e.name.as_str()).collect();
+            dir.sort_unstable();
+            let mut contents: Vec<&str> = contents.into_iter().map(|e| *e).collect();
+            contents.sort_unstable();
+            contents.dedup();
+            dir == contents
+        }
+    }
+
+    impl PartialEq<&[&str]> for OverlayDir {
+        fn eq(&self, other: &&[&str]) -> bool {
+            self.compare(*other)
+        }
+    }
+
+    #[test]
+    fn revert_deleted_directory() {
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        overlay.ensure_directory("a/dir").expect("Unable to create dir");
+        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        overlay.commit("Create file in subdir").unwrap();
+
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
+
+        overlay.delete_file("a/dir/test.txt").unwrap();
+        overlay.delete_file("a/dir").unwrap();
+        assert!(overlay.dir("a") == &[]);
+
+        overlay.revert_file("a/dir").unwrap();
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
+    }
+
+    #[test]
+    fn revert_single_file() {
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        overlay.ensure_directory("a/dir").expect("Unable to create dir");
+        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        overlay.commit("Create file in subdir").unwrap();
+
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
+
+        overlay.delete_file("a/dir/test.txt").unwrap();
+        assert!(overlay.dir("a/dir") == &[]);
+
+        overlay.revert_file("a/dir/test.txt").unwrap();
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
+    }
+
+    #[test]
+    fn revert_single_file_in_deleted_directory() {
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        overlay.ensure_directory("a/dir").expect("Unable to create dir");
+        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        let mut test_file = overlay.open_file("a/dir/test2.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What another test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        overlay.commit("Create file in subdir").unwrap();
+
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt", "test2.txt"]);
+
+        overlay.delete_file("a/dir/test.txt").unwrap();
+        assert!(overlay.dir("a/dir") == &["test2.txt"]);
+
+        overlay.revert_file("a/dir/test.txt").unwrap();
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt", "test2.txt"]);
+    }
+
+    #[test]
+    fn revert_changed_file() {
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        overlay.ensure_directory("a/dir").expect("Unable to create dir");
+        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        overlay.commit("Create file in subdir").unwrap();
+
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
+
+        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+            .expect("Unable to open committed file");
+        write!(test_file, "Now that's totally different!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
+
+        let mut test_file = overlay.open_file("a/dir/test.txt", false)
+            .expect("Unable to open test file");
+        check_file_content(&mut test_file, "Now that's totally different!");
+        drop(test_file);
+
+        overlay.revert_file("a/dir/test.txt").unwrap();
+
+        let mut test_file = overlay.open_file("a/dir/test.txt", false)
+            .expect("Unable to open test file");
+        check_file_content(&mut test_file, "What a test!");
+
+        assert!(overlay.dir("a") == &["dir"]);
+        assert!(overlay.dir("a/dir") == &["test.txt"]);
     }
 }
