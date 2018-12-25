@@ -27,6 +27,9 @@ pub enum Error {
     #[fail(display = "IO error: {}", _0)]
     IoError(io::Error),
 
+    #[fail(display = "Branch {} doesn't have a HEAD ref", _0)]
+    MissingHeadRef(String),
+
     #[fail(display = "Cache error: {}", _0)]
     CacheError(CacheError),
 
@@ -157,7 +160,9 @@ pub trait WorkspaceController<'a>: Debug {
                      -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
     fn get_status(&'a self) -> Result<Self::StatusIter>;
+    fn update_head(&mut self) -> Result<CacheRef>;
 }
+
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
     FsFile(Option<Arc<Mutex<File>>>),
@@ -273,10 +278,6 @@ impl OverlayPath {
         self.abs_fs_path.as_path()
     }
 
-    pub fn into_abs_fs_path(self) -> PathBuf {
-        self.abs_fs_path
-    }
-
     pub fn push_overlay<P: Into<PathBuf>>(&mut self, subdir: P) {
         let mut subdir = subdir.into().into_os_string();
         self.rel_overlay_path.push(&subdir);
@@ -308,10 +309,78 @@ enum OverlayOperation<T> {
     Subtract(T)
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceHead {
+    cache_ref: Option<CacheRef>,
+    meta_path: PathBuf
+}
+
+impl WorkspaceHead {
+    fn new(meta_path: PathBuf) -> Result<WorkspaceHead> {
+        let new_head_file_path = meta_path.join("NEW_HEAD");
+        if new_head_file_path.exists() {
+            unimplemented!("TODO: Recover from a previous crash during commit");
+        }
+
+        let head_path = meta_path.join("HEAD");
+        let cache_ref  = if head_path.exists() {
+            File::open(&head_path)
+                .and_then(|mut file| {
+                    let mut head = String::new();
+                    file.read_to_string(&mut head).map(|_| head)
+                })
+                .map_err(Error::IoError)
+                .and_then(|head|
+                    if head == CacheRef::null().to_string() {
+                        Ok(None)
+                    } else {
+                        head.parse()
+                            .map_err(Error::Generic)
+                            .map(Option::Some)
+                    })
+        } else {
+            Ok(None)
+        };
+
+        cache_ref.map(move |cache_ref|
+            WorkspaceHead {
+                cache_ref,
+                meta_path
+            })
+    }
+
+    fn get_ref(&self) -> Option<CacheRef> {
+        self.cache_ref.clone()
+    }
+
+    fn set_ref(&mut self, new_ref: Option<CacheRef>) -> Result<()> {
+        let head_file_path = self.meta_path.join("HEAD");
+        let new_head_file_path = self.meta_path.join("NEW_HEAD");
+        fs::remove_file(&new_head_file_path).ok();
+
+        let commit_ref = new_ref.unwrap_or_else(|| CacheRef::null());
+
+        let mut new_head_file = File::create(&new_head_file_path)?;
+        new_head_file.write(commit_ref.to_string().as_bytes())?;
+        new_head_file.flush()?;
+        new_head_file.sync_all()?;
+
+        match fs::remove_file(&head_file_path) {
+            Ok(_) => (),
+            Err(ref err) if err.kind() == io::ErrorKind::NotFound => (),
+            Err(err) => return Err(Error::IoError(err))
+        }
+        fs::rename(new_head_file_path, head_file_path)?;
+
+        self.cache_ref = new_ref;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct FilesystemOverlay<C: CacheLayer> {
     cache: C,
-    head: Option<CacheRef>,
+    head: WorkspaceHead,
     overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
     base_path: PathBuf,
     branch: String
@@ -336,32 +405,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         fs::create_dir_all(Self::file_path(base_path.as_ref()))?;
         let meta_path = Self::meta_path(base_path.as_ref());
         fs::create_dir_all(&meta_path)?;
-
-        let new_head_file_path = meta_path.join("NEW_HEAD");
-        if new_head_file_path.exists() {
-            unimplemented!("TODO: Recover from a previous crash during commit");
-        }
-
-        let head_path = meta_path.join("HEAD");
-        let head = match File::open(&head_path) {
-            Ok(mut file) => {
-                let mut head = String::new();
-                file.read_to_string(&mut head)?;
-                if head == CacheRef::null().to_string() {
-                    None
-                } else {
-                    Some(head.parse()?)
-                }
-            }
-
-            Err(ioerr) => {
-                if ioerr.kind() == io::ErrorKind::NotFound {
-                    cache.get_head_commit(branch)?
-                } else {
-                    return Err(ioerr.into());
-                }
-            }
-        };
+        let head = WorkspaceHead::new(meta_path)?;
 
         Ok(FilesystemOverlay {
             cache,
@@ -373,7 +417,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>> {
-        match self.head {
+        match self.head.get_ref() {
             Some(head) => {
                 let commit = self.cache.get(&head)?.into_commit()
                     .expect("Head ref is not a commit");
@@ -513,28 +557,6 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         self.cache.add_directory(&mut directory).map_err(Into::into)
     }
 
-    fn pin_current_head(&mut self) -> Result<PathBuf> {
-        let meta_path = Self::meta_path(&self.base_path);
-        let head_file_path = meta_path.join("HEAD");
-        if !head_file_path.exists() {
-            let new_head_file_path = meta_path.join("NEW_HEAD");
-            fs::remove_file(&new_head_file_path).ok();
-
-            let commit_ref = self.head.unwrap_or_else(|| CacheRef::null());
-
-            info!("Pinning HEAD to {}", commit_ref);
-
-            let mut new_head_file = File::create(&new_head_file_path)?;
-            new_head_file.write(commit_ref.to_string().as_bytes())?;
-            new_head_file.flush()?;
-            new_head_file.sync_all()?;
-
-            fs::rename(new_head_file_path, &head_file_path)?;
-        }
-
-        Ok(head_file_path)
-    }
-
     fn clear_closed_files_in_path(&mut self, path: &mut OverlayPath) -> Result<()> {
         debug!("Clearing overlay path {}", path.abs_fs_path().display());
 
@@ -546,6 +568,12 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
             if file_type.is_dir() {
                 self.clear_closed_files_in_path(path)?;
+                debug!("Removing overlay dir {}", path.abs_fs_path().display());
+                if let Err(ioerr) = fs::remove_dir(&*path.abs_fs_path()) {
+                    warn!("Unable to remove overlay directory {} during cleanup: {}",
+                          path.abs_fs_path().display(),
+                          ioerr.description());
+                }
             } else {
                 if !self.overlay_files.contains_key(path.overlay_path()) {
                     debug!("Removing overlay file {}", path.abs_fs_path().display());
@@ -556,13 +584,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                     }
                 }
             }
-        }
 
-        path.pop();
-        if let Err(ioerr) = fs::remove_dir(&*path.abs_fs_path()) {
-            warn!("Unable to remove overlay directory {} during cleanup: {}",
-                  path.abs_fs_path().display(),
-                  ioerr.description());
+            path.pop();
         }
 
         Ok(())
@@ -610,8 +633,6 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 new_file.seek(SeekFrom::Start(0))?;
             }
 
-            self.pin_current_head()?;
-
             Ok(self.add_fs_file(&cache_path, new_file))
         } else {
             if let Some(cache_file) = cache_file {
@@ -628,17 +649,9 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             .map(|entry| entry.is_some())
     }
 
-    fn unpin_head(&self) {
-        let meta_path = Self::meta_path(&self.base_path);
-        info!("Unpinning HEAD");
-        let head_file_path = meta_path.join("HEAD");
-        if let Err(ioerr) = fs::remove_file(head_file_path) {
-            if ioerr.kind() == io::ErrorKind::NotFound {
-                info!("HEAD file couldn't be found");
-            } else {
-                warn!("Unable to delete HEAD file: {}", ioerr);
-            }
-        }
+    #[cfg(test)]
+    pub fn set_head(&mut self, cache_ref: CacheRef) -> Result<()> {
+        self.head.set_ref(Some(cache_ref))
     }
 }
 
@@ -691,11 +704,10 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
         let file_path = Self::file_path(&self.base_path);
-        let meta_path = Self::meta_path(&self.base_path);
         let overlay_path = OverlayPath::new(file_path);
 
         let tree = self.generate_tree(overlay_path)?;
-        let parents = Vec::from_iter(self.head.take().into_iter());
+        let parents = Vec::from_iter(self.head.get_ref().into_iter());
         let commit = Commit {
             parents,
             tree,
@@ -710,26 +722,13 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         self.clear_closed_files()?;
 
         // Stage 2: Remove version pinning if there is no open file left
-        if self.overlay_files.is_empty() {
-            // If there is no open file, we can assume that moving to the latest HEAD is just fine.
-            // In this case we unpin and get the latest HEAD from the cache if the cache supports
-            // that.
-            self.unpin_head();
-            self.head = self.cache.get_head_commit(&self.branch)?.or(Some(new_commit_ref));
-        } else {
-            // If there are still open files, we just use our added commit as the new HEAD and pin
-            // the workspace to that reference so that open files do not accidentally overwrite
-            // stuff other people have committed in the meantime.
-            info!("Not unpinning as there are still open files in the overlay");
-            self.head = Some(new_commit_ref);
-            self.pin_current_head()?;
-        }
-
-        Ok(new_commit_ref)
+        self.head.set_ref(self.cache.get_head_commit(&self.branch)?
+            .or(Some(new_commit_ref)))
+            .map(|_| new_commit_ref)
     }
 
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>> {
-        Ok(self.head)
+        Ok(self.head.get_ref())
     }
 
     fn get_current_branch(&self) -> Result<Option<&str>> {
@@ -750,10 +749,9 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
                 .map_err(Into::into)
                 .and_then(|cache_ref|
                     cache_ref.ok_or(format_err!("Branch doesn't exist").into())))
-            .map(|new_cache_ref| {
+            .and_then(|new_cache_ref| {
                 self.branch = new_branch.to_string();
-                self.head = Some(new_cache_ref);
-                new_cache_ref
+                self.head.set_ref(Some(new_cache_ref)).map(|_| new_cache_ref)
             })
     }
 
@@ -765,7 +763,8 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
                 .map_err(Error::CacheError)
                 .and_then(|cache_ref|
                     cache_ref.ok_or(format_err!("Branch {} doesn't exsit", branch).into()))?,
-            None => self.head.ok_or(Error::Generic(format_err!("No HEAD in current workspace set")))?,
+            None => self.head.get_ref()
+                .ok_or(Error::Generic(format_err!("No HEAD in current workspace set")))?,
         };
 
         self.cache.create_branch(new_branch, base_ref)
@@ -779,6 +778,15 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     fn get_status(&'a self) -> Result<FSStatusIter<'a, C>> {
         let path = OverlayPath::new(Self::file_path(&self.base_path));
         Ok(FSStatusIter::new(path, self))
+    }
+
+    fn update_head(&mut self) -> Result<CacheRef> {
+        self.cache.get_head_commit(self.branch.as_str())
+            .map_err(Into::into)
+            .and_then(|cache_ref|
+                cache_ref.ok_or(Error::MissingHeadRef(self.branch.clone()))
+                    .and_then(|cache_ref|
+                        self.head.set_ref(Some(cache_ref)).map(|_| cache_ref)))
     }
 }
 

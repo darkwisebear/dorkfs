@@ -340,6 +340,26 @@ impl SpecialFileOps for RevertFileOps {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HeadFileOps;
+
+impl SpecialFileOps for HeadFileOps {
+    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>>
+        where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+        control_dir.get_current_head_ref()
+            .map(|cache_ref|
+                cache_ref
+                    .map(|cache_ref| cache_ref.to_string().into_bytes())
+                    .unwrap_or(b"(no HEAD)".to_vec()))
+    }
+
+    fn close<O>(&self, control_dir: &mut O, _buffer: &[u8]) -> Result<()>
+        where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
+        control_dir.update_head()
+            .map(|cache_ref| info!("Updating workspace to {}", cache_ref))
+    }
+}
+
 #[derive(Debug)]
 struct SpecialFileRegistry<O>(HashMap<&'static str, Box<SpecialFile<O>>>)
     where for<'a> O: Overlay+WorkspaceController<'a>;
@@ -378,6 +398,7 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
         special_files.insert_buffered("current_branch", BranchFileOps);
         special_files.insert_buffered("create_branch", CreateBranchFileOps);
         special_files.insert_buffered("revert", RevertFileOps);
+        special_files.insert_buffered("HEAD", HeadFileOps);
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -719,5 +740,43 @@ mod test {
             .expect("unable to write to revert dir");
         revert_file.close().unwrap();
         assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
+    }
+
+    #[test]
+    fn update_via_control_file() {
+        crate::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut test_file =
+            control_overlay.open_file("test.txt", true).unwrap();
+        write!(test_file, "A test text").unwrap();
+        test_file.close().unwrap();
+        drop(test_file);
+
+        let first_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
+
+        let mut test_file =
+            control_overlay.open_file("test2.txt", true).unwrap();
+        write!(&mut test_file, "A second test").unwrap();
+        test_file.close().unwrap();
+        drop(test_file);
+
+        let second_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
+
+        let cache = control_overlay.get_overlay_mut().set_head(first_commit).unwrap();
+        assert_eq!(Some(first_commit),
+                   control_overlay.get_overlay_mut().get_current_head_ref().unwrap());
+
+        let mut head_file =
+            control_overlay.open_file(".dork/HEAD", true).unwrap();
+        write!(&mut head_file, "latest").unwrap();
+        head_file.close().unwrap();
+        drop(head_file);
+
+        assert_eq!(Some(second_commit),
+                   control_overlay.get_overlay_mut().get_current_head_ref().unwrap());
     }
 }

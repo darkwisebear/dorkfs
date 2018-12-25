@@ -153,7 +153,6 @@ impl CacheLayer for NullCache {
     }
 
     fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<(), CacheError> {
-        self.branches.insert(branch.to_string(), cache_ref);
-        Ok(())
+        self.merge_commit(branch, cache_ref).map(|_| ())
     }
 }
