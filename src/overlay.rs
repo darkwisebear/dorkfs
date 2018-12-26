@@ -155,9 +155,8 @@ pub trait WorkspaceController<'a>: Debug {
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
     fn get_current_branch(&self) -> Result<Option<&str>>;
-    fn switch_branch(&mut self, branch: &str) -> Result<CacheRef>;
-    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
-                     -> Result<()>;
+    fn switch_branch(&mut self, branch: &str) -> Result<()>;
+    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
     fn get_status(&'a self) -> Result<Self::StatusIter>;
     fn update_head(&mut self) -> Result<CacheRef>;
@@ -735,24 +734,9 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         Ok(Some(self.branch.as_ref()))
     }
 
-    fn switch_branch(&mut self, new_branch: &str) -> Result<CacheRef> {
-        self.get_status()
-            .and_then(|mut status_iter|
-                match status_iter.next() {
-                    Some(item) => {
-                        Err(format_err!("Cannot switch if the workspace isn't clean: {:?}", item)
-                            .into())
-                    }
-                    None => Ok(())
-                })
-            .and_then(|_| self.cache.get_head_commit(new_branch)
-                .map_err(Into::into)
-                .and_then(|cache_ref|
-                    cache_ref.ok_or(format_err!("Branch doesn't exist").into())))
-            .and_then(|new_cache_ref| {
-                self.branch = new_branch.to_string();
-                self.head.set_ref(Some(new_cache_ref)).map(|_| new_cache_ref)
-            })
+    fn switch_branch(&mut self, new_branch: &str) -> Result<()> {
+        self.branch = new_branch.to_string();
+        Ok(())
     }
 
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)

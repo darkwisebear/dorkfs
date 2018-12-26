@@ -306,8 +306,8 @@ impl SpecialFileOps for BranchFileOps {
             .map_err(overlay::Error::from_fail)?;
         if Some(target_branch) != control_dir.get_current_branch()? {
             control_dir.switch_branch(target_branch.trim_end_matches('\n'))
-                .map(|cache_ref|
-                    info!("Successfully switched to branch {} ({})", target_branch, cache_ref))
+                .map(|_|
+                    info!("Successfully switched to branch {}", target_branch))
         } else {
             Ok(())
         }
@@ -512,7 +512,10 @@ mod test {
     use crate::{
         cache::ReferencedCommit,
         overlay::{
-            testutil::open_working_copy,
+            testutil::{
+                open_working_copy,
+                check_file_content
+            },
             Overlay, OverlayFile, WorkspaceController
         }
     };
@@ -558,6 +561,7 @@ mod test {
         let working_copy = open_working_copy(&dir);
         let mut control_overlay = super::ControlDir::new(working_copy);
 
+        // Create first test commit
         let mut file1 =
             control_overlay.open_file("file1.txt", true)
                 .expect("Unable to open test file");
@@ -565,10 +569,11 @@ mod test {
             .expect("Unable to write to test file");
         file1.close().expect("Couldn't close test file");
 
-        control_overlay.get_overlay_mut()
+        let first_commit = control_overlay.get_overlay_mut()
             .commit("Commit to first branch")
             .expect("Unable to create first commit");
 
+        // Create branch "feature"
         let mut create_branch =
             control_overlay.open_file(".dork/create_branch", true)
                 .expect("Unable to open create_branch special file");
@@ -576,6 +581,7 @@ mod test {
             .expect("Create branch \"feature\" failed");
         create_branch.close().unwrap();
 
+        // Check if we still track "master"
         let mut switch_branch =
             control_overlay.open_file(".dork/current_branch", false)
                 .expect("Unable to open current_branch for reading");
@@ -584,12 +590,14 @@ mod test {
         assert_eq!(b"master", content.as_slice());
         switch_branch.close().unwrap();
 
+        // Switch to branch "feature"
         let mut switch_branch =
             control_overlay.open_file(".dork/current_branch", true)
                 .expect("Unable to open current_branch for reading");
         switch_branch.write_all(b"feature").unwrap();
         switch_branch.close().unwrap();
 
+        // Check if switch is reflected
         let mut switch_branch =
             control_overlay.open_file(".dork/current_branch", false)
                 .expect("Unable to open current_branch for reading");
@@ -598,9 +606,7 @@ mod test {
         assert_eq!(b"feature", content.as_slice());
         switch_branch.close().unwrap();
 
-        control_overlay.get_overlay_mut().switch_branch("feature")
-            .expect("Should work since our working copy is clean");
-
+        // Add a commit with a second file to the branch "feature"
         let mut file2 =
             control_overlay.open_file("file2.txt", true)
                 .expect("Unable to open test file");
@@ -608,24 +614,57 @@ mod test {
             .expect("Unable to write to test file");
         file2.close().expect("Couldn't close test file");
 
-        control_overlay.get_overlay_mut().commit("Commit to second branch")
+        let second_commit = control_overlay.get_overlay_mut().commit("Commit to second branch")
             .expect("Unable to create second commit");
 
+        // Switch back to master
         control_overlay.get_overlay_mut().switch_branch("master").unwrap();
 
-        let mut file1 =
-            control_overlay.open_file("file1.txt", false)
+        // Check if checked-out workspace is unchanged
+        let mut file2 =
+            control_overlay.open_file("file2.txt", false)
                 .expect("Unable to open first test file");
         let mut content = Vec::new();
-        file1.read_to_end(&mut content)
+        file2.read_to_end(&mut content)
             .expect("Unable to read from first file");
-        assert_eq!(b"Test 1", content.as_slice());
+        assert_eq!(b"Test 2", content.as_slice());
+        file2.close().unwrap();
+        drop(file2);
 
-        control_overlay.open_file("file2.txt", false)
-            .expect_err("File 2 is there but it shouldn't");
+        // Now update the workspace
+        let mut head =
+            control_overlay.open_file(".dork/HEAD", true)
+                .expect("Unable to open HEAD");
+        write!(&mut head, "latest").expect("Unable to update workspace");
+        head.close().unwrap();
 
+        // ...and check if the second file is gone
+        assert!(control_overlay.open_file("file2.txt", false).is_err());
+
+        // Check if we're pointing to the right commit
+        check_file_content(
+            &mut control_overlay.open_file(".dork/HEAD", false).unwrap(),
+            first_commit.to_string().as_str());
+
+        // Switch back to feature branch
         control_overlay.get_overlay_mut().switch_branch("feature").unwrap();
 
+        // ...and check if the second file is still gone
+        assert!(control_overlay.open_file("file2.txt", false).is_err());
+
+        // Update the workspace
+        let mut head =
+            control_overlay.open_file(".dork/HEAD", true)
+                .expect("Unable to open HEAD");
+        write!(&mut head, "latest").expect("Unable to update workspace");
+        head.close().unwrap();
+
+        // Check if we're pointing to the right commit
+        check_file_content(
+            &mut control_overlay.open_file(".dork/HEAD", false).unwrap(),
+            second_commit.to_string().as_str());
+
+        // Check if all committed files are present and contain the correct contents
         let mut file1 =
             control_overlay.open_file("file1.txt", false)
                 .expect("Unable to open first test file");
@@ -766,7 +805,7 @@ mod test {
 
         let second_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
 
-        let cache = control_overlay.get_overlay_mut().set_head(first_commit).unwrap();
+        control_overlay.get_overlay_mut().set_head(first_commit).unwrap();
         assert_eq!(Some(first_commit),
                    control_overlay.get_overlay_mut().get_current_head_ref().unwrap());
 

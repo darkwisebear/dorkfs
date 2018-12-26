@@ -81,8 +81,9 @@ files:
   the update is refused.
 * current_branch: This file displays the currently tracked remote
   branch. Echoing a branch name to this file will switch the tracked
-  branch and updates to the latest commit of that branch. Switching only
-  works if the workspace is clean.
+  branch. It will, however, _not_ change the current commit used as the
+  base for the mounted fs. Use HEAD to update to the latest commit of
+  the tracked branch.
 * create_branch: This is a write-only file. Creates a branch with the
   written string as its name and sets it to the current commit HEAD
   points to.
