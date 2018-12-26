@@ -4,9 +4,9 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::borrow::{Cow, Borrow};
 
-use failure::Error;
+use failure::Fallible;
 
-pub fn os_string_to_string(s: OsString) -> Result<String, Error> {
+pub fn os_string_to_string(s: OsString) -> Fallible<String> {
     s.into_string()
         .map_err(|s| {
             format_err!("Unable to convert {} into UTF-8", s.to_string_lossy())
@@ -84,3 +84,71 @@ impl<T: Debug> OpenHandleSet<T> {
     }
 }
 
+pub enum RootrepoUrl<'a> {
+    GithubHttps {
+        apiurl: &'a str,
+        org: &'a str,
+        repo: &'a str
+    }
+}
+
+impl<'a> RootrepoUrl<'a> {
+    pub fn from_str(repo: &'a str) -> Fallible<Self> {
+        let (scheme, remainder) = Self::split_scheme(repo)?;
+        match scheme {
+            "github+https" => {
+                let mut splitter = remainder.rsplitn(3, '/');
+                let repo = splitter.next().ok_or(format_err!("Repo missing in repo URL"))?;
+                let org = splitter.next().ok_or(format_err!("Org/user missing in repo URL"))?;
+                let apiurl = splitter.next().ok_or(format_err!("Api URL missing in repo URL"))?;
+                Ok(RootrepoUrl::GithubHttps {
+                    apiurl,
+                    org,
+                    repo
+                })
+            }
+
+            unknown_scheme => bail!("Unknown repo URL scheme {}", unknown_scheme)
+        }
+    }
+
+    fn split_scheme(repo: &str) -> Fallible<(&str, &str)> {
+        repo.find(':').ok_or(format_err!("Missing scheme in repo URL"))
+            .and_then(|pos| repo.get(pos+3..)
+                .ok_or(format_err!("Incomplete repo URL"))
+                .map(|path| (&repo[..pos], path)))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::RootrepoUrl;
+
+    #[test]
+    fn parse_github_url() {
+        let repo_parts =
+            RootrepoUrl::from_str("github+https://api.github.com/darkwisebear/dorkfs")
+                .expect("Unable to parse repo URL");
+        match repo_parts {
+            RootrepoUrl::GithubHttps { apiurl, org, repo } => {
+                assert_eq!("api.github.com", apiurl);
+                assert_eq!("darkwisebear", org);
+                assert_eq!("dorkfs", repo);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_on_premises_url() {
+        let repo_parts =
+            RootrepoUrl::from_str("github+https://github.example.com/api/darkwisebear/dorkfs")
+                .expect("Unable to parse repo URL");
+        match repo_parts {
+            RootrepoUrl::GithubHttps { apiurl, org, repo } => {
+                assert_eq!("github.example.com/api", apiurl);
+                assert_eq!("darkwisebear", org);
+                assert_eq!("dorkfs", repo);
+            }
+        }
+    }
+}

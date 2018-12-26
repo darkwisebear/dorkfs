@@ -42,11 +42,12 @@ use std::str::FromStr;
 use std::fmt::Debug;
 use std::borrow::Cow;
 
-use failure::Error;
+use failure::Fallible;
 
 use crate::hashfilecache::HashFileCache;
 use crate::overlay::FilesystemOverlay;
 use crate::cache::CacheLayer;
+use crate::utility::RootrepoUrl;
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
@@ -67,7 +68,7 @@ fn parse_umask(s: &str) -> u16 {
 }
 
 #[cfg(target_os="linux")]
-fn resolve_uid(uid: &str) -> Result<u32, Error> {
+fn resolve_uid(uid: &str) -> Fallible<u32> {
     match u32::from_str(uid) {
         Ok(uid) => Ok(uid),
         Err(_) => {
@@ -85,12 +86,12 @@ fn resolve_uid(uid: &str) -> Result<u32, Error> {
 }
 
 #[cfg(not(target_os="linux"))]
-fn resolve_uid(uid: &str) -> Result<u32, Error> {
+fn resolve_uid(uid: &str) -> Fallible<u32> {
     u32::from_str(uid).map_err(|e| e.into())
 }
 
 #[cfg(target_os="linux")]
-fn resolve_gid(gid: &str) -> Result<u32, Error> {
+fn resolve_gid(gid: &str) -> Fallible<u32> {
     match u32::from_str(gid) {
         Ok(gid) => Ok(gid),
         Err(_) => {
@@ -108,7 +109,7 @@ fn resolve_gid(gid: &str) -> Result<u32, Error> {
 }
 
 #[cfg(not(target_os="linux"))]
-fn resolve_gid(gid: &str) -> Result<u32, Error> {
+fn resolve_gid(gid: &str) -> Fallible<u32> {
     u32::from_str(gid).map_err(|e| e.into())
 }
 
@@ -128,7 +129,7 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .takes_value(true)
             .required(true)
             .help("Connection specification to the root repository. For GitHub this string has \
-            the following form: github;<GitHub API URL>;<org>/<repo>[;branch]"))
+            the following form: github+<GitHub API URL>/<org>/<repo>"))
         .arg(Arg::with_name("uid")
             .takes_value(true)
             .default_value("0")
@@ -142,6 +143,11 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .default_value("022")
             .validator(validate_umask)
             .long("umask"))
+        .arg(Arg::with_name("branch")
+            .takes_value(true)
+            .long("branch")
+            .short("b")
+            .help("Remote branch that shall be tracked instead of the default branch."))
         .get_matches()
 }
 
@@ -158,35 +164,40 @@ fn mount_fuse<C>(
     dorkfs.mount(mountpoint).unwrap();
 }
 
-fn new_overlay<P, U, R, B>(workspace: P, rooturl: U, rootrepo: R, branch: Option<B>)
-    -> Result<FilesystemOverlay<cache::BoxedCacheLayer>, Error>
+fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: Option<B>)
+    -> Fallible<FilesystemOverlay<cache::BoxedCacheLayer>>
     where P: AsRef<Path>,
           U: AsRef<str>,
-          R: AsRef<str>,
           B: AsRef<str> {
     let overlaydir = workspace.as_ref().join("overlay");
     let cachedir = workspace.as_ref().join("cache");
 
-    let baseurl = rooturl.as_ref().to_owned();
-    let mut rootrepo_parts = rootrepo.as_ref().split('/');
-    let org = rootrepo_parts.next().expect("Missing repo owner");
-    let repo = rootrepo_parts.next().expect("Missing repo name");
-    let token = ::std::env::var("GITHUB_TOKEN")
-        .expect("GITHUB_TOKEN needed in order to authenticate against GitHub");
-    debug!("Connecting to GitHub at {} org {} repo {}", baseurl, org, repo);
-    let b = if let Some(ref x) = branch { Some(x.as_ref()) } else { None };
-    let github = github::Github::new(
-        baseurl.as_str(),
-        org,
-        repo,
-        token.as_str())?;
+    let baseurl = rooturl.as_ref();
+    let rootrepo_url = RootrepoUrl::from_str(baseurl)?;
+    let (rootrepo, branch) = match rootrepo_url {
+        RootrepoUrl::GithubHttps { apiurl, org, repo } => {
+            let mut baseurl = String::from("https://");
+            baseurl.push_str(apiurl);
+            let token = ::std::env::var("GITHUB_TOKEN")
+                .expect("GITHUB_TOKEN needed in order to authenticate against GitHub");
+            debug!("Connecting to GitHub at {} org {} repo {}", &baseurl, org, repo);
+            let github = github::Github::new(
+                baseurl.as_str(),
+                org,
+                repo,
+                token.as_str())?;
 
-    let branch = b.map(|s| Cow::Borrowed(s))
-        .unwrap_or_else(|| Cow::Owned(github.get_default_branch().unwrap()));
+            let branch = branch.as_ref().map(|s| Cow::Borrowed(s.as_ref()))
+                .unwrap_or_else(|| Cow::Owned(github.get_default_branch().unwrap()));
 
-    let cached_github =
-        cache::boxed(HashFileCache::new(github, cachedir)?);
-    FilesystemOverlay::new(cached_github, overlaydir, branch.as_ref())
+            let cached_github =
+                cache::boxed(HashFileCache::new(github, cachedir)?);
+
+            (cached_github, branch)
+        }
+    };
+
+    FilesystemOverlay::new(rootrepo, overlaydir, branch.as_ref())
         .map_err(Into::into)
 }
 
@@ -201,30 +212,22 @@ fn main() {
     let args = parse_arguments();
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let rootrepo = args.value_of("rootrepo").expect("No root URL given");
+    let branch = args.value_of("branch");
 
-    let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
-    let umask = args.value_of("umask")
-        .map(parse_umask)
-        .expect("Unparsable umask");
-    let uid = resolve_uid(args.value_of("uid").unwrap())
-        .expect("Cannot parse UID");
-    let gid = resolve_gid(args.value_of("gid").unwrap())
-        .expect("Cannot parse GID");
+    let fs = new_overlay(cachedir, rootrepo, branch)
+        .expect("Unable to create workspace");
 
-    let mut rootrepo_parts = rootrepo.split(';');
+    #[cfg(target_os = "linux")]
+    {
+        let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
+        let umask = args.value_of("umask")
+            .map(parse_umask)
+            .expect("Unparsable umask");
+        let uid = resolve_uid(args.value_of("uid").unwrap())
+            .expect("Cannot parse UID");
+        let gid = resolve_gid(args.value_of("gid").unwrap())
+            .expect("Cannot parse GID");
 
-    match rootrepo_parts.next().expect("No driver specified") {
-        "github" => {
-            let fs = new_overlay(
-                cachedir,
-                rootrepo_parts.next().expect("Missing base URL"),
-                rootrepo_parts.next().expect("Missing root repo specification"),
-                rootrepo_parts.next())
-                .expect("Unable to create workspace");
-
-            #[cfg(target_os = "linux")]
-            mount_fuse(mountpoint, fs, uid, gid, umask);
-        }
-        _ => panic!("Unknown root repo driver!")
+        mount_fuse(mountpoint, fs, uid, gid, umask);
     }
 }

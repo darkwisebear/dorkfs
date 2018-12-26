@@ -40,22 +40,25 @@ mount point. Currently, mounting supports the following options:
 dorkfs
 
 USAGE:
-    dorkfs.exe [OPTIONS] <cachedir> <mountpoint> <rootrepo>
+    dorkfs [OPTIONS] <cachedir> <mountpoint> <rootrepo>
 
 FLAGS:
     -h, --help       Prints help information
     -V, --version    Prints version information
 
 OPTIONS:
-        --gid <gid>         [default: 0]
-        --uid <uid>         [default: 0]
-        --umask <umask>     [default: 022]
+    -b, --branch <branch>    Remote branch that shall be tracked instead
+of the default branch.
+        --gid <gid>           [default: 0]
+        --uid <uid>           [default: 0]
+        --umask <umask>       [default: 022]
 
 ARGS:
     <cachedir>      Directory where the cached contents shall be stored
     <mountpoint>    Mountpoint that shows the checked out contents
-    <rootrepo>      Connection specification to the root repository. For GitHub this string has the following form:
-                    github;<GitHub API URL>;<org>/<repo>[;branch]
+    <rootrepo>      Connection specification to the root repository. For
+GitHub this string has the following form:
+github+<GitHub API URL>/<org>/<repo>
 ```
 
 Managing the workspace
@@ -81,7 +84,7 @@ The following commands
 
 ```
 $ dorkfs --uid johndoe --gid johndoe /home/johndoe/dorkcache \
-/mnt/dorkfs github;https://api.github.com;darkwisebear/dorktest
+/mnt/dorkfs github+https://api.github.com/darkwisebear/dorktest
 $ cd /mnt/dorkfs
 $ mkdir testdir
 $ cd testdir
