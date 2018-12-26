@@ -48,9 +48,11 @@ FLAGS:
 
 OPTIONS:
     -b, --branch <branch>    Remote branch that shall be tracked instead
-of the default branch.
-        --gid <gid>           [default: 0]
-        --uid <uid>           [default: 0]
+of the default branch
+        --gid <gid>          GID to be used for the files. Defaults to
+the effective GID of the process.
+        --uid <uid>          UID to be used for the files. Defaults to
+the effective UID of the process.
         --umask <umask>       [default: 022]
 
 ARGS:

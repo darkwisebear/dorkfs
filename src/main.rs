@@ -41,6 +41,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::fmt::Debug;
 use std::borrow::Cow;
+use std::ffi::CString;
 
 use failure::Fallible;
 
@@ -68,49 +69,51 @@ fn parse_umask(s: &str) -> u16 {
 }
 
 #[cfg(target_os="linux")]
-fn resolve_uid(uid: &str) -> Fallible<u32> {
-    match u32::from_str(uid) {
-        Ok(uid) => Ok(uid),
-        Err(_) => {
-            let name = std::ffi::CString::new(uid).unwrap();
-            unsafe {
-                let passwd = libc::getpwnam(name.as_ptr());
-                if let Some(passwd) = passwd.as_ref() {
-                    Ok(passwd.pw_uid)
-                } else {
-                    bail!("Unable to resolve the uid");
+fn resolve_uid(uid: Option<&str>) -> Fallible<u32> {
+    match uid {
+        Some(uid) => match u32::from_str(uid) {
+            Ok(uid) => Ok(uid),
+            Err(_) => {
+                let name = CString::new(uid).unwrap();
+                unsafe {
+                    let passwd = libc::getpwnam(name.as_ptr());
+                    if let Some(passwd) = passwd.as_ref() {
+                        Ok(passwd.pw_uid)
+                    } else {
+                        bail!("Unable to resolve the uid");
+                    }
                 }
             }
         }
-    }
-}
 
-#[cfg(not(target_os="linux"))]
-fn resolve_uid(uid: &str) -> Fallible<u32> {
-    u32::from_str(uid).map_err(|e| e.into())
+        None => unsafe {
+            Ok(libc::geteuid())
+        }
+    }
 }
 
 #[cfg(target_os="linux")]
-fn resolve_gid(gid: &str) -> Fallible<u32> {
-    match u32::from_str(gid) {
-        Ok(gid) => Ok(gid),
-        Err(_) => {
-            let name = std::ffi::CString::new(gid).unwrap();
-            unsafe {
-                let group = libc::getgrnam(name.as_ptr());
-                if let Some(group) = group.as_ref() {
-                    Ok(group.gr_gid)
-                } else {
-                    bail!("Unable to resolve the gid");
+fn resolve_gid(gid: Option<&str>) -> Fallible<u32> {
+    match gid {
+        Some(gid) => match u32::from_str(gid) {
+            Ok(gid) => Ok(gid),
+            Err(_) => {
+                let name = CString::new(gid).unwrap();
+                unsafe {
+                    let group = libc::getgrnam(name.as_ptr());
+                    if let Some(group) = group.as_ref() {
+                        Ok(group.gr_gid)
+                    } else {
+                        bail!("Unable to resolve the gid");
+                    }
                 }
             }
         }
-    }
-}
 
-#[cfg(not(target_os="linux"))]
-fn resolve_gid(gid: &str) -> Fallible<u32> {
-    u32::from_str(gid).map_err(|e| e.into())
+        None => unsafe {
+            Ok(libc::getegid())
+        }
+    }
 }
 
 fn parse_arguments() -> clap::ArgMatches<'static> {
@@ -132,12 +135,12 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             the following form: github+<GitHub API URL>/<org>/<repo>"))
         .arg(Arg::with_name("uid")
             .takes_value(true)
-            .default_value("0")
-            .long("uid"))
+            .long("uid")
+            .help("UID to be used for the files. Defaults to the effective UID of the process."))
         .arg(Arg::with_name("gid")
             .takes_value(true)
-            .default_value("0")
-            .long("gid"))
+            .long("gid")
+            .help("GID to be used for the files. Defaults to the effective GID of the process."))
         .arg(Arg::with_name("umask")
             .takes_value(true)
             .default_value("022")
@@ -147,7 +150,7 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .takes_value(true)
             .long("branch")
             .short("b")
-            .help("Remote branch that shall be tracked instead of the default branch."))
+            .help("Remote branch that shall be tracked instead of the default branch"))
         .get_matches()
 }
 
@@ -223,9 +226,9 @@ fn main() {
         let umask = args.value_of("umask")
             .map(parse_umask)
             .expect("Unparsable umask");
-        let uid = resolve_uid(args.value_of("uid").unwrap())
+        let uid = resolve_uid(args.value_of("uid"))
             .expect("Cannot parse UID");
-        let gid = resolve_gid(args.value_of("gid").unwrap())
+        let gid = resolve_gid(args.value_of("gid"))
             .expect("Cannot parse GID");
 
         mount_fuse(mountpoint, fs, uid, gid, umask);

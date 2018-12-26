@@ -391,7 +391,8 @@ impl<C> DorkFS<C> where
     }
 
     pub fn mount<P: AsRef<Path>>(self, mountpoint: P) -> Result<(), Error> {
-        mount(FuseMT::new(self, 1), &mountpoint, &[])
+        let fuse = FuseMT::new(self, 1);
+        mount(fuse, &mountpoint, &[OsStr::new("default_permissions")])
             .map_err(|e| Error::from(e))
     }
 
