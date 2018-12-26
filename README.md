@@ -73,6 +73,24 @@ files:
   message of the newly created commit.
 * log: This file is read-only. It provides the commit log of the
   currently mounted workspace.
+* HEAD: This file shows the current base commit used to display
+  contents. Echoing 'latest' to this file will update the repository to
+  the latest commit of the tracked branch. If the workspace is unclean,
+  the update is refused.
+* current_branch: This file displays the currently tracked remote
+  branch. Echoing a branch name to this file will switch the tracked
+  branch and updates to the latest commit of that branch. Switching only
+  works if the workspace is clean.
+* create_branch: This is a write-only file. Creates a branch with the
+  written string as its name and sets it to the current commit HEAD
+  points to.
+* revert: This is a write-only file. Reverts the file or directory
+  given. The string has to be a path relative to the mount point.
+* status: This is a read-only file. Displays the status of the
+  workspace. The first column shows the status of the file or directory:
+  'D' denotes a deleted file or dir, 'A' denotes added files,
+  and 'M' marks modified files. The second column shows the path to the
+  file or directory as a relative path to the mount point.
 
 Examples
 ========
