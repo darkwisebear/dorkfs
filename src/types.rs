@@ -22,7 +22,7 @@ pub enum RepoRef<'a> {
 }
 
 impl ObjectType {
-    fn from_file_type(file_type: fs::FileType) -> Result<ObjectType, Error> {
+    pub fn from_file_type(file_type: fs::FileType) -> Result<ObjectType, Error> {
         if file_type.is_file() {
             Ok(ObjectType::File)
         } else if file_type.is_dir() {
@@ -34,10 +34,11 @@ impl ObjectType {
         }
     }
 
-    fn from_cache_object_type(obj_type: cache::ObjectType) -> Result<ObjectType, Error> {
+    pub fn from_cache_object_type(obj_type: cache::ObjectType) -> Result<ObjectType, Error> {
         match obj_type {
             cache::ObjectType::File => Ok(ObjectType::File),
             cache::ObjectType::Directory => Ok(ObjectType::Directory),
+            cache::ObjectType::Symlink => Ok(ObjectType::Symlink),
             _ => Err(format_err!("Unmappable object type from cache!"))
         }
     }
@@ -54,15 +55,6 @@ impl Metadata {
         let metadata = Metadata {
             size: fs_metadata.len(),
             object_type: ObjectType::from_file_type(fs_metadata.file_type())?
-        };
-
-        Ok(metadata)
-    }
-
-    pub fn from_cache_metadata(cache_metadata: cache::CacheObjectMetadata) -> Result<Metadata, Error> {
-        let metadata = Metadata {
-            size: cache_metadata.size,
-            object_type: ObjectType::from_cache_object_type(cache_metadata.object_type)?
         };
 
         Ok(metadata)

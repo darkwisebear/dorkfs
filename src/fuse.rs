@@ -354,6 +354,28 @@ impl<C> FilesystemMT for DorkFS<C> where
                 }
             })
     }
+
+    fn readlink(&self, _req: RequestInfo, path: &Path) -> Result<Vec<u8>, i32> {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
+        let mut state = self.state.write().unwrap();
+        state.overlay.open_file(path, false)
+            .map_err(|e| {
+                warn!("Unable to open symlink: {}", &e);
+                match e {
+                    overlay::Error::FileNotFound => libc::ENOENT,
+                    _ => libc::EIO
+                }
+            })
+            .and_then(|mut file| {
+                let mut result = Vec::new();
+                file.read_to_end(&mut result)
+                    .map(move |_| result)
+                    .map_err(|e| {
+                        warn!("Unable to read link from overlay: {}", e);
+                        libc::EIO
+                    })
+            })
+    }
 }
 
 
@@ -406,7 +428,7 @@ impl<C> DorkFS<C> where
     }
 
     fn overlay_dir_entry_to_fuse_dir_entry(dir_entry: &OverlayDirEntry) -> ::fuse_mt::DirectoryEntry {
-        let kind = Self::object_type_to_file_type(dir_entry.metadata.object_type);
+        let kind = Self::object_type_to_file_type(dir_entry.object_type);
 
         ::fuse_mt::DirectoryEntry {
             name: OsString::from(dir_entry.name.clone()),

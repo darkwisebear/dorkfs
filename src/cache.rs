@@ -36,12 +36,6 @@ pub enum CacheError {
     #[fail(display = "JSON error: {}", _0)]
     JsonError(serde_json::Error),
 
-    #[fail(display = "Unparsable reference {}: {}", _0, _1)]
-    UnparsableCacheRef(String, Error),
-
-    #[fail(display = "Object creation failed: read only cache layer")]
-    WriteProtectedError,
-
     #[fail(display = "Runtime error {}: {}", _0, _1)]
     Custom(&'static str, Error),
 
@@ -171,7 +165,8 @@ pub trait ReadonlyFile: io::Read+io::Seek+Debug {}
 pub enum ObjectType {
     File,
     Directory,
-    Commit
+    Commit,
+    Symlink
 }
 
 impl Display for ObjectType {
@@ -180,6 +175,7 @@ impl Display for ObjectType {
             ObjectType::File => write!(f, "file"),
             ObjectType::Directory => write!(f, "directory"),
             ObjectType::Commit => write!(f, "commit"),
+            ObjectType::Symlink => write!(f, "symlink"),
         }.map_err(|_| fmt::Error)
     }
 }
@@ -189,7 +185,8 @@ impl<'a, F: ReadonlyFile, D: Directory> From<&'a CacheObject<F, D>> for ObjectTy
         match obj {
             &CacheObject::File(..) => ObjectType::File,
             &CacheObject::Directory(..) => ObjectType::Directory,
-            &CacheObject::Commit(..) => ObjectType::Commit
+            &CacheObject::Commit(..) => ObjectType::Commit,
+            &CacheObject::Symlink(..) => ObjectType::Symlink
         }
     }
 }
@@ -198,7 +195,8 @@ impl<'a, F: ReadonlyFile, D: Directory> From<&'a CacheObject<F, D>> for ObjectTy
 pub struct DirectoryEntry {
     pub name: String,
     pub cache_ref: CacheRef,
-    pub object_type: ObjectType
+    pub object_type: ObjectType,
+    pub size: u64
 }
 
 impl PartialEq for DirectoryEntry {
@@ -257,6 +255,7 @@ pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     File(F),
     Directory(D),
     Commit(Commit),
+    Symlink(String)
 }
 
 #[derive(Debug, Clone)]
@@ -296,7 +295,6 @@ pub trait CacheLayer: Debug {
     type Directory: Directory+Debug;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
-    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata>;
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef>;
     fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef>;
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
@@ -397,13 +395,10 @@ impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
             CacheObject::File(file) =>
                 CacheObject::File(Box::new(file) as Box<ReadonlyFile+Send+Sync>),
             CacheObject::Directory(dir) => CacheObject::Directory(DirectoryWrapper::new(dir)),
-            CacheObject::Commit(commit) => CacheObject::Commit(commit)
+            CacheObject::Commit(commit) => CacheObject::Commit(commit),
+            CacheObject::Symlink(symlink) => CacheObject::Symlink(symlink)
         };
         Ok(obj)
-    }
-
-    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
-        self.inner.metadata(cache_ref)
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
@@ -439,10 +434,6 @@ impl<C, F, D> CacheLayer for Box<C> where C: CacheLayer<File=F, Directory=D>+?Si
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         (**self).get(cache_ref)
-    }
-
-    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
-        (**self).metadata(cache_ref)
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {

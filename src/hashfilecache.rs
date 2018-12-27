@@ -34,37 +34,26 @@ enum CacheFileType {
     File,
     Directory,
     Commit,
-    Metadata
+    Symlink
 }
 
 impl CacheFileType {
     fn from_identifier(id: u8) -> Result<Self> {
         match id {
             b'F' => Ok(CacheFileType::File),
-            b'M' => Ok(CacheFileType::Metadata),
             b'D' => Ok(CacheFileType::Directory),
             b'C' => Ok(CacheFileType::Commit),
+            b'L' => Ok(CacheFileType::Symlink),
             _ => Err(CacheError::UnknownObjectType(id))
-        }
-    }
-
-    fn try_into_object_type(self) -> Result<ObjectType> {
-        match self {
-            CacheFileType::File => Ok(ObjectType::File),
-            CacheFileType::Directory => Ok(ObjectType::Directory),
-            CacheFileType::Commit => Ok(ObjectType::Commit),
-            CacheFileType::Metadata => Err(CacheError::LayerError(
-                format_err!("Unexpected cache file type!")))
-
         }
     }
 
     fn as_identifier(&self) -> u8 {
         match self {
             CacheFileType::File => b'F',
-            CacheFileType::Metadata => b'M',
             CacheFileType::Directory => b'D',
-            CacheFileType::Commit => b'C'
+            CacheFileType::Commit => b'C',
+            CacheFileType::Symlink => b'L'
         }
     }
 }
@@ -74,7 +63,8 @@ impl From<ObjectType> for CacheFileType {
         match val {
             ObjectType::File => CacheFileType::File,
             ObjectType::Directory => CacheFileType::Directory,
-            ObjectType::Commit => CacheFileType::Commit
+            ObjectType::Commit => CacheFileType::Commit,
+            ObjectType::Symlink => CacheFileType::Symlink
         }
     }
 }
@@ -118,6 +108,11 @@ impl IntoIterator for HashDirectory {
 
 impl Directory for HashDirectory {}
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct LinkData {
+    target: String
+}
+
 #[derive(Debug)]
 pub struct HashFileCache<C: CacheLayer+Debug> {
     base_path: Arc<PathBuf>,
@@ -130,7 +125,7 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         match self.open_object_file(cache_ref)
-            .and_then(|f| Self::load_cache_object(f, *cache_ref)) {
+            .and_then(|f| Self::load_cache_object(f)) {
             Ok(object) => Ok(object),
 
             Err(CacheError::ObjectNotFound(_)) => {
@@ -155,53 +150,16 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
 
                     CacheObject::Commit(ref commit) =>
                         self.store_json(cache_ref, commit, CacheFileType::Commit)
-                            .map(|_| CacheObject::Commit(commit.clone()))
-                }
-            }
+                            .map(|_| CacheObject::Commit(commit.clone())),
 
-            Err(e) => Err(e)
-        }
-    }
-
-    fn metadata(&self, cache_ref: &CacheRef) -> Result<CacheObjectMetadata> {
-        match self.open_object_file(cache_ref) {
-            Ok(mut file) => {
-                let cache_file_type = Self::identify_object_type(&mut file)?;
-                let result = match cache_file_type {
-                    CacheFileType::Metadata => {
-                        let metadata: FileMetadata = serde_json::from_reader(file)?;
-                        let cache_file_type = CacheFileType::from_identifier(metadata.objtype as u8)?;
-                        CacheObjectMetadata {
-                            size: metadata.size,
-                            object_type: cache_file_type.try_into_object_type()?
-                        }
+                    CacheObject::Symlink(ref symlink) => {
+                        let linkdata = LinkData {
+                            target: symlink.clone()
+                        };
+                        self.store_json(cache_ref, &linkdata, CacheFileType::Symlink)
+                            .map(|_| CacheObject::Symlink(symlink.clone()))
                     }
-
-                    CacheFileType::File |
-                    CacheFileType::Directory |
-                    CacheFileType::Commit => {
-                        let size = file.metadata()?.len() - 1;
-                        CacheObjectMetadata {
-                            size,
-                            object_type: cache_file_type.try_into_object_type().unwrap()
-                        }
-                    }
-                };
-
-                Ok(result)
-            }
-
-            Err(CacheError::ObjectNotFound(_)) => {
-                let cache_metadata = self.cache.metadata(cache_ref)?;
-
-                let file_metadata = FileMetadata::from(cache_metadata.clone());
-                if let Err(e) = self.store_json(cache_ref,
-                                                &file_metadata,
-                                                CacheFileType::Metadata) {
-                    warn!("Unable to store metadata: {}", e);
                 }
-
-                Ok(cache_metadata)
             }
 
             Err(e) => Err(e)
@@ -342,7 +300,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         CacheFileType::from_identifier(objtype_identifier[0])
     }
 
-    fn load_cache_object(mut file: fs::File, cache_ref: CacheRef)
+    fn load_cache_object(mut file: fs::File)
         -> Result<CacheObject<HashFile, HashDirectory>> {
         let objtype = Self::identify_object_type(&mut file)?;
         match objtype {
@@ -364,7 +322,10 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
                 Ok(CacheObject::Commit(commit))
             }
 
-            CacheFileType::Metadata => Err(CacheError::ObjectNotFound(cache_ref))
+            CacheFileType::Symlink => {
+                let linkdata: LinkData = serde_json::from_reader(file)?;
+                Ok(CacheObject::Symlink(linkdata.target))
+            }
         }
     }
 

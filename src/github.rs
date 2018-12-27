@@ -19,7 +19,7 @@ use failure;
 use base64;
 use bytes::Bytes;
 
-use crate::cache::{DirectoryEntry, ReadonlyFile, CacheObject, CacheObjectMetadata, CacheError, CacheRef,
+use crate::cache::{DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
             self, CacheLayer, Directory, LayerError, Commit};
 
 lazy_static! {
@@ -169,9 +169,10 @@ mod restv3 {
         fn from(dir_entry: DirectoryEntry) -> Self {
             let sha = super::cache_ref_to_sha(dir_entry.cache_ref.to_string());
             let (obj_type, mode) = match dir_entry.object_type {
-                ObjectType::File => ("blob", "100644"),
-                ObjectType::Directory => ("tree", "040000"),
-                ObjectType::Commit => ("commit", "160000"),
+                ObjectType::File =>      ("blob",   "100644"),
+                ObjectType::Directory => ("tree",   "040000"),
+                ObjectType::Commit =>    ("commit", "160000"),
+                ObjectType::Symlink =>   ("blob",   "120000")
             };
 
             Self {
@@ -263,6 +264,8 @@ mod graphql {
         pub has_next_page: bool
     }
 
+    const FILE_MODE_SYMLINK: u32 = 0o120000;
+
     #[derive(Debug, Clone, Deserialize)]
     pub struct TreeEntry {
         pub name: String,
@@ -270,6 +273,28 @@ mod graphql {
         #[serde(flatten)]
         pub oid: GitObjectId,
         pub object: GitObject
+    }
+
+    impl TreeEntry {
+        pub fn get_entry_type(&self) -> ObjectType {
+            match self.object {
+                GitObject::Commit { .. } => ObjectType::Commit,
+                GitObject::Tree { .. } => ObjectType::Directory,
+                GitObject::Blob { .. } => if self.mode == FILE_MODE_SYMLINK {
+                    ObjectType::Symlink
+                } else {
+                    ObjectType::File
+                }
+            }
+        }
+
+        pub fn get_entry_size(&self) -> u64 {
+            if let GitObject::Blob { byte_size, .. } = self.object {
+                byte_size as u64
+            } else {
+                0u64
+            }
+        }
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -319,16 +344,6 @@ mod graphql {
         deserializer.deserialize_string(StringToVecVisitor)
     }
 
-    impl<'a> Into<ObjectType> for &'a GitObject {
-        fn into(self) -> ObjectType {
-            match *self {
-                GitObject::Commit { .. } => ObjectType::Commit,
-                GitObject::Tree { .. } => ObjectType::Directory,
-                GitObject::Blob { .. } => ObjectType::File
-            }
-        }
-    }
-
     impl Into<Result<CacheObject<GithubBlob, GithubTree>, Error>> for GitObject {
         fn into(self) -> Result<CacheObject<GithubBlob, GithubTree>, Error> {
             match self {
@@ -369,9 +384,10 @@ mod graphql {
                         = entries.unwrap_or_default().into_iter().map(
                             |entry| -> Result<DirectoryEntry, Error> {
                                 Ok(DirectoryEntry {
+                                    object_type: entry.get_entry_type(),
+                                    size: entry.get_entry_size(),
                                     name: entry.name,
                                     cache_ref: entry.oid.try_into_cache_ref()?,
-                                    object_type: (&entry.object).into(),
                                 })
                             });
                     let dir_vec = dir.collect::<Result<_, Error>>()?;
@@ -417,20 +433,6 @@ impl CacheLayer for Github {
         let object = self.query_object(cache_ref, true)?;
         let cache_obj: Result<_, _> = object.into();
         Ok(cache_obj.unwrap())
-    }
-
-    fn metadata(&self, cache_ref: &CacheRef) -> cache::Result<CacheObjectMetadata> {
-        let object = self.query_object(cache_ref, false)?;
-        let metadata = CacheObjectMetadata {
-            object_type: (&object).into(),
-            size: match object {
-                graphql::GitObject::Blob { byte_size, .. } => byte_size as u64,
-                graphql::GitObject::Tree { entries: Some(ref entries) } => entries.len() as u64,
-                graphql::GitObject::Tree { entries: None } => 0u64,
-                graphql::GitObject::Commit { .. } => 0u64
-            }
-        };
-        Ok(metadata)
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> cache::Result<CacheRef> {
@@ -843,9 +845,17 @@ query {{ \
                     .map_err(|e| CacheError::Custom("Unparsable OID string", e))
             }
 
-            Some(other_type) => {
-                let obj_type = (&other_type.target).into();
-                Err(CacheError::UnexpectedObjectType(obj_type))
+            Some(graphql::Ref { target: graphql::GitObject::Tree { .. }, .. }) => {
+                Err(CacheError::UnexpectedObjectType(cache::ObjectType::Directory))
+            }
+
+            Some(graphql::Ref { target: graphql::GitObject::Blob { .. }, .. }) => {
+                Err(CacheError::UnexpectedObjectType(cache::ObjectType::File))
+            }
+
+            Some(_) => {
+                Err(CacheError::LayerError(
+                    Error::UnexpectedGraphQlResponse("No branch ref received").into()))
             }
 
             None => Ok(None)
@@ -1088,9 +1098,10 @@ mod test {
         let newdir1 = vec![DirectoryEntry {
             object_type: ObjectType::File,
             cache_ref: file1ref,
+            size: 8,
             name: format!("test{}.txt", String::from_iter(ascii.take(8))) }];
         let newdir1ref = gh.add_directory(&mut newdir1.into_iter())
-            .expect("Unbale to generate new root directory");
+            .expect("Unable to generate new root directory");
         let newcommit1 = Commit {
             parents: vec![parent_commit],
             tree: newdir1ref,

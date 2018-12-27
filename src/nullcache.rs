@@ -106,10 +106,6 @@ impl CacheLayer for NullCache {
         Err(CacheError::ObjectNotFound(cache_ref.clone()))
     }
 
-    fn metadata(&self, cache_ref: &CacheRef) -> cache::Result<CacheObjectMetadata> {
-        Err(CacheError::ObjectNotFound(cache_ref.clone()))
-    }
-
     fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef, CacheError> {
         let mut keccak = HashWriter::new();
 

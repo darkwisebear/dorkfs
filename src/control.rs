@@ -18,10 +18,8 @@ lazy_static! {
     static ref ADDITIONAL_ROOT_DIRECTORIES: [OverlayDirEntry; 1] = [
         OverlayDirEntry {
             name: String::from(DORK_DIR_ENTRY),
-            metadata: Metadata {
-                size: 0,
-                object_type: ObjectType::Directory
-            }
+            size: 0,
+            object_type: ObjectType::Directory
         }
     ];
 }

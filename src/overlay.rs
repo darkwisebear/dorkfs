@@ -73,7 +73,8 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 #[derive(Debug, Clone)]
 pub struct OverlayDirEntry {
     pub name: String,
-    pub metadata: Metadata
+    pub size: u64,
+    pub object_type: ObjectType
 }
 
 impl PartialEq for OverlayDirEntry {
@@ -94,7 +95,8 @@ impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
     fn from(val: (&'a str, &'a Metadata)) -> OverlayDirEntry {
         OverlayDirEntry {
             name: val.0.to_owned(),
-            metadata: val.1.clone()
+            object_type: val.1.object_type,
+            size: val.1.size
         }
     }
 }
@@ -454,7 +456,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             let directory_entry = cache::DirectoryEntry {
                 cache_ref,
                 object_type,
-                name
+                name,
+                size: dir_entry.metadata()?.len()
             };
 
             debug!("Add entry {}", directory_entry.name.as_str());
@@ -467,7 +470,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 } else {
                     cache::ObjectType::Directory
                 },
-                name
+                name,
+                size: 0u64
             };
 
             debug!("Subtract entry {}", directory_entry.name.as_str());
@@ -520,9 +524,11 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         overlay_path.push_fs(&fs_name);
         let name = os_string_to_string(overlay_path.overlay_path().as_os_str().to_owned())?;
 
+        let metadata = Metadata::from_fs_metadata(dir_entry.metadata()?)?;
         let entry = OverlayDirEntry {
             name,
-            metadata: Metadata::from_fs_metadata(dir_entry.metadata()?)?
+            size: metadata.size,
+            object_type: metadata.object_type
         };
 
         if fs_name.ends_with("f") {
@@ -534,14 +540,12 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     fn directory_entry_to_overlay_dir_entry(&self, dir_entry: DirectoryEntry)
         -> Result<OverlayDirEntry> {
-        self.cache.metadata(&dir_entry.cache_ref)
-            .map_err(Error::from)
-            .and_then(|meta| Metadata::from_cache_metadata(meta)
-                .map_err(Error::Generic))
-            .map(move |metadata| OverlayDirEntry {
-                name: dir_entry.name,
-                metadata
-            })
+        let object_type = ObjectType::from_cache_object_type(dir_entry.object_type)?;
+        Ok(OverlayDirEntry {
+            name: dir_entry.name,
+            object_type,
+            size: dir_entry.size
+        })
     }
 
     fn generate_tree(&self, overlay_path: OverlayPath) -> Result<CacheRef> {
@@ -932,12 +936,26 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 .and_then(|meta| Metadata::from_fs_metadata(meta)
                     .map_err(Into::into))
         } else {
-            self.resolve_object_ref(overlay_path.overlay_path())
+            let path = overlay_path.overlay_path();
+            let file_name = path.file_name()
+                .ok_or(Error::Generic(format_err!("Path doesn't contain a name")))?;
+            let parent_dir = path.parent().unwrap_or(Path::new(""));
+            debug!("Find metadata in {} for {}", parent_dir.display(), file_name.to_string_lossy());
+            let dir_entry = self.resolve_object_ref(parent_dir)
                 .and_then(|cache_ref|
-                    cache_ref.ok_or(format_err!("File not found!").into()))
-                .and_then(|cache_ref| self.cache.metadata(&cache_ref)
+                    cache_ref.ok_or(format_err!("Parent directory not found!").into()))
+                .and_then(|cache_ref| self.cache.get(&cache_ref)
+                    .and_then(|obj| obj.into_directory())
                     .map_err(Error::from))
-                .and_then(|meta| Metadata::from_cache_metadata(meta).map_err(Into::into))
+                .and_then(|dir|
+                    dir.into_iter().find(|entry| OsStr::new(entry.name.as_str()) == file_name)
+                        .ok_or(Error::Generic(format_err!("File not found in directory"))))?;
+            let metadata = Metadata {
+                object_type: ObjectType::from_cache_object_type(dir_entry.object_type)?,
+                size: dir_entry.size
+            };
+
+            Ok(metadata)
         }
     }
 
