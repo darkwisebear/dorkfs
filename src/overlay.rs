@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 
-use chrono::Local;
+use chrono::{Utc, Offset};
 
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
@@ -706,11 +706,12 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 
         let tree = self.generate_tree(overlay_path)?;
         let parents = Vec::from_iter(self.head.get_ref().into_iter());
+        let time = Utc::now();
         let commit = Commit {
             parents,
             tree,
             message: message.to_owned(),
-            committed_date: Local::now()
+            committed_date: time.with_timezone(&Utc.fix())
         };
 
         let new_commit_ref = self.cache.add_commit(commit)
@@ -946,9 +947,16 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 .and_then(|dir|
                     dir.into_iter().find(|entry| OsStr::new(entry.name.as_str()) == file_name)
                         .ok_or(Error::Generic(format_err!("File not found in directory"))))?;
+
+            let head_commit = self.head.cache_ref
+                .ok_or(CacheError::Custom("Inexistent HEAD commit", format_err!("Blubb")))
+                .and_then(|head_ref| self.cache.get(&head_ref))
+                .and_then(CacheObject::into_commit)?;
+
             let metadata = Metadata {
                 object_type: ObjectType::from_cache_object_type(dir_entry.object_type)?,
-                size: dir_entry.size
+                size: dir_entry.size,
+                modified_date: head_commit.committed_date.with_timezone(&Utc)
             };
 
             Ok(metadata)

@@ -7,6 +7,8 @@ use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::str;
 
+use chrono;
+
 use crate::{
     types::*,
     overlay::{self, *}
@@ -142,7 +144,8 @@ impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
     fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
         let metadata = Metadata {
             size: self.ops.init(control_dir.get_overlay().deref())?.len() as u64,
-            object_type: ObjectType::File
+            object_type: ObjectType::File,
+            modified_date: chrono::Utc::now()
         };
 
         Ok(metadata)
@@ -475,7 +478,8 @@ impl<O> Overlay for ControlDir<O>
         if path.as_ref() == Path::new(DORK_DIR_ENTRY) {
             Ok(Metadata {
                 size: 0,
-                object_type: ObjectType::Directory
+                object_type: ObjectType::Directory,
+                modified_date: chrono::Utc::now()
             })
         } else if path.as_ref().starts_with(DORK_DIR_ENTRY) {
             let file_name = path.as_ref().strip_prefix(DORK_DIR_ENTRY).unwrap();

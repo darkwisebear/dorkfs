@@ -8,6 +8,7 @@ use std::fmt::Debug;
 
 use failure::Error;
 use time::{get_time, Timespec};
+use chrono::{DateTime, TimeZone, Timelike};
 use fuse_mt::*;
 use libc;
 
@@ -29,6 +30,12 @@ lazy_static! {
             kind: FileType::Directory
         }
     ];
+}
+
+fn to_timespec<Tz: TimeZone>(time: &DateTime<Tz>) -> Timespec {
+    let sec = time.timestamp();
+    let nsec = time.nanosecond() as i32;
+    Timespec::new(sec, nsec)
 }
 
 #[derive(Debug)]
@@ -77,13 +84,14 @@ impl<C> FilesystemMT for DorkFS<C> where
 
         let kind = Self::object_type_to_file_type(metadata.object_type);
 
+        let time = to_timespec(&metadata.modified_date);
         let attr = FileAttr {
             size: metadata.size,
             blocks: (metadata.size+4095) / 4096,
-            atime: get_time(),
-            mtime: get_time(),
-            ctime: get_time(),
-            crtime: get_time(),
+            atime: time,
+            mtime: time,
+            ctime: time,
+            crtime: time,
             kind,
             perm,
             nlink: 1,

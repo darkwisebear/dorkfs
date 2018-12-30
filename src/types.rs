@@ -1,6 +1,7 @@
 use std::fs;
 
 use failure::Error;
+use chrono::{DateTime, Utc};
 
 use crate::cache::{self, CacheRef};
 
@@ -47,14 +48,16 @@ impl ObjectType {
 #[derive(Debug, Clone, Copy)]
 pub struct Metadata {
     pub size: u64,
-    pub object_type: ObjectType
+    pub object_type: ObjectType,
+    pub modified_date: DateTime<Utc>
 }
 
 impl Metadata {
     pub fn from_fs_metadata(fs_metadata: fs::Metadata) -> Result<Metadata, Error> {
         let metadata = Metadata {
             size: fs_metadata.len(),
-            object_type: ObjectType::from_file_type(fs_metadata.file_type())?
+            object_type: ObjectType::from_file_type(fs_metadata.file_type())?,
+            modified_date: fs_metadata.modified()?.into()
         };
 
         Ok(metadata)

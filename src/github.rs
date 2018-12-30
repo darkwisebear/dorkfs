@@ -225,7 +225,7 @@ mod graphql {
 
     use failure::Error;
     use serde::{Deserializer, de::Visitor};
-    use chrono::{DateTime, Local};
+    use chrono::{DateTime, FixedOffset};
 
     use crate::{
         cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType}
@@ -313,7 +313,7 @@ mod graphql {
             parents: Option<CommitConnection>,
             #[serde(flatten)]
             oid: Option<GitObjectId>,
-            committed_date: Option<DateTime<Local>>
+            committed_date: Option<DateTime<FixedOffset>>
         },
 
         #[serde(rename_all = "camelCase")]
@@ -961,7 +961,7 @@ mod test {
     use std::io::Write;
     use tempfile::NamedTempFile;
     use rand::{prelude::*, distributions::Alphanumeric};
-    use chrono::Local;
+    use chrono::{Local, FixedOffset};
     use super::*;
 
     fn setup_github() -> Github {
@@ -1090,7 +1090,7 @@ mod test {
             tree: updated_root,
             parents: vec![head_commit_ref],
             message: "Test commit from unit test".to_string(),
-            committed_date: Local::now()
+            committed_date: Local::now().with_timezone(&FixedOffset::east(0))
         };
 
         let new_commit_ref = github.add_commit(new_commit)
@@ -1120,7 +1120,7 @@ mod test {
             parents: vec![parent_commit],
             tree: newdir1ref,
             message: "Commit on top of the test branch".to_string(),
-            committed_date: Local::now()
+            committed_date: Local::now().with_timezone(&FixedOffset::east(0))
         };
 
         gh.add_commit(newcommit1)

@@ -13,7 +13,7 @@ use serde_json;
 use failure::{Fail, Error};
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, FixedOffset};
 
 pub trait LayerError: Fail {}
 
@@ -221,7 +221,7 @@ pub struct Commit {
     pub tree: CacheRef,
     pub parents: Vec<CacheRef>,
     pub message: String,
-    pub committed_date: DateTime<Local>
+    pub committed_date: DateTime<FixedOffset>
 }
 
 impl Display for Commit {
