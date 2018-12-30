@@ -19,8 +19,8 @@ use failure;
 use base64;
 use bytes::Bytes;
 
-use crate::cache::{DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
-            self, CacheLayer, Directory, LayerError, Commit};
+use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
+                   CacheLayer, Directory, LayerError, Commit};
 
 lazy_static! {
     static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
@@ -223,9 +223,14 @@ mod graphql {
     use std::fmt::{self, Formatter};
     use std::sync::Arc;
 
-    use crate::cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType};
     use failure::Error;
     use serde::{Deserializer, de::Visitor};
+    use chrono::{DateTime, Local};
+
+    use crate::{
+        cache::{CacheObject, Commit, CacheRef, DirectoryEntry, ObjectType}
+    };
+
     use super::{GithubBlob, GithubTree};
 
     #[derive(Debug, Clone, Deserialize)]
@@ -300,13 +305,15 @@ mod graphql {
     #[derive(Debug, Clone, Deserialize)]
     #[serde(tag = "__typename")]
     pub enum GitObject {
+        #[serde(rename_all = "camelCase")]
         Commit {
             author: Option<Author>,
             tree: Option<GitObjectId>,
             message: Option<String>,
             parents: Option<CommitConnection>,
             #[serde(flatten)]
-            oid: Option<GitObjectId>
+            oid: Option<GitObjectId>,
+            committed_date: Option<DateTime<Local>>
         },
 
         #[serde(rename_all = "camelCase")]
@@ -350,7 +357,10 @@ mod graphql {
                 GitObject::Commit {
                     tree: Some(tree),
                     parents: Some(parents),
-                    message: Some(message), ..
+                    message: Some(message),
+                    committed_date: Some(committed_date),
+                    author: _,
+                    oid: _
                 } => {
                     let cache_ref = tree.try_into_cache_ref()?;
                     let converted_parents =
@@ -360,7 +370,8 @@ mod graphql {
                     let commit = Commit {
                         tree: cache_ref,
                         parents: converted_parents.collect::<Result<Vec<CacheRef>, Error>>()?,
-                        message
+                        message,
+                        committed_date
                     };
 
                     Ok(CacheObject::Commit(commit))
@@ -615,6 +626,7 @@ query {{ \
           oid \
         }} \
         message \
+        committedDate \
         parents(first:5) {{ \
           nodes {{ \
             oid \
@@ -949,6 +961,7 @@ mod test {
     use std::io::Write;
     use tempfile::NamedTempFile;
     use rand::{prelude::*, distributions::Alphanumeric};
+    use chrono::Local;
     use super::*;
 
     fn setup_github() -> Github {
@@ -1057,7 +1070,7 @@ mod test {
             .expect("src is not a directory");
 
         let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
-        writeln!(temp_file, "Test executed on {}", ::time::now().rfc822z()).unwrap();
+        writeln!(temp_file, "Test executed on {}", ::chrono::Local::now().to_rfc2822()).unwrap();
         let file_cache_ref = github.add_file_by_path(
             temp_file.into_temp_path().as_ref())
             .expect("Unable to upload file contents");
@@ -1076,7 +1089,8 @@ mod test {
         let new_commit = crate::cache::Commit {
             tree: updated_root,
             parents: vec![head_commit_ref],
-            message: "Test commit from unit test".to_string()
+            message: "Test commit from unit test".to_string(),
+            committed_date: Local::now()
         };
 
         let new_commit_ref = github.add_commit(new_commit)
@@ -1105,7 +1119,8 @@ mod test {
         let newcommit1 = Commit {
             parents: vec![parent_commit],
             tree: newdir1ref,
-            message: "Commit on top of the test branch".to_string()
+            message: "Commit on top of the test branch".to_string(),
+            committed_date: Local::now()
         };
 
         gh.add_commit(newcommit1)

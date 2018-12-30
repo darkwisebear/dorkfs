@@ -10,10 +10,13 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 
-use crate::types::*;
-use crate::utility::*;
-use crate::cache::{
-    self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject, CacheError
+use chrono::Local;
+
+use crate::{
+    cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
+            CacheError},
+    types::*,
+    utility::*
 };
 
 #[derive(Debug, Fail)]
@@ -706,7 +709,8 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         let commit = Commit {
             parents,
             tree,
-            message: message.to_owned()
+            message: message.to_owned(),
+            committed_date: Local::now()
         };
 
         let new_commit_ref = self.cache.add_commit(commit)

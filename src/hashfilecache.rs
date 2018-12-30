@@ -125,7 +125,7 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         match self.open_object_file(cache_ref)
-            .and_then(|f| Self::load_cache_object(f)) {
+            .and_then(|f| self.load_cache_object(cache_ref, f)) {
             Ok(object) => Ok(object),
 
             Err(CacheError::ObjectNotFound(_)) => {
@@ -228,6 +228,8 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         info!("Adding object {} to {}", cache_ref, target_path.display());
         if !target_path.exists() {
             fs::hard_link(&source_path, target_path)?;
+        } else {
+            warn!("Target path already exists, unable to create link!")
         }
 
         debug!("Removing staging file {}", source_path.display());
@@ -265,6 +267,16 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         Path::new("staging").join(rand_name)
     }
 
+    fn invalidate(&self, cache_ref: &CacheRef) {
+        if let Err(e) = fs::remove_file(self.generate_cache_file_path(cache_ref)) {
+            if let io::ErrorKind::NotFound = e.kind() {
+                info!("Invalidated object {} not in cache", cache_ref);
+            } else {
+                error!("Unable to invalidate object {}: {}", cache_ref, e);
+            }
+        }
+    }
+
     fn create_staging_file(&self, object_type: CacheFileType) -> Result<(fs::File, PathBuf)> {
         self.ensure_path("staging")?;
         let rel_path = Self::generate_staging_path();
@@ -282,9 +294,13 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         Ok((file, rel_path))
     }
 
-    fn open_object_file(&self, cache_ref: &CacheRef) -> Result<fs::File> {
+    fn generate_cache_file_path(&self, cache_ref: &CacheRef) -> PathBuf {
         let rel_path = Self::rel_path_from_ref(cache_ref);
-        let path = self.base_path.join(&rel_path);
+        self.base_path.join(&rel_path)
+    }
+
+    fn open_object_file(&self, cache_ref: &CacheRef) -> Result<fs::File> {
+        let path = self.generate_cache_file_path(cache_ref);
 
         if path.exists() {
             let file = fs::File::open(path)?;
@@ -300,7 +316,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         CacheFileType::from_identifier(objtype_identifier[0])
     }
 
-    fn load_cache_object(mut file: fs::File)
+    fn load_cache_object(&self, cache_ref: &CacheRef, mut file: fs::File)
         -> Result<CacheObject<HashFile, HashDirectory>> {
         let objtype = Self::identify_object_type(&mut file)?;
         match objtype {
@@ -318,8 +334,17 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
             }
 
             CacheFileType::Commit => {
-                let commit = serde_json::from_reader(file)?;
-                Ok(CacheObject::Commit(commit))
+                // If the returned error indicates that data is missing we force the upper layer to
+                // retrieve the object from upstream again.
+                match serde_json::from_reader(file) {
+                    Ok(commit) => Ok(CacheObject::Commit(commit)),
+                    Err(e) => if e.is_data() {
+                        self.invalidate(cache_ref);
+                        Err(CacheError::ObjectNotFound(cache_ref.clone()))
+                    } else {
+                        Err(e.into())
+                    }
+                }
             }
 
             CacheFileType::Symlink => {

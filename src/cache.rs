@@ -13,6 +13,7 @@ use serde_json;
 use failure::{Fail, Error};
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
+use chrono::{DateTime, Local};
 
 pub trait LayerError: Fail {}
 
@@ -219,22 +220,29 @@ pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone { }
 pub struct Commit {
     pub tree: CacheRef,
     pub parents: Vec<CacheRef>,
-    pub message: String
+    pub message: String,
+    pub committed_date: DateTime<Local>
 }
 
 impl Display for Commit {
     fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
         f.write_str(self.message.as_str())?;
-        write!(f, "\n\nTree:    {}\n", self.tree)?;
+        write!(f, "\n\nCommitted: {}", self.committed_date)?;
+        write!(f, "\nTree:      {}\n", self.tree)?;
 
         match self.parents.len() {
             0 => (),
-            1 => f.write_str("Parent: ")?,
-            _ => f.write_str("Parents:")?
+            1 => f.write_str("Parent:    ")?,
+            _ => f.write_str("Parents:   ")?
         }
 
-        for parent_commit in &self.parents {
-            write!(f, " {}", parent_commit)?;
+        let mut parents = self.parents.iter();
+        if let Some(parent_commit) = parents.next() {
+            write!(f, "{}", parent_commit)?;
+        }
+
+        for parent_commit in parents {
+            write!(f, "\n           {}", parent_commit)?;
         }
 
         Ok(())
@@ -246,7 +254,7 @@ pub struct ReferencedCommit(pub CacheRef, pub Commit);
 
 impl Display for ReferencedCommit {
     fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
-        write!(f, "Commit:  {}\n\n{}", self.0, self.1)
+        write!(f, "\nCommit:    {}\n\n{}", self.0, self.1)
     }
 }
 
