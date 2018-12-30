@@ -181,26 +181,14 @@ impl<C> FilesystemMT for DorkFS<C> where
 
     fn release(&self,
                _req: RequestInfo,
-               path: &Path,
+               _path: &Path,
                fh: u64,
                _flags: u32,
                _lock_owner: u64,
                _flush: bool) -> ResultEmpty {
         self.state.write().unwrap().open_handles.remove(fh)
             .ok_or(libc::EBADF)
-            .and_then(|handle| {
-                if let OpenObject::File(mut file) = handle {
-                    file.close().
-                        map_err(|e| {
-                            error!("Unable to successfully close file {}: {}",
-                                   path.to_string_lossy(),
-                                   e);
-                            libc::EIO
-                        })
-                } else {
-                    Ok(())
-                }
-            })
+            .map(drop)
     }
 
     fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32 )

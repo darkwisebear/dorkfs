@@ -102,7 +102,6 @@ impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
 }
 
 pub trait OverlayFile: Read+Write+Seek {
-    fn close(&mut self) -> Result<()>;
     fn truncate(&mut self, size: u64) -> Result<()>;
 }
 
@@ -166,21 +165,14 @@ pub trait WorkspaceController<'a>: Debug {
 
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
-    FsFile(Option<Arc<Mutex<File>>>),
+    FsFile(Arc<Mutex<File>>),
     CacheFile(C::File)
 }
 
 impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
-    fn close(&mut self) -> Result<()> {
-        if let FSOverlayFile::FsFile(ref mut file) = *self {
-            file.take();
-        }
-        Ok(())
-    }
-
     fn truncate(&mut self, size: u64) -> Result<()> {
         if let FSOverlayFile::FsFile(ref mut file) = *self {
-            let file = file.as_ref().unwrap().lock().unwrap();
+            let file = file.lock().unwrap();
             file.set_len(size).map_err(Error::from)
         } else {
             Ok(())
@@ -192,7 +184,7 @@ impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             FSOverlayFile::FsFile(ref mut file) => {
-                let mut file = file.as_mut().unwrap().lock().unwrap();
+                let mut file = file.lock().unwrap();
                 file.read(buf)
             }
             FSOverlayFile::CacheFile(ref mut read) => read.read(buf),
@@ -204,7 +196,7 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match *self {
             FSOverlayFile::FsFile(ref mut file) => {
-                let mut file = file.as_mut().unwrap().lock().unwrap();
+                let mut file = file.lock().unwrap();
                 file.write(buf)
             }
             FSOverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
@@ -213,7 +205,7 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
 
     fn flush(&mut self) -> io::Result<()> {
         if let FSOverlayFile::FsFile(ref mut file) = *self {
-            let mut file = file.as_mut().unwrap().lock().unwrap();
+            let mut file = file.lock().unwrap();
             file.flush()
         } else {
             Ok(())
@@ -225,7 +217,7 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match *self {
             FSOverlayFile::FsFile(ref mut file) => {
-                let mut file = file.as_mut().unwrap().lock().unwrap();
+                let mut file = file.lock().unwrap();
                 file.seek(pos)
             }
             FSOverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
@@ -399,7 +391,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     fn add_fs_file<P: AsRef<Path>>(&mut self, path: P, file: File) -> FSOverlayFile<C> {
         let file = Arc::new(Mutex::new(file));
         self.overlay_files.insert(path.as_ref().to_owned(), Arc::downgrade(&file));
-        FSOverlayFile::FsFile(Some(file))
+        FSOverlayFile::FsFile(file)
     }
 
     pub fn new<P: AsRef<Path>>(cache: C, base_path: P, branch: &str) -> Result<Self> {

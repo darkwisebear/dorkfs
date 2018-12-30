@@ -24,11 +24,36 @@ lazy_static! {
     ];
 }
 
-pub struct DynamicOverlayFileWrapper(Box<dyn OverlayFile+Send+Sync>);
+/// Implemented for all control files.
+///
+/// Due to https://github.com/rust-lang/rust/issues/27863 we cannot implement Drop for BufferedFile
+/// without introducing a lifetime parameter for it. Therefore we introduce a trait that will then
+/// be used in the Drop implementation of DynamicOverlayFileWrapper to execute the control file's
+/// action on close.
+pub trait ControlOverlayFile: OverlayFile {
+    /// Called if the control file is closed
+    ///
+    /// # Panics
+    /// This method shall not panic as it will be called inside a Drop implementation.
+    fn close(&mut self) -> Result<()>;
+}
+
+pub struct DynamicOverlayFileWrapper(Box<dyn ControlOverlayFile+Send+Sync>);
 
 impl Debug for DynamicOverlayFileWrapper {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "<Dynamic overlay file object>")
+    }
+}
+
+impl Drop for DynamicOverlayFileWrapper {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.close() {
+            warn!("Unable to close file on drop: {}", &e);
+            // Enable this in debug builds to make tests fail if there is an error during closing
+            // the control file. Not sure if that's smart as the panic will most likely abort()...
+            debug_assert!(false, "Closing a control file failed: {}", &e);
+        }
     }
 }
 
@@ -38,27 +63,7 @@ pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     InnerOverlayFile(O::File)
 }
 
-// Due to https://github.com/rust-lang/rust/issues/27863 we cannot implement Drop for ControlFile
-// without introducing a lifetime parameter for it. Do not auto-execute a started commit on Drop
-// for now. Instead, close() has to be called explicitly.
-//
-// impl<O> Drop for ControlFile<O> where for <'a> O: Overlay+WorkspaceController<'a> {
-//     fn drop(&mut self) {
-//         if let Err(e) = self.execute_commit() {
-//             error!("Unable to complete commit: {}", e);
-//         }
-//     }
-// }
-
 impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn close(&mut self) -> overlay::Result<()> {
-        match self {
-            ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(ref mut overlay_file)) =>
-                overlay_file.close(),
-            ControlFile::InnerOverlayFile(ref mut overlay_file) => overlay_file.close()
-        }
-    }
-
     fn truncate(&mut self, size: u64) -> overlay::Result<()> {
         match self {
             ControlFile::DynamicOverlayFile(DynamicOverlayFileWrapper(special_file)) =>
@@ -121,7 +126,7 @@ pub trait SpecialFileOps: Clone+Debug {
 pub trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceController<'a> {
     fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata>;
     fn get_file<'a, 'b>(&'a self, _control_dir: &'b ControlDir<O>)
-        -> overlay::Result<Box<dyn OverlayFile+Send+Sync>> {
+        -> overlay::Result<Box<dyn ControlOverlayFile+Send+Sync>> {
         Err(format_err!("This special file type cannot be accessed like a normal file").into())
     }
 }
@@ -144,13 +149,13 @@ impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
     }
 
     fn get_file<'a, 'b>(&'a self, control_dir: &'b ControlDir<O>)
-        -> overlay::Result<Box<dyn OverlayFile+Send+Sync>> {
+        -> overlay::Result<Box<dyn ControlOverlayFile+Send+Sync>> {
         let file = BufferedFile {
             buf: Cursor::new(self.ops.init(control_dir.get_overlay().deref())?),
             ops: self.ops.clone(),
             overlay: Arc::clone(&control_dir.overlay)
         };
-        Ok(Box::new(file) as Box<dyn OverlayFile+Send+Sync>)
+        Ok(Box::new(file) as Box<dyn ControlOverlayFile+Send+Sync>)
     }
 }
 
@@ -197,17 +202,21 @@ impl<F, O> Seek for BufferedFile<F, O> where F: SpecialFileOps,
 impl<F, O> OverlayFile for BufferedFile<F, O>
     where F: SpecialFileOps,
           for<'a> O: Overlay+WorkspaceController<'a>+Send+Sync+'static {
-    fn close(&mut self) -> overlay::Result<()> {
-        self.ops.close(&mut *self.overlay.write().unwrap(),
-                       self.buf.get_ref().as_slice())
-    }
-
     fn truncate(&mut self, size: u64) -> overlay::Result<()> {
         if self.buf.position() as u64 > size {
             self.buf.set_position(size);
         }
         self.buf.get_mut().truncate(size as usize);
         Ok(())
+    }
+}
+
+impl<F, O> ControlOverlayFile for BufferedFile<F, O>
+    where F: SpecialFileOps,
+    for<'a> O: Overlay+WorkspaceController<'a>+Send+Sync+'static {
+    fn close(&mut self) -> overlay::Result<()> {
+        self.ops.close(&mut *self.overlay.write().unwrap(),
+                       self.buf.get_ref().as_slice())
     }
 }
 
@@ -536,8 +545,7 @@ mod test {
             .expect("Unable to open commit file");
         commit_file.write("Test commit message".as_bytes())
             .expect("Unable to write commit message");
-        commit_file.close()
-            .expect("Closing commit message failed");
+        drop(commit_file);
 
         let workspace_controller = control_overlay.get_overlay();
         let head_ref = workspace_controller.get_current_head_ref()
@@ -565,7 +573,7 @@ mod test {
                 .expect("Unable to open test file");
         file1.write(b"Test 1")
             .expect("Unable to write to test file");
-        file1.close().expect("Couldn't close test file");
+        drop(file1);
 
         let first_commit = control_overlay.get_overlay_mut()
             .commit("Commit to first branch")
@@ -577,7 +585,7 @@ mod test {
                 .expect("Unable to open create_branch special file");
         create_branch.write_all(b"feature")
             .expect("Create branch \"feature\" failed");
-        create_branch.close().unwrap();
+        drop(create_branch);
 
         // Check if we still track "master"
         let mut switch_branch =
@@ -586,14 +594,14 @@ mod test {
         let mut content = Vec::new();
         switch_branch.read_to_end(&mut content).unwrap();
         assert_eq!(b"master", content.as_slice());
-        switch_branch.close().unwrap();
+        drop(switch_branch);
 
         // Switch to branch "feature"
         let mut switch_branch =
             control_overlay.open_file(".dork/current_branch", true)
                 .expect("Unable to open current_branch for reading");
         switch_branch.write_all(b"feature").unwrap();
-        switch_branch.close().unwrap();
+        drop(switch_branch);
 
         // Check if switch is reflected
         let mut switch_branch =
@@ -602,7 +610,7 @@ mod test {
         let mut content = Vec::new();
         switch_branch.read_to_end(&mut content).unwrap();
         assert_eq!(b"feature", content.as_slice());
-        switch_branch.close().unwrap();
+        drop(switch_branch);
 
         // Add a commit with a second file to the branch "feature"
         let mut file2 =
@@ -610,7 +618,7 @@ mod test {
                 .expect("Unable to open test file");
         file2.write(b"Test 2")
             .expect("Unable to write to test file");
-        file2.close().expect("Couldn't close test file");
+        drop(file2);
 
         let second_commit = control_overlay.get_overlay_mut().commit("Commit to second branch")
             .expect("Unable to create second commit");
@@ -626,7 +634,6 @@ mod test {
         file2.read_to_end(&mut content)
             .expect("Unable to read from first file");
         assert_eq!(b"Test 2", content.as_slice());
-        file2.close().unwrap();
         drop(file2);
 
         // Now update the workspace
@@ -634,7 +641,7 @@ mod test {
             control_overlay.open_file(".dork/HEAD", true)
                 .expect("Unable to open HEAD");
         write!(&mut head, "latest").expect("Unable to update workspace");
-        head.close().unwrap();
+        drop(head);
 
         // ...and check if the second file is gone
         assert!(control_overlay.open_file("file2.txt", false).is_err());
@@ -655,7 +662,7 @@ mod test {
             control_overlay.open_file(".dork/HEAD", true)
                 .expect("Unable to open HEAD");
         write!(&mut head, "latest").expect("Unable to update workspace");
-        head.close().unwrap();
+        drop(head);
 
         // Check if we're pointing to the right commit
         check_file_content(
@@ -726,7 +733,7 @@ mod test {
                 .expect("Unable to open test file");
         file1.write(b"Test 1")
             .expect("Unable to write to test file");
-        file1.close().expect("Couldn't close test file");
+        drop(file1);
         assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
 
         let mut revert_file =
@@ -734,7 +741,7 @@ mod test {
                 .expect("Unable to open revert file");
         revert_file.write_all(b"file1.txt")
             .expect("unable to write to revert file");
-        revert_file.close().unwrap();
+        drop(revert_file);
         assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
     }
 
@@ -751,7 +758,7 @@ mod test {
                 .expect("Unable to open test file");
         file1.write(b"Test 1")
             .expect("Unable to write to test file");
-        file1.close().expect("Couldn't close test file");
+        drop(file1);
         assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
 
         let mut file2 =
@@ -759,7 +766,7 @@ mod test {
                 .expect("Unable to open test file");
         file2.write(b"Test 2")
             .expect("Unable to write to test file");
-        file2.close().expect("Couldn't close test file");
+        drop(file2);
         assert_eq!(2, control_overlay.get_overlay().get_status().unwrap().count());
 
         let mut revert_file =
@@ -767,7 +774,7 @@ mod test {
                 .expect("Unable to open revert file");
         revert_file.write_all(b"file1.txt")
             .expect("unable to write to revert file");
-        revert_file.close().unwrap();
+        drop(revert_file);
         assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
 
         let mut revert_file =
@@ -775,7 +782,7 @@ mod test {
                 .expect("Unable to open revert file");
         revert_file.write_all(b"dir")
             .expect("unable to write to revert dir");
-        revert_file.close().unwrap();
+        drop(revert_file);
         assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
     }
 
@@ -790,7 +797,6 @@ mod test {
         let mut test_file =
             control_overlay.open_file("test.txt", true).unwrap();
         write!(test_file, "A test text").unwrap();
-        test_file.close().unwrap();
         drop(test_file);
 
         let first_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
@@ -798,7 +804,6 @@ mod test {
         let mut test_file =
             control_overlay.open_file("test2.txt", true).unwrap();
         write!(&mut test_file, "A second test").unwrap();
-        test_file.close().unwrap();
         drop(test_file);
 
         let second_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
@@ -810,7 +815,6 @@ mod test {
         let mut head_file =
             control_overlay.open_file(".dork/HEAD", true).unwrap();
         write!(&mut head_file, "latest").unwrap();
-        head_file.close().unwrap();
         drop(head_file);
 
         assert_eq!(Some(second_commit),
