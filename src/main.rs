@@ -46,7 +46,7 @@ use std::ffi::CString;
 use failure::Fallible;
 
 use crate::hashfilecache::HashFileCache;
-use crate::overlay::FilesystemOverlay;
+use crate::overlay::{WorkspaceController, FilesystemOverlay};
 use crate::cache::CacheLayer;
 use crate::utility::RootrepoUrl;
 
@@ -201,6 +201,24 @@ fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: Option<B>)
     };
 
     FilesystemOverlay::new(rootrepo, overlaydir, branch.as_ref())
+        .and_then(|mut overlay|
+            match overlay.update_head() {
+                Err(overlay::Error::UncleanWorkspace) => {
+                    println!("Not updating current workspace since it is unclean.");
+                    Ok(overlay)
+                }
+
+                Err(err) => Err(err),
+
+                Ok(cache_ref) => {
+                    println!("Updating workspace to latest HEAD of {} -> {}",
+                             overlay.get_current_branch()?
+                                 .expect("No tracked branch but update worked..?"),
+                             &cache_ref);
+                    Ok(overlay)
+                }
+            }
+        )
         .map_err(Into::into)
 }
 
