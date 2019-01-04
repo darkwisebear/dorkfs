@@ -24,6 +24,9 @@ pub enum Error {
     #[fail(display = "Directory not empty")]
     NonemptyDirectory,
 
+    #[fail(display = "Workspace unclean")]
+    UncleanWorkspace,
+
     #[fail(display = "File not found")]
     FileNotFound,
 
@@ -164,6 +167,12 @@ pub trait WorkspaceController<'a>: Debug {
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
     fn get_status(&'a self) -> Result<Self::StatusIter>;
     fn update_head(&mut self) -> Result<CacheRef>;
+
+    fn is_clean(&'a self) -> Result<bool> {
+        self.get_status()
+            .map(|mut status|
+                status.next().is_none())
+    }
 }
 
 #[derive(Debug)]
@@ -766,12 +775,16 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     }
 
     fn update_head(&mut self) -> Result<CacheRef> {
+        if !self.is_clean()? {
+            return Err(Error::UncleanWorkspace);
+        }
+
         self.cache.get_head_commit(self.branch.as_str())
             .map_err(Into::into)
-            .and_then(|cache_ref|
-                cache_ref.ok_or(Error::MissingHeadRef(self.branch.clone()))
-                    .and_then(|cache_ref|
-                        self.head.set_ref(Some(cache_ref)).map(|_| cache_ref)))
+        .and_then(|cache_ref|
+            cache_ref.ok_or(Error::MissingHeadRef(self.branch.clone())))
+        .and_then(|cache_ref|
+            self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
     }
 }
 
@@ -1640,5 +1653,24 @@ mod test {
 
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
+    }
+
+    #[test]
+    fn refuse_update_if_workspace_unclean() {
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        let mut test_file = overlay.open_file("test.txt", true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        match overlay.update_head() {
+            Err(super::Error::UncleanWorkspace) => (),
+            Err(err) => panic!("Unexpected error during update of unclean workspace: {}", err),
+            Ok(_) => panic!("Update worked despite unclean workspace!")
+        }
     }
 }
