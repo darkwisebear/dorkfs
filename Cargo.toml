@@ -23,7 +23,7 @@ tiny-keccak = "1.4"
 rand = "0.5"
 lazy_static = "1.0"
 tempfile = "3.0"
-git2 = { version = "0.7", optional = true }
+git2 = { version = "0.8", optional = true }
 hyper = "0.12"
 hyper-tls = "0.3"
 http = "0.1"

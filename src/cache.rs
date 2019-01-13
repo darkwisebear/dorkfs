@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::hash::{Hash, Hasher};
 use std::iter::FromIterator;
 use std::vec;
+use std::fs;
 
 use serde_json;
 use failure::{Fail, Error};
@@ -64,15 +65,21 @@ impl<E: LayerError> From<E> for CacheError {
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
+#[derive(PartialEq, Eq, Clone, Copy, Hash)]
 pub struct CacheRef(pub [u8; 32]);
 
-impl Display for CacheRef {
+impl Debug for CacheRef {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         for b in self.0.iter() {
             write!(f, "{:02x}", b)?;
         }
         Ok(())
+    }
+}
+
+impl Display for CacheRef {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        <Self as Debug>::fmt(self, f)
     }
 }
 
@@ -162,6 +169,8 @@ impl<'de> Deserialize<'de> for CacheRef {
 
 pub trait ReadonlyFile: io::Read+io::Seek+Debug {}
 
+impl ReadonlyFile for fs::File {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ObjectType {
     File,
@@ -215,6 +224,8 @@ impl Hash for DirectoryEntry {
 }
 
 pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone { }
+
+impl Directory for Vec<DirectoryEntry> {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Commit {
