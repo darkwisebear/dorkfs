@@ -9,6 +9,7 @@ use std::sync::{Arc, Weak, Mutex};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
+use std::cmp::max;
 
 use chrono::{Utc, Offset};
 
@@ -660,6 +661,11 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     pub fn set_head(&mut self, cache_ref: CacheRef) -> Result<()> {
         self.head.set_ref(Some(cache_ref))
     }
+
+    #[cfg(test)]
+    pub fn get_cache_mut(&mut self) -> &mut C {
+        &mut self.cache
+    }
 }
 
 pub struct CacheLayerLog<'a, C: CacheLayer+'a> {
@@ -710,8 +716,17 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     type StatusIter = FSStatusIter<'a, C>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
+        // lock all opened files to block writes as long as the commit is pending
+        let open_files = self.overlay_files.drain()
+            .filter_map(|(path, file)|
+                file.upgrade().map(move |file| (path, file)))
+            .collect::<Vec<_>>();
+        let mut locks = open_files.iter()
+            .map(|(path, ptr)| (path, ptr.lock().unwrap()))
+            .collect::<Vec<_>>();
+
         let file_path = Self::file_path(&self.base_path);
-        let overlay_path = OverlayPath::new(file_path);
+        let overlay_path = OverlayPath::new(&file_path);
 
         let tree = self.generate_tree(overlay_path)?;
         let parents = Vec::from_iter(self.head.get_ref().into_iter());
@@ -723,17 +738,48 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
             committed_date: time.with_timezone(&Utc.fix())
         };
 
+        // Commit
         let new_commit_ref = self.cache.add_commit(commit)
             .and_then(|cache_ref|
                 self.cache.merge_commit(&self.branch, cache_ref))?;
 
-        // Stage 1: Cleanup overlay content
+        // Set HEAD to (possibly merged) new head commit
+        let result = self.head.set_ref(self.cache.get_head_commit(&self.branch)?
+            .or(Some(new_commit_ref)))
+            .map(|_| new_commit_ref);
+
+        debug!("Updating overlay");
+        for (path, overlay_file) in locks.iter_mut() {
+            // If the file is still open, update its contents
+            debug!("Updating file {}", path.display());
+            self.resolve_object_ref(path)
+                .and_then(|cache_ref| match cache_ref {
+                    Some(cache_ref) => self.cache.get(&cache_ref)
+                        .and_then(CacheObject::into_file)
+                        .map_err(Error::CacheError)
+                        .and_then(|mut cache_file| {
+                            let cur_pos = overlay_file.seek(SeekFrom::Current(0))?;
+                            overlay_file.seek(SeekFrom::Start(0))?;
+                            let amount = io::copy(&mut cache_file,
+                                                  &mut **overlay_file)?;
+                            // truncate file if copied amount is less than the current size or
+                            // enlarge it if it has become smaller than the previous write position
+                            overlay_file.set_len(max(amount, cur_pos))?;
+                            overlay_file.seek(SeekFrom::Start(cur_pos))
+                                .map(|_| ())
+                                .map_err(Error::IoError)
+                        }),
+                    None => Ok(())
+                })?;
+        }
+
+        drop(locks);
+        self.overlay_files.extend(open_files.into_iter()
+            .map(|(path, file)| (path, Arc::downgrade(&file))));
+
         self.clear_closed_files()?;
 
-        // Stage 2: Remove version pinning if there is no open file left
-        self.head.set_ref(self.cache.get_head_commit(&self.branch)?
-            .or(Some(new_commit_ref)))
-            .map(|_| new_commit_ref)
+        result
     }
 
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>> {
@@ -1117,6 +1163,7 @@ mod test {
         iter::FromIterator
     };
     use tempfile::tempdir;
+    use chrono::{Utc, Offset};
     use crate::overlay::{Overlay, OverlayFile, OverlayDirEntry, FileState, WorkspaceController};
     use super::testutil::*;
 
@@ -1672,5 +1719,103 @@ mod test {
             Err(err) => panic!("Unexpected error during update of unclean workspace: {}", err),
             Ok(_) => panic!("Update worked despite unclean workspace!")
         }
+    }
+
+    #[cfg(feature = "gitcache")]
+    #[test]
+    fn commit_with_open_file_and_external_change() {
+        use crate::cache::{CacheObject, CacheLayer, DirectoryEntry, Commit};
+        // This test shall verify that it is ok to commit when a file is open and was changed in
+        // the cache by another action.
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+
+        let cache_dir = tempdir.path().join("cache");
+        let overlay_dir = tempdir.path().join("overlay");
+        let git_dir = tempdir.path().join("git");
+
+        let storage = crate::gitcache::GitCache::new(git_dir)
+            .expect("Unable to initialize Git storage");
+        let cache =
+            crate::hashfilecache::HashFileCache::new(storage, &cache_dir)
+                .expect("Unable to create cache");
+        let mut overlay =
+            crate::overlay::FilesystemOverlay::new(cache, &overlay_dir, "master")
+                .expect("Unable to create overlay");
+
+        // 1. Create two test files and commit
+        let mut file1 =
+            overlay.open_file("test1.txt", true)
+                .expect("Unable to create first test file");
+        write!(file1, "A test file")
+            .expect("Unable to write to first test file");
+        drop(file1);
+        let mut file2 =
+            overlay.open_file("test2.txt", true)
+                .expect("Unable to create second test file");
+        write!(file2, "Another test file")
+            .expect("Unable to write to second test file");
+        drop(file2);
+
+        let commit_ref = overlay.commit("Create two test files")
+            .expect("Unable to create first commit");
+
+        // 2. Reopen the files, change one
+        let mut file1 =
+            overlay.open_file("test1.txt", true)
+                .expect("Unable to reopen first test file");
+        write!(file1, "Alter one file in the overlay")
+            .expect("Unable to change the first file");
+        drop(file1);
+        let mut file2 =
+            overlay.open_file("test2.txt", true)
+                .expect("Unable to reopen second test file");
+
+        // 3. Alter the other file directly in the cache
+        let cache = overlay.get_cache_mut();
+        let commit = cache.get(&commit_ref)
+            .and_then(CacheObject::into_commit)
+            .expect("Unable to retrieve first commit object");
+        let root_tree =
+            cache.get(&commit.tree)
+                .and_then(CacheObject::into_directory)
+                .expect("Unable to get root commit");
+
+        let mut newfile = tempfile::NamedTempFile::new().unwrap();
+        write!(newfile, "Altered content").unwrap();
+        let newfile_path = newfile.into_temp_path();
+        let newfile_ref =
+            cache.add_file_by_path(&newfile_path)
+                .expect("Unable to add file with altered path");
+        let directory = root_tree.into_iter()
+            .map(|mut entry: DirectoryEntry| {
+                if entry.name == "test2.txt" {
+                    entry.cache_ref = newfile_ref;
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let newtree_ref =
+            cache.add_directory(&mut directory.into_iter())
+                .expect("Unable to create new root tree");
+        let new_commit = Commit {
+            tree: newtree_ref,
+            parents: vec![commit_ref],
+            message: String::from("Altered second test file"),
+            committed_date: Utc::now().with_timezone(&Utc.fix())
+        };
+        let newcommit_ref =
+            cache.add_commit(new_commit)
+                .expect("Unable to add commit that alters a file");
+        cache.inner_mut().set_reference("master", &newcommit_ref).unwrap();
+        drop(cache);
+
+        // 4. Commit the other file
+        overlay.commit("Altered first test file")
+            .expect("Unable to create the second commit via the overlay");
+
+        // 5. Check if the locally unchanged file contains the changes from the cache
+        check_file_content(&mut file2, "Altered content");
     }
 }

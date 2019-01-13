@@ -216,6 +216,11 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
         Ok(cache)
     }
 
+    #[cfg(test)]
+    pub fn inner_mut(&mut self) -> &mut C {
+        &mut self.cache
+    }
+
     fn add_object_file(&self, rel_path: PathBuf, cache_ref: &CacheRef) -> Result<()> {
         let rel_target_path = Self::rel_path_from_ref(&cache_ref);
         let parent_path = rel_target_path.parent()
