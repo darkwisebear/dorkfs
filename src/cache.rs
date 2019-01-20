@@ -277,6 +277,17 @@ pub enum CacheObject<F: ReadonlyFile, D: Directory> {
     Symlink(String)
 }
 
+impl<F, D> Clone for CacheObject<F, D> where F: ReadonlyFile+Clone, D: Directory {
+    fn clone(&self) -> Self {
+        match self {
+            CacheObject::File(f) => CacheObject::File(f.clone()),
+            CacheObject::Directory(d) => CacheObject::Directory(d.clone()),
+            CacheObject::Commit(c) => CacheObject::Commit(c.clone()),
+            CacheObject::Symlink(s) => CacheObject::Symlink(s.clone())
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheObjectMetadata {
     pub size: u64,

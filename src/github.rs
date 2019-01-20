@@ -5,7 +5,6 @@ use std::fs;
 use std::sync::{Arc, Weak, Mutex, mpsc::channel};
 use std::str::{self, FromStr};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::default::Default;
 
 use http::{uri::InvalidUri, request};
@@ -92,7 +91,7 @@ pub fn cache_ref_to_sha(mut cache_ref_str: String) -> String {
     cache_ref_str
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GithubBlob {
     data: Cursor<Arc<[u8]>>
 }
@@ -134,7 +133,7 @@ pub struct Github {
     token: String,
     tokio: Arc<Runtime>,
     http_client: Client<HttpsConnector<HttpConnector>>,
-    query_cache: Mutex<HashMap<CacheRef, graphql::GitObject>>
+    object_cache: Mutex<HashMap<CacheRef, CacheObject<GithubBlob, GithubTree>>>
 }
 
 mod restv3 {
@@ -220,10 +219,12 @@ mod restv3 {
 
 mod graphql {
     use std::io::Cursor;
-    use std::fmt::{self, Formatter};
+    use std::fmt::{self, Formatter, Debug};
     use std::sync::Arc;
+    use std::mem::replace;
+    use std::vec;
 
-    use failure::Error;
+    use failure::{Fallible, Error};
     use serde::{Deserializer, de::Visitor};
     use chrono::{DateTime, FixedOffset};
 
@@ -303,17 +304,67 @@ mod graphql {
     }
 
     #[derive(Debug, Clone, Deserialize)]
+    pub struct NodeList<T> where T: Debug+Clone {
+        nodes: Vec<T>
+    }
+
+    impl<T: Debug+Clone> Default for NodeList<T> {
+        fn default() -> Self {
+            Self {
+                nodes: Vec::new()
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct GitCommit {
+        author: Option<Author>,
+        tree: Option<GitObjectId>,
+        message: Option<String>,
+        parents: Option<CommitConnection>,
+        #[serde(flatten)]
+        oid: Option<GitObjectId>,
+        committed_date: Option<DateTime<FixedOffset>>
+    }
+
+    impl Into<Fallible<Commit>> for GitCommit {
+        fn into(self) -> Fallible<Commit> {
+            if let GitCommit {
+                tree: Some(tree),
+                parents: Some(parents),
+                message: Some(message),
+                committed_date: Some(committed_date),
+                author: _,
+                oid: _
+            } = self {
+                let cache_ref = tree.try_into_cache_ref()?;
+                let converted_parents =
+                    parents.nodes.into_iter()
+                        .map(|parent|
+                            parent.try_into_cache_ref());
+                let commit = Commit {
+                    tree: cache_ref,
+                    parents: converted_parents.collect::<Fallible<Vec<CacheRef>>>()?,
+                    message,
+                    committed_date
+                };
+
+                Ok(commit)
+            } else {
+                unimplemented!("TODO: Cope with incomplete commit data")
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
     #[serde(tag = "__typename")]
     pub enum GitObject {
-        #[serde(rename_all = "camelCase")]
         Commit {
-            author: Option<Author>,
-            tree: Option<GitObjectId>,
-            message: Option<String>,
-            parents: Option<CommitConnection>,
             #[serde(flatten)]
             oid: Option<GitObjectId>,
-            committed_date: Option<DateTime<FixedOffset>>
+            #[serde(default)]
+            history: NodeList<GitCommit>
         },
 
         #[serde(rename_all = "camelCase")]
@@ -327,6 +378,8 @@ mod graphql {
         },
 
         Tree {
+            #[serde(flatten)]
+            oid: Option<GitObjectId>,
             #[serde(default)]
             entries: Option<Vec<TreeEntry>>
         }
@@ -351,59 +404,119 @@ mod graphql {
         deserializer.deserialize_string(StringToVecVisitor)
     }
 
-    impl Into<Result<CacheObject<GithubBlob, GithubTree>, Error>> for GitObject {
-        fn into(self) -> Result<CacheObject<GithubBlob, GithubTree>, Error> {
+    pub enum GitObjIter {
+        Err(failure::Error),
+        Blob(CacheRef, GithubBlob),
+        TreeEntries(CacheRef, vec::IntoIter<TreeEntry>),
+        CommitHistory(vec::IntoIter<GitCommit>),
+        Finished
+    }
+
+    impl Iterator for GitObjIter {
+        type Item = Fallible<(CacheRef, CacheObject<GithubBlob, GithubTree>)>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let cur_state = replace(self, GitObjIter::Finished);
+            match cur_state {
+                GitObjIter::Blob(cache_ref, file) => Some(Ok((cache_ref, CacheObject::File(file)))),
+
+                GitObjIter::TreeEntries(cache_ref, entries) => {
+                    let dir: Fallible<Vec<DirectoryEntry>> = entries.map(|entry| {
+                        let object_type = entry.get_entry_type();
+                        let size = entry.get_entry_size();
+
+                        let cache_ref = entry.oid.try_into_cache_ref()?;
+
+                        let dir_entry = DirectoryEntry {
+                            object_type,
+                            size,
+                            name: entry.name,
+                            cache_ref
+                        };
+
+                        Ok(dir_entry)
+                    }).collect();
+
+                    match dir {
+                        Ok(dir) => Some(Ok((cache_ref, CacheObject::Directory(GithubTree(dir))))),
+                        Err(e) => Some(Err(e))
+                    }
+                }
+
+                GitObjIter::CommitHistory(mut history) => {
+                    let commit = history.next().map(|mut commit| {
+                        let oid = commit.oid.take();
+                        let cache_ref = oid.ok_or(format_err!("Missing Oid"))
+                            .and_then(|oid| oid.try_into_cache_ref())?;
+                        let commit: Fallible<Commit> = commit.into();
+                        commit.map(move |commit|
+                            (cache_ref, CacheObject::Commit(commit)))
+                    });
+
+                    if commit.is_some() {
+                        *self = GitObjIter::CommitHistory(history);
+                    }
+
+                    commit
+                }
+
+                GitObjIter::Err(e) => Some(Err(e)),
+
+                GitObjIter::Finished => None
+            }
+        }
+    }
+
+    impl IntoIterator for GitObject {
+        type Item = Fallible<(CacheRef, CacheObject<GithubBlob, GithubTree>)>;
+        type IntoIter = GitObjIter;
+
+        fn into_iter(self) -> Self::IntoIter {
+            let oid = self.get_oid();
+
+            let cache_ref = oid.ok_or(format_err!("Missing oid in object"))
+                .and_then(|oid| oid.clone().try_into_cache_ref());
+
             match self {
-                GitObject::Commit {
-                    tree: Some(tree),
-                    parents: Some(parents),
-                    message: Some(message),
-                    committed_date: Some(committed_date),
-                    author: _,
-                    oid: _
-                } => {
-                    let cache_ref = tree.try_into_cache_ref()?;
-                    let converted_parents =
-                        parents.nodes.into_iter()
-                            .map(|parent|
-                                parent.try_into_cache_ref());
-                    let commit = Commit {
-                        tree: cache_ref,
-                        parents: converted_parents.collect::<Result<Vec<CacheRef>, Error>>()?,
-                        message,
-                        committed_date
+                GitObject::Blob { text, oid: _, .. } => {
+                    let cache_ref = match cache_ref {
+                        Ok(cache_ref) => cache_ref,
+                        Err(e) => return GitObjIter::Err(e)
                     };
 
-                    Ok(CacheObject::Commit(commit))
-                }
+                    let data = match text.ok_or(
+                        format_err!("Attempt to convert a blob without data into a cache object")) {
+                        Ok(content) => Cursor::new(content),
+                        Err(e) => return GitObjIter::Err(e)
+                    };
 
-                GitObject::Commit { .. } => {
-                    unimplemented!("TODO: Cope with incomplete commit data")
-                }
-
-                GitObject::Blob { text, .. } => {
-                    let content = text.expect("Attempt to convert a blob without \
-                    data into a cache object");
                     let blob = GithubBlob {
-                        data: Cursor::new(content)
+                        data
                     };
-                    Ok(CacheObject::File(blob))
+                    GitObjIter::Blob(cache_ref, blob)
                 }
 
-                GitObject::Tree { entries } => {
-                    let dir
-                        = entries.unwrap_or_default().into_iter().map(
-                            |entry| -> Result<DirectoryEntry, Error> {
-                                Ok(DirectoryEntry {
-                                    object_type: entry.get_entry_type(),
-                                    size: entry.get_entry_size(),
-                                    name: entry.name,
-                                    cache_ref: entry.oid.try_into_cache_ref()?,
-                                })
-                            });
-                    let dir_vec = dir.collect::<Result<_, Error>>()?;
-                    Ok(CacheObject::Directory(GithubTree(dir_vec)))
+                GitObject::Commit { history, oid: _ } =>
+                    GitObjIter::CommitHistory(history.nodes.into_iter()),
+
+                GitObject::Tree { entries, oid: _ } => {
+                    let cache_ref = match cache_ref {
+                        Ok(cache_ref) => cache_ref,
+                        Err(e) => return GitObjIter::Err(e)
+                    };
+
+                    GitObjIter::TreeEntries(cache_ref, entries.unwrap_or_default().into_iter())
                 }
+            }
+        }
+    }
+
+    impl GitObject {
+        pub fn get_oid(&self) -> Option<&GitObjectId> {
+            match self {
+                &GitObject::Blob { ref oid, .. } => oid.as_ref(),
+                &GitObject::Tree { ref oid, .. } => oid.as_ref(),
+                &GitObject::Commit { ref oid, .. } => oid.as_ref()
             }
         }
     }
@@ -441,9 +554,7 @@ impl CacheLayer for Github {
 
     fn get(&self, cache_ref: &CacheRef)
            -> cache::Result<CacheObject<Self::File, Self::Directory>> {
-        let object = self.query_object(cache_ref, true)?;
-        let cache_obj: Result<_, _> = object.into();
-        Ok(cache_obj.unwrap())
+        self.query_object(cache_ref, true)
     }
 
     fn add_file_by_path(&self, source_path: &Path) -> cache::Result<CacheRef> {
@@ -528,7 +639,7 @@ impl Github {
             token: token.to_string(),
             tokio,
             http_client,
-            query_cache: Default::default()
+            object_cache: Default::default()
         })
     }
 
@@ -618,21 +729,26 @@ query {{ \
         isTruncated \
       }} \
       ...on Commit {{ \
-        author {{ \
-          name \
-          email \
-        }} \
-        tree {{ \
-          oid \
-        }} \
-        message \
-        committedDate \
-        parents(first:5) {{ \
+        history(first:20) {{ \
           nodes {{ \
             oid \
-          }} \
-          pageInfo {{ \
-            hasNextPage \
+            author {{ \
+              name \
+              email \
+            }} \
+            tree {{ \
+              oid \
+            }} \
+            message \
+            committedDate \
+            parents(first:5) {{ \
+              nodes {{ \
+                oid \
+              }} \
+              pageInfo {{ \
+                hasNextPage \
+              }} \
+            }} \
           }} \
         }} \
       }} \
@@ -658,54 +774,56 @@ query {{ \
         let response = self.execute_graphql_query(query)?;
 
         let mut get_response: GraphQLQueryResponse = from_json_slice(response.body().as_ref())?;
-        debug!("Parsed response: {:?}", get_response);
 
-        // If we've received a blob, set its oid since we may need it to get the object's
-        // contents later
-        if let Some(graphql::GitObject::Blob { ref mut oid, .. }) = get_response.data.repository.object {
-            *oid = Some(graphql::GitObjectId::from(*cache_ref));
+        // Set the oid since we didn't request it from the server as that would be redundant.
+        let new_oid = Some(graphql::GitObjectId::from(*cache_ref));
+        match get_response.data.repository.object {
+            Some(graphql::GitObject::Blob { ref mut oid, .. }) => *oid = new_oid,
+            Some(graphql::GitObject::Tree { ref mut oid, .. }) => *oid= new_oid,
+            Some(graphql::GitObject::Commit { ref mut oid, .. }) => *oid = new_oid,
+            None => ()
         }
+
+        debug!("Parsed response: {:?}", get_response);
 
         Ok(get_response)
     }
 
     fn query_object(&self, cache_ref: &CacheRef, get_blob_contents: bool)
-                    -> cache::Result<graphql::GitObject> {
-        let mut cache =
-            self.query_cache.lock().unwrap();
-        let obj = {
-            let obj = match cache.entry(*cache_ref) {
-                Entry::Occupied(occupied) => occupied.into_mut(),
+                    -> cache::Result<CacheObject<GithubBlob, GithubTree>> {
+        let mut cache = self.object_cache.lock().unwrap();
 
-                Entry::Vacant(vacant) => {
-                    let fetched_obj =
-                        self.fetch_remote_object(cache_ref, get_blob_contents)?;
-                    let obj = fetched_obj.data.repository.object
-                        .ok_or(Error::UnexpectedGraphQlResponse("Missing object"))?;
-                    vacant.insert(obj)
+        let obj = if let Some(obj) = cache.get(cache_ref) {
+            obj.clone()
+        } else {
+            let mut result = Err(CacheError::ObjectNotFound(*cache_ref));
+
+            let obj = {
+                let fetched_obj =
+                    self.fetch_remote_object(cache_ref, get_blob_contents)?;
+                let mut obj = fetched_obj.data.repository.object
+                    .ok_or(Error::UnexpectedGraphQlResponse("Missing object"))?;
+
+                if get_blob_contents {
+                    self.ensure_git_object_data(cache_ref, &mut obj)?;
                 }
+
+                obj
             };
 
-            if get_blob_contents {
-                self.ensure_git_object_data(cache_ref, obj)?;
-            }
-
-            obj.clone()
-        };
-
-        // If we've received a tree we extract the entries so that we don't have to query them
-        // again if we need their metadata
-        if let graphql::GitObject::Tree { entries: Some(ref entries) } = obj {
-            for tree_entry in entries {
-                let cache_ref =
-                    tree_entry.oid.clone().try_into_cache_ref()
-                        .map_err(|e| CacheError::Custom(
-                            "Unable to convert the oid to a CacheRef", e))?;
-                if let Entry::Vacant(cache_entry) = cache.entry(cache_ref) {
-                    cache_entry.insert(tree_entry.object.clone());
+            for cache_obj in obj {
+                let (obj_cache_ref, cache_obj) = cache_obj
+                    .map_err(|e|
+                        CacheError::Custom("Unable to parse graphql response", e))?;
+                if cache_ref == &obj_cache_ref {
+                    result = Ok(cache_obj.clone());
                 }
+                debug!("Add {} to github cache", obj_cache_ref);
+                cache.insert(obj_cache_ref, cache_obj);
             }
-        }
+
+            result?
+        };
 
         Ok(obj)
     }
@@ -725,7 +843,7 @@ query {{ \
 
             // If the cached tree is missing its entries we add them directly to the cached
             // tree object
-            graphql::GitObject::Tree { entries: None } => {
+            graphql::GitObject::Tree { entries: None, oid: _ } => {
                 let fetched_obj =
                     self.fetch_remote_object(cache_ref, false)?;
                 *object = fetched_obj.data.repository.object
@@ -733,8 +851,8 @@ query {{ \
 
                 // Check if we received what we expected
                 match object {
-                    graphql::GitObject::Tree { entries: Some(_) } => (), // We're cool
-                    graphql::GitObject::Tree { entries: None } =>
+                    graphql::GitObject::Tree { entries: Some(_), oid: _ } => (), // We're cool
+                    graphql::GitObject::Tree { entries: None, oid: _ } =>
                         return Err(Error::UnexpectedGraphQlResponse(
                             "No entries received in tree").into()),
                     _ => {
@@ -949,6 +1067,12 @@ query {{ \
                     Ok(())
                 })
     }
+
+    #[cfg(test)]
+    pub fn get_cached(&self, cache_ref: &CacheRef) -> Option<CacheObject<GithubBlob, GithubTree>> {
+        let mut cache = self.object_cache.lock().unwrap();
+        cache.get(cache_ref).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -979,7 +1103,11 @@ mod test {
         crate::init_logging();
         let github = setup_github();
         let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
-        debug!("Commit from GitHub: {:?}", obj);
+        let commit = obj.into_commit().expect("Unable to convert into commit");
+        let parent_ref = commit.parents[0];
+        let parent_obj = github.get_cached(&parent_ref)
+            .expect("Parent commit uncached");
+        debug!("Commit from GitHub: {:?}", commit);
     }
 
     #[test]
@@ -1022,20 +1150,20 @@ mod test {
         let test2_parsed: GitObject = serde_json::from_str(test2).unwrap();
         let test3_parsed: GitObject = serde_json::from_str(test3).unwrap();
 
-        if let GitObject::Tree { entries: Some(v) } = test1_parsed {
+        if let GitObject::Tree { entries: Some(v), oid: _ } = test1_parsed {
             assert_eq!(0, v.len());
         } else {
             panic!("Unexpected deserialization result: {:?}", test1_parsed);
         }
 
-        if let GitObject::Tree { entries: Some(v) } = test2_parsed {
+        if let GitObject::Tree { entries: Some(v), oid: _ } = test2_parsed {
             assert_eq!("77bd95d183dbe757ebd53c0aa95d1a710b85460f", v[0].oid.oid.as_str());
             assert_eq!("test", v[0].name);
         } else {
             panic!("Unexpected deserialization result: {:?}", test3_parsed);
         }
 
-        if let GitObject::Tree { entries: None } = test3_parsed {
+        if let GitObject::Tree { entries: None, oid: _ } = test3_parsed {
 
         } else {
             panic!("Unexpected deserialization result: {:?}", test3_parsed);
