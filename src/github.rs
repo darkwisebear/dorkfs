@@ -628,7 +628,7 @@ impl Github {
             ("https://api.github.com/graphql".parse().unwrap(),
              "https://api.github.com".to_string())
         } else {
-            (format!("{}/graphql", uri).parse().unwrap(), format!("{}/v3", uri))
+            (format!("{}api/graphql", uri).parse().unwrap(), format!("{}api/v3", uri))
         };
 
         Ok(Github {
