@@ -15,7 +15,7 @@ use chrono::{Utc, Offset};
 
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
-            CacheError},
+            CacheError, Directory},
     types::*,
     utility::*
 };
@@ -1004,7 +1004,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                     .and_then(|obj| obj.into_directory())
                     .map_err(Error::from))
                 .and_then(|dir|
-                    dir.into_iter().find(|entry| OsStr::new(entry.name.as_str()) == file_name)
+                    dir.find_entry(&file_name).cloned()
                         .ok_or(Error::Generic(format_err!("File not found in directory"))))?;
 
             let head_commit = self.head.cache_ref

@@ -110,19 +110,7 @@ impl Seek for GithubBlob {
 
 impl ReadonlyFile for GithubBlob {}
 
-#[derive(Debug, Clone)]
-pub struct GithubTree(Vec<DirectoryEntry>);
-
-impl Directory for GithubTree {}
-
-impl IntoIterator for GithubTree {
-    type Item = DirectoryEntry;
-    type IntoIter = vec::IntoIter<DirectoryEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
+type GithubTree = Vec<DirectoryEntry>;
 
 #[derive(Debug)]
 pub struct Github {
@@ -223,6 +211,7 @@ mod graphql {
     use std::sync::Arc;
     use std::mem::replace;
     use std::vec;
+    use std::iter::FromIterator;
 
     use failure::{Fallible, Error};
     use serde::{Deserializer, de::Visitor};
@@ -438,7 +427,7 @@ mod graphql {
                     }).collect();
 
                     match dir {
-                        Ok(dir) => Some(Ok((cache_ref, CacheObject::Directory(GithubTree(dir))))),
+                        Ok(dir) => Some(Ok((cache_ref, CacheObject::Directory(GithubTree::from_iter(dir))))),
                         Err(e) => Some(Err(e))
                     }
                 }
@@ -1070,7 +1059,7 @@ query {{ \
 
     #[cfg(test)]
     pub fn get_cached(&self, cache_ref: &CacheRef) -> Option<CacheObject<GithubBlob, GithubTree>> {
-        let mut cache = self.object_cache.lock().unwrap();
+        let cache = self.object_cache.lock().unwrap();
         cache.get(cache_ref).cloned()
     }
 }
@@ -1105,8 +1094,7 @@ mod test {
         let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
         let commit = obj.into_commit().expect("Unable to convert into commit");
         let parent_ref = commit.parents[0];
-        let parent_obj = github.get_cached(&parent_ref)
-            .expect("Parent commit uncached");
+        github.get_cached(&parent_ref).expect("Parent commit uncached");
         debug!("Commit from GitHub: {:?}", commit);
     }
 

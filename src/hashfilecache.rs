@@ -6,13 +6,15 @@ use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fmt::Debug;
 use std::error::Error;
 use std::iter::FromIterator;
+use std::borrow::Borrow;
+use std::ffi::OsStr;
 
 use rand::{prelude::*, distributions::Alphanumeric};
 use serde_json;
 use serde::Serialize;
 
-use crate::cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
-            CacheObject, ObjectType, CacheObjectMetadata, Commit};
+use crate::cache::{Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer,
+                   CacheRef, CacheObject, ObjectType, CacheObjectMetadata, Commit};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FileMetadata {
@@ -97,16 +99,26 @@ pub struct HashDirectory {
     entries: Vec<DirectoryEntry>
 }
 
+impl FromIterator<DirectoryEntry> for HashDirectory {
+    fn from_iter<I: IntoIterator<Item=DirectoryEntry>>(iter: I) -> Self {
+        HashDirectory { entries: Vec::from_iter(iter) }
+    }
+}
+
+impl Directory for HashDirectory {
+    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
+        self.entries.find_entry(name)
+    }
+}
+
 impl IntoIterator for HashDirectory {
     type Item = DirectoryEntry;
     type IntoIter = vec::IntoIter<DirectoryEntry>;
 
-    fn into_iter(self) -> <Self as IntoIterator>::IntoIter {
+    fn into_iter(self) -> Self::IntoIter {
         self.entries.into_iter()
     }
 }
-
-impl Directory for HashDirectory {}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct LinkData {
@@ -141,9 +153,7 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
                     }
 
                     CacheObject::Directory(ref dir) => {
-                        let hash_dir = HashDirectory {
-                            entries: Vec::from_iter(dir.clone().into_iter())
-                        };
+                        let hash_dir = HashDirectory::from_iter(dir.clone());
                         self.store_json(cache_ref, &hash_dir, CacheFileType::Directory)
                             .map(|_| CacheObject::Directory(hash_dir))
                     }
@@ -177,7 +187,7 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         let entries = Vec::from_iter(items);
         let cache_ref = self.cache.add_directory(&mut entries.iter().cloned())?;
 
-        let hash_dir = HashDirectory { entries };
+        let hash_dir = HashDirectory::from_iter(entries);
         self.store_json(&cache_ref, &hash_dir, CacheFileType::Directory)?;
         Ok(cache_ref)
     }

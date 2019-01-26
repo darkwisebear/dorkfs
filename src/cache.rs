@@ -6,6 +6,7 @@ use std::result;
 use std::string::ToString;
 use std::str::FromStr;
 use std::hash::{Hash, Hasher};
+use std::borrow::Borrow;
 use std::iter::FromIterator;
 use std::vec;
 use std::fs;
@@ -223,9 +224,16 @@ impl Hash for DirectoryEntry {
     }
 }
 
-pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone { }
+pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone {
+    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry>;
+}
 
-impl Directory for Vec<DirectoryEntry> {}
+impl Directory for Vec<DirectoryEntry> {
+    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
+        self.iter().find(|entry|
+            <String as AsRef<OsStr>>::as_ref(&entry.name) == name.borrow())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Commit {
@@ -340,10 +348,6 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
     let mut objs = vec![commit.tree.clone()];
     let path = path.as_ref();
 
-    fn find_entry<D: Directory>(dir: D, component: &OsStr) -> Option<DirectoryEntry> {
-        dir.into_iter().find(|entry| Some(entry.name.as_str()) == component.to_str())
-    }
-
     for component in path.components() {
         match component {
             Component::Prefix(..) => panic!("A prefix is not allowed to appear in a cache path"),
@@ -361,7 +365,7 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
                         .expect("Non-directory ref in directory stack");
                     let cur_dir =
                         cache.get(cur_dir_ref)?.into_directory()?;
-                    match find_entry(cur_dir, entry) {
+                    match cur_dir.find_entry(&entry) {
                         Some(dir_entry) => dir_entry.cache_ref,
                         None => return Ok(None)
                     }
@@ -376,28 +380,9 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
 
 impl ReadonlyFile for Box<ReadonlyFile+Send+Sync> {}
 
-#[derive(Clone, Debug)]
-pub struct DirectoryWrapper(vec::IntoIter<DirectoryEntry>);
-
-impl DirectoryWrapper {
-    fn new<D: Directory>(dir: D) -> Self {
-        DirectoryWrapper(Vec::from_iter(dir.into_iter()).into_iter())
-    }
-}
-
-impl Directory for DirectoryWrapper {}
-
-impl IntoIterator for DirectoryWrapper {
-    type Item = DirectoryEntry;
-    type IntoIter = vec::IntoIter<DirectoryEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0
-    }
-}
-
 pub type BoxedCacheLayer =
-    Box<CacheLayer<File=Box<ReadonlyFile+Send+Sync+'static>, Directory=DirectoryWrapper>+Send+Sync>;
+    Box<CacheLayer<File=Box<ReadonlyFile+Send+Sync+'static>,
+        Directory=Vec<DirectoryEntry>>+Send+Sync>;
 
 #[derive(Debug)]
 struct CacheLayerWrapper<C: CacheLayer+Send+Sync> {
@@ -418,13 +403,13 @@ pub fn boxed<C>(inner: C) -> BoxedCacheLayer where C: CacheLayer+Send+Sync+'stat
 impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
                                                   C::File: Send+Sync+'static {
     type File = Box<ReadonlyFile+Send+Sync>;
-    type Directory = DirectoryWrapper;
+    type Directory = Vec<DirectoryEntry>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let obj = match self.inner.get(cache_ref)? {
             CacheObject::File(file) =>
                 CacheObject::File(Box::new(file) as Box<ReadonlyFile+Send+Sync>),
-            CacheObject::Directory(dir) => CacheObject::Directory(DirectoryWrapper::new(dir)),
+            CacheObject::Directory(dir) => CacheObject::Directory(Vec::from_iter(dir)),
             CacheObject::Commit(commit) => CacheObject::Commit(commit),
             CacheObject::Symlink(symlink) => CacheObject::Symlink(symlink)
         };

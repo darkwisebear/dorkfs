@@ -4,7 +4,9 @@ use std::{
     vec::IntoIter,
     io::{self, Read, Write, Seek, SeekFrom},
     fs::File,
-    collections::HashMap
+    collections::HashMap,
+    borrow::Borrow,
+    ffi::OsStr
 };
 
 use tiny_keccak::Keccak;
@@ -91,7 +93,11 @@ impl IntoIterator for NullDirectory {
     }
 }
 
-impl Directory for NullDirectory {}
+impl Directory for NullDirectory {
+    fn find_entry<S: Borrow<OsStr>>(&self, _name: &S) -> Option<&DirectoryEntry> {
+        unreachable!()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct NullCache {
