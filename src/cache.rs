@@ -1,13 +1,14 @@
 use std::path::{Component, Path};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::fmt::{Debug, Display, Formatter, self};
 use std::result;
 use std::string::ToString;
 use std::str::FromStr;
 use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, hash_map};
 use std::borrow::Borrow;
-use std::iter::FromIterator;
+use std::iter::{self, FromIterator};
 use std::vec;
 use std::fs;
 
@@ -224,7 +225,7 @@ impl Hash for DirectoryEntry {
     }
 }
 
-pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone {
+pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+FromIterator<DirectoryEntry>+Clone {
     fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry>;
 }
 
@@ -232,6 +233,40 @@ impl Directory for Vec<DirectoryEntry> {
     fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
         self.iter().find(|entry|
             <String as AsRef<OsStr>>::as_ref(&entry.name) == name.borrow())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectoryImpl(HashMap<OsString, DirectoryEntry>);
+
+impl IntoIterator for DirectoryImpl {
+    type Item = DirectoryEntry;
+    type IntoIter = iter::Map<hash_map::IntoIter<OsString, DirectoryEntry>,
+        fn((OsString, DirectoryEntry)) -> DirectoryEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        #[inline]
+        fn map_entry(e: (OsString, DirectoryEntry)) -> DirectoryEntry {
+            e.1
+        }
+
+        self.0.into_iter().map(map_entry)
+    }
+}
+
+impl FromIterator<DirectoryEntry> for DirectoryImpl {
+    fn from_iter<T: IntoIterator<Item=DirectoryEntry>>(iter: T) -> Self {
+        let hash_map = iter.into_iter().map(|entry| {
+            let name = OsString::from(&entry.name);
+            (name, entry)
+        }).collect();
+        DirectoryImpl(hash_map)
+    }
+}
+
+impl Directory for DirectoryImpl {
+    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
+        self.0.get(name.borrow())
     }
 }
 
@@ -380,9 +415,11 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
 
 impl ReadonlyFile for Box<ReadonlyFile+Send+Sync> {}
 
+type DirectoryWrapper = DirectoryImpl;
+
 pub type BoxedCacheLayer =
     Box<CacheLayer<File=Box<ReadonlyFile+Send+Sync+'static>,
-        Directory=Vec<DirectoryEntry>>+Send+Sync>;
+        Directory=DirectoryWrapper>+Send+Sync>;
 
 #[derive(Debug)]
 struct CacheLayerWrapper<C: CacheLayer+Send+Sync> {
@@ -403,13 +440,13 @@ pub fn boxed<C>(inner: C) -> BoxedCacheLayer where C: CacheLayer+Send+Sync+'stat
 impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
                                                   C::File: Send+Sync+'static {
     type File = Box<ReadonlyFile+Send+Sync>;
-    type Directory = Vec<DirectoryEntry>;
+    type Directory = DirectoryWrapper;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let obj = match self.inner.get(cache_ref)? {
             CacheObject::File(file) =>
                 CacheObject::File(Box::new(file) as Box<ReadonlyFile+Send+Sync>),
-            CacheObject::Directory(dir) => CacheObject::Directory(Vec::from_iter(dir)),
+            CacheObject::Directory(dir) => CacheObject::Directory(Self::Directory::from_iter(dir)),
             CacheObject::Commit(commit) => CacheObject::Commit(commit),
             CacheObject::Symlink(symlink) => CacheObject::Symlink(symlink)
         };

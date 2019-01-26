@@ -81,23 +81,7 @@ impl Seek for NullFile {
 
 impl ReadonlyFile for NullFile {}
 
-#[derive(Debug, Clone)]
-pub struct NullDirectory;
-
-impl IntoIterator for NullDirectory {
-    type Item = DirectoryEntry;
-    type IntoIter = IntoIter<DirectoryEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        unreachable!()
-    }
-}
-
-impl Directory for NullDirectory {
-    fn find_entry<S: Borrow<OsStr>>(&self, _name: &S) -> Option<&DirectoryEntry> {
-        unreachable!()
-    }
-}
+pub type NullDirectory = Vec<DirectoryEntry>;
 
 #[derive(Debug, Default)]
 pub struct NullCache {
