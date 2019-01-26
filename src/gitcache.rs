@@ -159,7 +159,7 @@ impl CacheLayer for GitCache {
                     use chrono::{TimeZone, FixedOffset, DateTime};
                     let time = commit.time();
                     let offset = FixedOffset::east_opt(time.offset_minutes())
-                        .ok_or(CacheError::Custom("", format_err!("Bad time offset")))?;
+                        .ok_or(CacheError::RuntimeError(format_err!("Bad time offset")))?;
                     offset.timestamp(time.seconds(), 0)
                 };
                 let commit = Commit {

@@ -1005,10 +1005,11 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                     .map_err(Error::from))
                 .and_then(|dir|
                     dir.find_entry(&file_name).cloned()
-                        .ok_or(Error::Generic(format_err!("File not found in directory"))))?;
+                        .ok_or(Error::Generic(format_err!(r#"File "{}" not found in directory"#,
+                                                          file_name.to_string_lossy()))))?;
 
             let head_commit = self.head.cache_ref
-                .ok_or(CacheError::Custom("Inexistent HEAD commit", format_err!("Blubb")))
+                .ok_or(CacheError::RuntimeError(format_err!("Inexistent HEAD commit")))
                 .and_then(|head_ref| self.cache.get(&head_ref))
                 .and_then(CacheObject::into_commit)?;
 
