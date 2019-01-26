@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::io::{self, Read, Seek, SeekFrom, Cursor};
-use std::vec;
 use std::fs;
 use std::sync::{Arc, Weak, Mutex, mpsc::channel};
 use std::str::{self, FromStr};
@@ -19,7 +18,7 @@ use base64;
 use bytes::Bytes;
 
 use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
-                   CacheLayer, Directory, LayerError, Commit};
+                   CacheLayer, LayerError, Commit};
 
 lazy_static! {
     static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
@@ -374,7 +373,7 @@ mod graphql {
         }
     }
 
-    fn arc_u8_from_string<'de, D>(deserializer: D) -> Result<Option<Arc<[u8]>>, D::Error>
+    pub fn arc_u8_from_string<'de, D>(deserializer: D) -> Result<Option<Arc<[u8]>>, D::Error>
         where D: Deserializer<'de> {
         struct StringToVecVisitor;
 
@@ -383,6 +382,10 @@ mod graphql {
 
             fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
                 write!(formatter, "Just. A. String.")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Some(v.as_bytes().into()))
             }
 
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
@@ -507,6 +510,16 @@ mod graphql {
                 &GitObject::Tree { ref oid, .. } => oid.as_ref(),
                 &GitObject::Commit { ref oid, .. } => oid.as_ref()
             }
+        }
+
+        pub fn set_oid(&mut self, new_oid: GitObjectId) {
+            let oid = match self {
+                &mut GitObject::Blob { ref mut oid, .. } => oid,
+                &mut GitObject::Tree { ref mut oid, .. } => oid,
+                &mut GitObject::Commit { ref mut oid, .. } => oid
+            };
+
+            *oid = Some(new_oid)
         }
     }
 
@@ -765,12 +778,9 @@ query {{ \
         let mut get_response: GraphQLQueryResponse = from_json_slice(response.body().as_ref())?;
 
         // Set the oid since we didn't request it from the server as that would be redundant.
-        let new_oid = Some(graphql::GitObjectId::from(*cache_ref));
-        match get_response.data.repository.object {
-            Some(graphql::GitObject::Blob { ref mut oid, .. }) => *oid = new_oid,
-            Some(graphql::GitObject::Tree { ref mut oid, .. }) => *oid= new_oid,
-            Some(graphql::GitObject::Commit { ref mut oid, .. }) => *oid = new_oid,
-            None => ()
+        if let Some(ref mut obj) = get_response.data.repository.object {
+            let new_oid = graphql::GitObjectId::from(*cache_ref);
+            obj.set_oid(new_oid);
         }
 
         debug!("Parsed response: {:?}", get_response);
@@ -1066,7 +1076,7 @@ query {{ \
 
 #[cfg(test)]
 mod test {
-    use crate::cache::{CacheLayer, DirectoryEntry, ObjectType};
+    use crate::cache::{CacheLayer, DirectoryEntry, ObjectType, Directory};
     use std::str::FromStr;
     use std::iter::FromIterator;
     use std::env;
@@ -1281,5 +1291,31 @@ mod test {
         assert!(new_head_commit.parents.contains(&commit1ref) &&
                     new_head_commit.parents.contains(&commit2ref),
                 "New merge commit does not contain the two commits created");
+    }
+
+    #[test]
+    fn parse_link_response() {
+        let testresponse = r#"{
+"data": {
+    "repository": {
+        "object":
+            {
+                "__typename":"Blob",
+                "text":"README.md",
+                "byteSize":9,
+                "isTruncated":false
+            }
+        }
+    }
+}"#;
+        let mut parsed_response =
+            serde_json::from_str::<GraphQLQueryResponse>(testresponse).unwrap();
+        if let Some(graphql::GitObject::Blob { text, .. }) = parsed_response.data.repository.object {
+            let bytes = text.unwrap();
+            let content = str::from_utf8(bytes.as_ref()).unwrap();
+            assert_eq!("README.md", content);
+        } else {
+            panic!("No object found in response: {:?}", parsed_response.data.repository.object);
+        }
     }
 }
