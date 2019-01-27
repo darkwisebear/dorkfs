@@ -263,7 +263,7 @@ impl OverlayPath {
             match c {
                 ::std::path::Component::Normal(c) => {
                     path.push_overlay(c.to_str()
-                        .ok_or(format_err!("Unable to convert path component to UTF-8"))?
+                        .ok_or_else(|| format_err!("Unable to convert path component to UTF-8"))?
                         .to_owned());
                 },
                 i => debug!("Dropping {:?} during conversion", i)
@@ -356,7 +356,7 @@ impl WorkspaceHead {
     }
 
     fn get_ref(&self) -> Option<CacheRef> {
-        self.cache_ref.clone()
+        self.cache_ref
     }
 
     fn set_ref(&mut self, new_ref: Option<CacheRef>) -> Result<()> {
@@ -364,10 +364,10 @@ impl WorkspaceHead {
         let new_head_file_path = self.meta_path.join("NEW_HEAD");
         fs::remove_file(&new_head_file_path).ok();
 
-        let commit_ref = new_ref.unwrap_or_else(|| CacheRef::null());
+        let commit_ref = new_ref.unwrap_or_else(CacheRef::null);
 
         let mut new_head_file = File::create(&new_head_file_path)?;
-        new_head_file.write(commit_ref.to_string().as_bytes())?;
+        new_head_file.write_all(commit_ref.to_string().as_bytes())?;
         new_head_file.flush()?;
         new_head_file.sync_all()?;
 
@@ -435,7 +435,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         }
     }
 
-    fn dir_entry_to_directory_entry(&self, dir_entry: DirEntry, mut overlay_path: OverlayPath)
+    fn dir_entry_to_directory_entry(&self, dir_entry: &DirEntry, mut overlay_path: OverlayPath)
         -> Result<OverlayOperation<cache::DirectoryEntry>> {
         let fs_name = os_string_to_string(dir_entry.file_name())?;
         let file_type = dir_entry.file_type()?;
@@ -447,9 +447,9 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 .unwrap()
                 .to_os_string())?;
 
-        if fs_name.ends_with("f") {
+        if fs_name.ends_with('f') {
             let (cache_ref, object_type) = if file_type.is_dir() {
-                let cache_ref = self.generate_tree(overlay_path)?;
+                let cache_ref = self.generate_tree(&overlay_path)?;
                 (cache_ref, cache::ObjectType::Directory)
             } else if file_type.is_file() {
                 let cache_ref = self.cache.add_file_by_path(&dir_entry.path())?;
@@ -485,13 +485,13 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn iter_directory<I,T,F,G>(&self,
-                               overlay_path: OverlayPath,
+                               overlay_path: &OverlayPath,
                                from_directory_entry: F,
                                mut from_dir_entry: G) -> Result<I>
         where I: FromIterator<T>,
               T: Eq+Hash,
               F: FnMut(DirectoryEntry) -> Result<T>,
-              G: FnMut(DirEntry) -> Result<OverlayOperation<T>> {
+              G: FnMut(&DirEntry) -> Result<OverlayOperation<T>> {
         // Get the directory contents from the cache if it's already there
         let dir_entries_result: Result<HashSet<T>> =
             if let Some(cache_dir_ref) = self.resolve_object_ref(overlay_path.overlay_path())? {
@@ -511,7 +511,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         if abs_path.exists() {
             info!("Reading overlay path {}", abs_path.to_string_lossy());
             for dir_entry in fs::read_dir(abs_path)? {
-                match from_dir_entry(dir_entry?)? {
+                match from_dir_entry(&dir_entry?)? {
                     OverlayOperation::Add(entry) => { dir_entries.replace(entry); }
                     OverlayOperation::Subtract(entry) => { dir_entries.remove(&entry); }
                 }
@@ -523,20 +523,21 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         Ok(I::from_iter(dir_entries.into_iter()))
     }
 
-    fn dir_entry_to_overlay_dir_entry(dir_entry: fs::DirEntry) -> Result<OverlayOperation<OverlayDirEntry>> {
+    fn dir_entry_to_overlay_dir_entry(dir_entry: &fs::DirEntry)
+        -> Result<OverlayOperation<OverlayDirEntry>> {
         let mut overlay_path = OverlayPath::new("");
         let fs_name = os_string_to_string(dir_entry.file_name())?;
         overlay_path.push_fs(&fs_name);
         let name = os_string_to_string(overlay_path.overlay_path().as_os_str().to_owned())?;
 
-        let metadata = Metadata::from_fs_metadata(dir_entry.metadata()?)?;
+        let metadata = Metadata::from_fs_metadata(&dir_entry.metadata()?)?;
         let entry = OverlayDirEntry {
             name,
             size: metadata.size,
             object_type: metadata.object_type
         };
 
-        if fs_name.ends_with("f") {
+        if fs_name.ends_with('f') {
             Ok(OverlayOperation::Add(entry))
         } else {
             Ok(OverlayOperation::Subtract(entry))
@@ -553,13 +554,12 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         })
     }
 
-    fn generate_tree(&self, overlay_path: OverlayPath) -> Result<CacheRef> {
+    fn generate_tree(&self, overlay_path: &OverlayPath) -> Result<CacheRef> {
         let dir_entries: HashSet<DirectoryEntry> = self.iter_directory(
-            overlay_path.clone(),
-            |e| Ok(e),
-            |e| {
-                self.dir_entry_to_directory_entry(e, overlay_path.clone())
-            })?;
+            &overlay_path,
+            Ok,
+            |e|
+                self.dir_entry_to_directory_entry(&e, overlay_path.clone()))?;
 
         let mut directory = dir_entries.into_iter();
         self.cache.add_directory(&mut directory).map_err(Into::into)
@@ -582,14 +582,12 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                           path.abs_fs_path().display(),
                           ioerr.description());
                 }
-            } else {
-                if !self.overlay_files.contains_key(path.overlay_path()) {
-                    debug!("Removing overlay file {}", path.abs_fs_path().display());
-                    if let Err(ioerr) = fs::remove_file(&*path.abs_fs_path()) {
-                        warn!("Unable to remove overlay file {} during cleanup: {}",
-                              path.abs_fs_path().display(),
-                              ioerr.description());
-                    }
+            } else if !self.overlay_files.contains_key(path.overlay_path()) {
+                debug!("Removing overlay file {}", path.abs_fs_path().display());
+                if let Err(ioerr) = fs::remove_file(&*path.abs_fs_path()) {
+                    warn!("Unable to remove overlay file {} during cleanup: {}",
+                          path.abs_fs_path().display(),
+                          ioerr.description());
                 }
             }
 
@@ -642,12 +640,10 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             }
 
             Ok(self.add_fs_file(&cache_path, new_file))
-        } else {
-            if let Some(cache_file) = cache_file {
+        } else if let Some(cache_file) = cache_file {
                 Ok(FSOverlayFile::CacheFile(cache_file))
-            } else {
-                Err(format_err!("File not found!").into())
-            }
+        } else {
+            Err(format_err!("File not found!").into())
         }
     }
 
@@ -677,7 +673,7 @@ impl<'a, C: CacheLayer+'a> CacheLayerLog<'a, C> {
     fn new<'b>(cache: &'a C, commit_ref: &'b CacheRef) -> Result<Self> {
         let log = CacheLayerLog {
             cache,
-            next_cache_ref: Some(commit_ref.clone())
+            next_cache_ref: Some(*commit_ref)
         };
 
         Ok(log)
@@ -728,7 +724,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         let file_path = Self::file_path(&self.base_path);
         let overlay_path = OverlayPath::new(&file_path);
 
-        let tree = self.generate_tree(overlay_path)?;
+        let tree = self.generate_tree(&overlay_path)?;
         let parents = Vec::from_iter(self.head.get_ref().into_iter());
         let time = Utc::now();
         let commit = Commit {
@@ -745,7 +741,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 
         // Set HEAD to (possibly merged) new head commit
         let result = self.head.set_ref(self.cache.get_head_commit(&self.branch)?
-            .or(Some(new_commit_ref)))
+            .or_else(|| Some(new_commit_ref)))
             .map(|_| new_commit_ref);
 
         debug!("Updating overlay");
@@ -802,9 +798,9 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
             Some(RepoRef::Branch(branch)) => self.cache.get_head_commit(branch)
                 .map_err(Error::CacheError)
                 .and_then(|cache_ref|
-                    cache_ref.ok_or(format_err!("Branch {} doesn't exsit", branch).into()))?,
+                    cache_ref.ok_or_else(|| format_err!("Branch {} doesn't exsit", branch).into()))?,
             None => self.head.get_ref()
-                .ok_or(Error::Generic(format_err!("No HEAD in current workspace set")))?,
+                .ok_or_else(|| Error::Generic(format_err!("No HEAD in current workspace set")))?,
         };
 
         self.cache.create_branch(new_branch, base_ref)
@@ -828,7 +824,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         self.cache.get_head_commit(self.branch.as_str())
             .map_err(Into::into)
         .and_then(|cache_ref|
-            cache_ref.ok_or(Error::MissingHeadRef(self.branch.clone())))
+            cache_ref.ok_or_else(|| Error::MissingHeadRef(self.branch.clone())))
         .and_then(|cache_ref|
             self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
     }
@@ -890,7 +886,7 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
                                             } else {
                                                 FileState::New
                                             },
-                                            Err(err) => break Some(Err(err.into()))
+                                            Err(err) => break Some(Err(err))
                                         };
                                     let workspace_file_status = WorkspaceFileStatus(
                                         path.overlay_path().to_path_buf(),
@@ -974,7 +970,7 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
               P: AsRef<Path> {
         let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         self.iter_directory(
-            overlay_path,
+            &overlay_path,
             |dir_entry| {
                 self.directory_entry_to_overlay_dir_entry(dir_entry)
             },
@@ -989,27 +985,28 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         if abs_fs_path.exists() {
             fs::symlink_metadata(&*abs_fs_path)
                 .map_err(|e| e.into())
-                .and_then(|meta| Metadata::from_fs_metadata(meta)
+                .and_then(|meta| Metadata::from_fs_metadata(&meta)
                     .map_err(Into::into))
         } else {
             let path = overlay_path.overlay_path();
             let file_name = path.file_name()
-                .ok_or(Error::Generic(format_err!("Path doesn't contain a name")))?;
-            let parent_dir = path.parent().unwrap_or(Path::new(""));
+                .ok_or_else(|| Error::Generic(format_err!("Path doesn't contain a name")))?;
+            let parent_dir = path.parent().unwrap_or_else(|| Path::new(""));
             debug!("Find metadata in {} for {}", parent_dir.display(), file_name.to_string_lossy());
             let dir_entry = self.resolve_object_ref(parent_dir)
                 .and_then(|cache_ref|
-                    cache_ref.ok_or(format_err!("Parent directory not found!").into()))
+                    cache_ref.ok_or_else(|| format_err!("Parent directory not found!").into()))
                 .and_then(|cache_ref| self.cache.get(&cache_ref)
                     .and_then(|obj| obj.into_directory())
                     .map_err(Error::from))
                 .and_then(|dir|
                     dir.find_entry(&file_name).cloned()
-                        .ok_or(Error::Generic(format_err!(r#"File "{}" not found in directory"#,
-                                                          file_name.to_string_lossy()))))?;
+                        .ok_or_else(|| Error::Generic(
+                            format_err!(r#"File "{}" not found in directory"#,
+                            file_name.to_string_lossy()))))?;
 
             let head_commit = self.head.cache_ref
-                .ok_or(CacheError::RuntimeError(format_err!("Inexistent HEAD commit")))
+                .ok_or_else(|| CacheError::RuntimeError(format_err!("Inexistent HEAD commit")))
                 .and_then(|head_ref| self.cache.get(&head_ref))
                 .and_then(CacheObject::into_commit)?;
 
@@ -1024,10 +1021,9 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
     }
 
     fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        if self.metadata(path.as_ref())?.object_type == ObjectType::Directory {
-            if !self.list_directory::<Vec<_>, _>(path.as_ref())?.is_empty() {
-                return Err(Error::NonemptyDirectory)
-            }
+        if self.metadata(path.as_ref())?.object_type == ObjectType::Directory &&
+            !self.list_directory::<Vec<_>, _>(path.as_ref())?.is_empty() {
+            return Err(Error::NonemptyDirectory)
         }
 
         let overlay_path =

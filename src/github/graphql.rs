@@ -51,7 +51,7 @@ pub struct PageInfo {
     pub has_next_page: bool
 }
 
-const FILE_MODE_SYMLINK: u32 = 0o120000;
+const FILE_MODE_SYMLINK: u32 = 0o120_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TreeEntry {
@@ -231,7 +231,7 @@ impl Iterator for GitObjIter {
             GitObjIter::CommitHistory(mut history) => {
                 let commit = history.next().map(|mut commit| {
                     let oid = commit.oid.take();
-                    let cache_ref = oid.ok_or(format_err!("Missing Oid"))
+                    let cache_ref = oid.ok_or_else(|| format_err!("Missing Oid"))
                         .and_then(|oid| oid.try_into_cache_ref())?;
                     let commit: Fallible<Commit> = commit.into();
                     commit.map(move |commit|
@@ -259,17 +259,18 @@ impl IntoIterator for GitObject {
     fn into_iter(self) -> Self::IntoIter {
         let oid = self.get_oid();
 
-        let cache_ref = oid.ok_or(format_err!("Missing oid in object"))
+        let cache_ref = oid.ok_or_else(||
+            format_err!("Missing oid in object"))
             .and_then(|oid| oid.clone().try_into_cache_ref());
 
         match self {
-            GitObject::Blob { text, oid: _, .. } => {
+            GitObject::Blob { text, .. } => {
                 let cache_ref = match cache_ref {
                     Ok(cache_ref) => cache_ref,
                     Err(e) => return GitObjIter::Err(e)
                 };
 
-                let data = match text.ok_or(
+                let data = match text.ok_or_else(||
                     format_err!("Attempt to convert a blob without data into a cache object")) {
                     Ok(content) => Cursor::new(content),
                     Err(e) => return GitObjIter::Err(e)
@@ -298,18 +299,18 @@ impl IntoIterator for GitObject {
 
 impl GitObject {
     pub fn get_oid(&self) -> Option<&GitObjectId> {
-        match self {
-            &GitObject::Blob { ref oid, .. } => oid.as_ref(),
-            &GitObject::Tree { ref oid, .. } => oid.as_ref(),
-            &GitObject::Commit { ref oid, .. } => oid.as_ref()
+        match *self {
+            GitObject::Blob { ref oid, .. } => oid.as_ref(),
+            GitObject::Tree { ref oid, .. } => oid.as_ref(),
+            GitObject::Commit { ref oid, .. } => oid.as_ref()
         }
     }
 
     pub fn set_oid(&mut self, new_oid: GitObjectId) {
-        let oid = match self {
-            &mut GitObject::Blob { ref mut oid, .. } => oid,
-            &mut GitObject::Tree { ref mut oid, .. } => oid,
-            &mut GitObject::Commit { ref mut oid, .. } => oid
+        let oid = match *self {
+            GitObject::Blob { ref mut oid, .. } => oid,
+            GitObject::Tree { ref mut oid, .. } => oid,
+            GitObject::Commit { ref mut oid, .. } => oid
         };
 
         *oid = Some(new_oid)

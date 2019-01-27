@@ -31,7 +31,7 @@ impl From<CacheObjectMetadata> for FileMetadata {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum CacheFileType {
     File,
     Directory,
@@ -50,7 +50,7 @@ impl CacheFileType {
         }
     }
 
-    fn as_identifier(&self) -> u8 {
+    fn as_identifier(self) -> u8 {
         match self {
             CacheFileType::File => b'F',
             CacheFileType::Directory => b'D',
@@ -234,7 +234,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
     fn add_object_file(&self, rel_path: PathBuf, cache_ref: &CacheRef) -> Result<()> {
         let rel_target_path = Self::rel_path_from_ref(&cache_ref);
         let parent_path = rel_target_path.parent()
-            .ok_or(CacheError::ObjectNotFound(*cache_ref))?.to_owned();
+            .ok_or_else(|| CacheError::ObjectNotFound(*cache_ref))?.to_owned();
         self.ensure_path(parent_path)?;
 
         let source_path = self.base_path.join(rel_path);
@@ -304,7 +304,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
             .write(true)
             .open(full_path)?;
 
-        file.write(&[object_type.as_identifier()])?;
+        file.write_all(&[object_type.as_identifier()])?;
 
         Ok((file, rel_path))
     }
@@ -321,7 +321,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
             let file = fs::File::open(path)?;
             Ok(file)
         } else {
-            Err(CacheError::ObjectNotFound(cache_ref.clone()))
+            Err(CacheError::ObjectNotFound(*cache_ref))
         }
     }
 
@@ -355,7 +355,7 @@ impl<C: CacheLayer+Debug> HashFileCache<C> {
                     Ok(commit) => Ok(CacheObject::Commit(commit)),
                     Err(e) => if e.is_data() {
                         self.invalidate(cache_ref);
-                        Err(CacheError::ObjectNotFound(cache_ref.clone()))
+                        Err(CacheError::ObjectNotFound(*cache_ref))
                     } else {
                         Err(e.into())
                     }
