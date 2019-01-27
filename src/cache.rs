@@ -137,7 +137,7 @@ impl<'a> Iterator for HexCharIterator<'a> {
         let (byte_str, rest) =
             self.hex.split_at(usize::min(self.hex.len(), 2));
 
-        if byte_str.len() > 0 {
+        if byte_str.is_empty() {
             self.hex = rest;
 
             let byte = u8::from_str_radix(byte_str, 16)
@@ -176,7 +176,7 @@ pub trait ReadonlyFile: io::Read+io::Seek+Debug {}
 
 impl ReadonlyFile for fs::File {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ObjectType {
     File,
     Directory,
@@ -197,11 +197,11 @@ impl Display for ObjectType {
 
 impl<'a, F: ReadonlyFile, D: Directory> From<&'a CacheObject<F, D>> for ObjectType {
     fn from(obj: &'a CacheObject<F, D>) -> Self {
-        match obj {
-            &CacheObject::File(..) => ObjectType::File,
-            &CacheObject::Directory(..) => ObjectType::Directory,
-            &CacheObject::Commit(..) => ObjectType::Commit,
-            &CacheObject::Symlink(..) => ObjectType::Symlink
+        match *obj {
+            CacheObject::File(..) => ObjectType::File,
+            CacheObject::Directory(..) => ObjectType::Directory,
+            CacheObject::Commit(..) => ObjectType::Commit,
+            CacheObject::Symlink(..) => ObjectType::Symlink
         }
     }
 }
@@ -242,10 +242,13 @@ impl Directory for Vec<DirectoryEntry> {
 #[derive(Debug, Clone)]
 pub struct DirectoryImpl(HashMap<OsString, DirectoryEntry>);
 
+type HashMapDirEntryIter = hash_map::IntoIter<OsString, DirectoryEntry>;
+type HashMapEntryToDirectoryEntry = fn((OsString, DirectoryEntry)) -> DirectoryEntry;
+type IntoDirEntryIter = iter::Map<HashMapDirEntryIter, HashMapEntryToDirectoryEntry>;
+
 impl IntoIterator for DirectoryImpl {
     type Item = DirectoryEntry;
-    type IntoIter = iter::Map<hash_map::IntoIter<OsString, DirectoryEntry>,
-        fn((OsString, DirectoryEntry)) -> DirectoryEntry>;
+    type IntoIter = IntoDirEntryIter;
 
     fn into_iter(self) -> Self::IntoIter {
         #[inline]
@@ -383,7 +386,7 @@ pub trait CacheLayer: Debug {
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
     -> result::Result<Option<CacheRef>, Error> where C: CacheLayer,
                                                               P: AsRef<Path> {
-    let mut objs = vec![commit.tree.clone()];
+    let mut objs = vec![commit.tree];
     let path = path.as_ref();
 
     for component in path.components() {
@@ -391,11 +394,11 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
             Component::Prefix(..) => panic!("A prefix is not allowed to appear in a cache path"),
             Component::RootDir => {
                 objs.clear();
-                objs.push(commit.tree.clone());
+                objs.push(commit.tree);
             }
             Component::CurDir => (),
             Component::ParentDir => {
-                objs.pop().ok_or(format_err!("Outside path due to too many parent dirs!"))?;
+                objs.pop().ok_or_else(|| format_err!("Outside path due to too many parent dirs!"))?;
             }
             Component::Normal(entry) => {
                 let cache_ref = {

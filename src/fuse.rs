@@ -411,7 +411,7 @@ impl<C> DorkFS<C> where
     pub fn mount<P: AsRef<Path>>(self, mountpoint: P) -> Result<(), Error> {
         let fuse = FuseMT::new(self, 1);
         mount(fuse, &mountpoint, &[OsStr::new("default_permissions")])
-            .map_err(|e| Error::from(e))
+            .map_err(Error::from)
     }
 
     fn object_type_to_file_type(obj_type: types::ObjectType) -> FileType {
