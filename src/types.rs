@@ -53,7 +53,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn from_fs_metadata(fs_metadata: &fs::Metadata) -> Result<Metadata, Error> {
+    pub fn from_fs_metadata(fs_metadata: fs::Metadata) -> Result<Metadata, Error> {
         let metadata = Metadata {
             size: fs_metadata.len(),
             object_type: ObjectType::from_file_type(fs_metadata.file_type())?,

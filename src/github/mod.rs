@@ -229,7 +229,7 @@ impl Github {
     pub fn get_default_branch(&self) -> cache::Result<String> {
         self.get_ref_info(None)
             .and_then(|ref_info| ref_info
-                .ok_or_else(|| Error::UnknownReference("(default branch)".to_string()).into())
+                .ok_or(Error::UnknownReference("(default branch)".to_string()).into())
                 .map(|(ref_name,_)| ref_name))
     }
 

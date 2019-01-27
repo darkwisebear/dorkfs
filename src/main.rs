@@ -1,5 +1,3 @@
-#![allow(clippy::unneeded_field_pattern, clippy::new_ret_no_self)]
-
 extern crate clap;
 #[macro_use] extern crate failure;
 #[macro_use] extern crate failure_derive;
@@ -56,9 +54,8 @@ fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
 }
 
-fn validate_umask<S: AsRef<str>>(s: S) -> Result<(), String> {
-    let s = s.as_ref();
-    if is_octal_number(s) && s.len() == 3 {
+fn validate_umask(s: String) -> Result<(), String> {
+    if is_octal_number(s.as_str()) && s.len() == 3 {
         Ok(())
     } else {
         Err("Parameter must be a valid octal umask".to_string())
@@ -170,7 +167,7 @@ fn mount_fuse<C>(
     dorkfs.mount(mountpoint).unwrap();
 }
 
-fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: &Option<B>)
+fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: Option<B>)
     -> Fallible<FilesystemOverlay<cache::BoxedCacheLayer>>
     where P: AsRef<Path>,
           U: AsRef<str>,
@@ -227,7 +224,7 @@ fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: &Option<B>)
 
 pub fn init_logging() {
     static INIT_LOGGING: std::sync::Once = std::sync::ONCE_INIT;
-    INIT_LOGGING.call_once(env_logger::init);
+    INIT_LOGGING.call_once(|| env_logger::init());
 }
 
 fn main() {
@@ -238,7 +235,7 @@ fn main() {
     let rootrepo = args.value_of("rootrepo").expect("No root URL given");
     let branch = args.value_of("branch");
 
-    let fs = new_overlay(cachedir, rootrepo, &branch)
+    let fs = new_overlay(cachedir, rootrepo, branch)
         .expect("Unable to create workspace");
 
     #[cfg(target_os = "linux")]

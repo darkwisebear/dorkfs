@@ -98,12 +98,9 @@ impl<'a> RootrepoUrl<'a> {
         match scheme {
             "github+https" => {
                 let mut splitter = remainder.rsplitn(3, '/');
-                let repo = splitter.next()
-                    .ok_or_else(|| format_err!("Repo missing in repo URL"))?;
-                let org = splitter.next()
-                    .ok_or_else(|| format_err!("Org/user missing in repo URL"))?;
-                let apiurl = splitter.next()
-                    .ok_or_else(|| format_err!("Api URL missing in repo URL"))?;
+                let repo = splitter.next().ok_or(format_err!("Repo missing in repo URL"))?;
+                let org = splitter.next().ok_or(format_err!("Org/user missing in repo URL"))?;
+                let apiurl = splitter.next().ok_or(format_err!("Api URL missing in repo URL"))?;
                 Ok(RootrepoUrl::GithubHttps {
                     apiurl,
                     org,
@@ -116,9 +113,9 @@ impl<'a> RootrepoUrl<'a> {
     }
 
     fn split_scheme(repo: &str) -> Fallible<(&str, &str)> {
-        repo.find(':').ok_or_else(|| format_err!("Missing scheme in repo URL"))
+        repo.find(':').ok_or(format_err!("Missing scheme in repo URL"))
             .and_then(|pos| repo.get(pos+3..)
-                .ok_or_else(|| format_err!("Incomplete repo URL"))
+                .ok_or(format_err!("Incomplete repo URL"))
                 .map(|path| (&repo[..pos], path)))
     }
 }

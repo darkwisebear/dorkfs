@@ -360,7 +360,7 @@ impl SpecialFileOps for HeadFileOps {
             .map(|cache_ref|
                 cache_ref
                     .map(|cache_ref| cache_ref.to_string().into_bytes())
-                    .unwrap_or_else(|| b"(no HEAD)".to_vec()))
+                    .unwrap_or(b"(no HEAD)".to_vec()))
     }
 
     fn close<O>(&self, control_dir: &mut O, _buffer: &[u8]) -> Result<()>
@@ -483,10 +483,10 @@ impl<O> Overlay for ControlDir<O>
             })
         } else if path.as_ref().starts_with(DORK_DIR_ENTRY) {
             let file_name = path.as_ref().strip_prefix(DORK_DIR_ENTRY).unwrap();
-            file_name.to_str().ok_or_else(|| "Unable to decode to UTF-8".into())
+            file_name.to_str().ok_or("Unable to decode to UTF-8".into())
                 .and_then(|s| {
                     self.special_files.get(s)
-                        .ok_or_else(|| "File entry not found!".into())
+                        .ok_or("File entry not found!".into())
                         .and_then(|special_file| special_file.metadata(self))
                 })
         } else {
