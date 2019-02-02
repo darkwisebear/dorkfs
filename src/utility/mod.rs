@@ -1,3 +1,6 @@
+mod gitmodules;
+mod gitconfig;
+
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
 use std::fmt::Debug;

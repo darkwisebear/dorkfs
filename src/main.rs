@@ -21,6 +21,7 @@ extern crate futures;
 extern crate tokio;
 extern crate base64;
 extern crate bytes;
+extern crate regex;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;
