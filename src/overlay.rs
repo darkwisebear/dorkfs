@@ -145,7 +145,7 @@ pub trait Overlay: Debug {
     fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<()>;
 }
 
-pub trait WorkspaceLog<'a>: Iterator<Item=Result<ReferencedCommit>> { }
+pub trait WorkspaceLog: Iterator<Item=Result<ReferencedCommit>> { }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceFileStatus(pub PathBuf, pub FileState);
@@ -157,7 +157,7 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
 }
 
 pub trait WorkspaceController<'a>: Debug {
-    type Log: WorkspaceLog<'a>;
+    type Log: WorkspaceLog+'a;
     type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
@@ -680,7 +680,7 @@ impl<'a, C: CacheLayer+'a> CacheLayerLog<'a, C> {
     }
 }
 
-impl<'a, C: CacheLayer+'a> WorkspaceLog<'a> for CacheLayerLog<'a, C> { }
+impl<'a, C: CacheLayer+'a> WorkspaceLog for CacheLayerLog<'a, C> { }
 
 impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
     type Item = Result<ReferencedCommit>;
