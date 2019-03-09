@@ -315,7 +315,7 @@ impl SpecialFileOps for BranchFileOps {
         let target_branch = str::from_utf8(buffer)
             .map_err(overlay::Error::from_fail)?;
         if Some(target_branch) != control_dir.get_current_branch()? {
-            control_dir.switch_branch(target_branch.trim_end_matches('\n'))
+            control_dir.switch_branch(Some(target_branch.trim_end_matches('\n')))
                 .map(|_|
                     info!("Successfully switched to branch {}", target_branch))
         } else {
@@ -628,7 +628,7 @@ mod test {
             .expect("Unable to create second commit");
 
         // Switch back to master
-        control_overlay.get_overlay_mut().switch_branch("master").unwrap();
+        control_overlay.get_overlay_mut().switch_branch(Some("master")).unwrap();
 
         // Check if checked-out workspace is unchanged
         let mut file2 =
@@ -656,7 +656,7 @@ mod test {
             first_commit.to_string().as_str());
 
         // Switch back to feature branch
-        control_overlay.get_overlay_mut().switch_branch("feature").unwrap();
+        control_overlay.get_overlay_mut().switch_branch(Some("feature")).unwrap();
 
         // ...and check if the second file is still gone
         assert!(control_overlay.open_file("file2.txt", false).is_err());

@@ -384,8 +384,9 @@ pub trait CacheLayer: Debug {
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
-    -> result::Result<Option<CacheRef>, Error> where C: CacheLayer,
-                                                              P: AsRef<Path> {
+    -> result::Result<Option<CacheRef>, Error>
+    where C: CacheLayer+?Sized,
+          P: AsRef<Path> {
     let mut objs = vec![commit.tree];
     let path = path.as_ref();
 

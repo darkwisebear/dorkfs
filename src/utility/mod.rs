@@ -1,4 +1,4 @@
-mod gitmodules;
+pub mod gitmodules;
 mod gitconfig;
 
 use std::ffi::{OsStr, OsString};
@@ -87,15 +87,15 @@ impl<T: Debug> OpenHandleSet<T> {
     }
 }
 
-pub enum RootrepoUrl<'a> {
+pub enum RepoUrl<'a> {
     GithubHttps {
-        apiurl: &'a str,
-        org: &'a str,
-        repo: &'a str
+        apiurl: Cow<'a, str>,
+        org: Cow<'a, str>,
+        repo: Cow<'a, str>
     }
 }
 
-impl<'a> RootrepoUrl<'a> {
+impl<'a> RepoUrl<'a> {
     pub fn from_str(repo: &'a str) -> Fallible<Self> {
         let (scheme, remainder) = Self::split_scheme(repo)?;
         match scheme {
@@ -107,10 +107,10 @@ impl<'a> RootrepoUrl<'a> {
                     .ok_or_else(|| format_err!("Org/user missing in repo URL"))?;
                 let apiurl = splitter.next()
                     .ok_or_else(|| format_err!("Api URL missing in repo URL"))?;
-                Ok(RootrepoUrl::GithubHttps {
-                    apiurl,
-                    org,
-                    repo
+                Ok(RepoUrl::GithubHttps {
+                    apiurl: Cow::Borrowed(apiurl),
+                    org: Cow::Borrowed(org),
+                    repo: Cow::Borrowed(repo)
                 })
             }
 
@@ -128,15 +128,15 @@ impl<'a> RootrepoUrl<'a> {
 
 #[cfg(test)]
 mod test {
-    use super::RootrepoUrl;
+    use super::RepoUrl;
 
     #[test]
     fn parse_github_url() {
         let repo_parts =
-            RootrepoUrl::from_str("github+https://api.github.com/darkwisebear/dorkfs")
+            RepoUrl::from_str("github+https://api.github.com/darkwisebear/dorkfs")
                 .expect("Unable to parse repo URL");
         match repo_parts {
-            RootrepoUrl::GithubHttps { apiurl, org, repo } => {
+            RepoUrl::GithubHttps { apiurl, org, repo } => {
                 assert_eq!("api.github.com", apiurl);
                 assert_eq!("darkwisebear", org);
                 assert_eq!("dorkfs", repo);
@@ -147,10 +147,10 @@ mod test {
     #[test]
     fn parse_on_premises_url() {
         let repo_parts =
-            RootrepoUrl::from_str("github+https://github.example.com/api/darkwisebear/dorkfs")
+            RepoUrl::from_str("github+https://github.example.com/api/darkwisebear/dorkfs")
                 .expect("Unable to parse repo URL");
         match repo_parts {
-            RootrepoUrl::GithubHttps { apiurl, org, repo } => {
+            RepoUrl::GithubHttps { apiurl, org, repo } => {
                 assert_eq!("github.example.com/api", apiurl);
                 assert_eq!("darkwisebear", org);
                 assert_eq!("dorkfs", repo);

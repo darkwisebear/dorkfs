@@ -1,13 +1,14 @@
 mod restv3;
 mod graphql;
 
-use std::path::Path;
+use std::path::{PathBuf, Path};
 use std::io::{self, Read, Seek, SeekFrom, Cursor};
 use std::fs;
 use std::sync::{Arc, Weak, Mutex, mpsc::channel};
 use std::str::{self, FromStr};
 use std::collections::HashMap;
 use std::default::Default;
+use std::borrow::Cow;
 
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
@@ -22,9 +23,47 @@ use bytes::Bytes;
 
 use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
                    CacheLayer, LayerError, Commit};
+use crate::utility::{RepoUrl, gitmodules::GitModules};
 
 lazy_static! {
     static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
+}
+
+pub fn initialize_github_submodules<R: Read>(file: R,
+                                       apiurl: &str,
+                                       org: &str)
+    -> failure::Fallible<Vec<(PathBuf, RepoUrl<'static>)>> {
+    let submodules = GitModules::from_reader(file)?;
+
+    let cached_repos = submodules.into_iter()
+        .filter_map(|submodule| {
+            match submodule.url.get_github_submodule(apiurl, org) {
+                Ok(github_submodule) => {
+                    let baseurl = github_submodule.host;
+
+                    info!("Adding submodule \"{}\" with url {} at path {} using base url https://{}",
+                          &submodule.name, &submodule.url, submodule.path.display(), baseurl);
+
+                    let github_submodule_url = crate::utility::RepoUrl::GithubHttps {
+                        apiurl: Cow::Owned(baseurl.to_string()),
+                        org: Cow::Owned(github_submodule.org.to_string()),
+                        repo: Cow::Owned(github_submodule.repo.to_string())
+                    };
+
+                    Some((submodule.path, github_submodule_url))
+                }
+
+                Err(err) => {
+                    warn!("Skipping submodule with unsupported URL {}: {}",
+                          &submodule.url,
+                          err);
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(cached_repos)
 }
 
 #[derive(Fail, Debug)]

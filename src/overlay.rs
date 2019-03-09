@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::cmp::max;
+use std::borrow::Cow;
 
 use chrono::{Utc, Offset};
 
@@ -36,6 +37,9 @@ pub enum Error {
 
     #[fail(display = "Branch {} doesn't have a HEAD ref", _0)]
     MissingHeadRef(String),
+
+    #[fail(display = "Detached HEAD")]
+    DetachedHead,
 
     #[fail(display = "Cache error: {}", _0)]
     CacheError(CacheError),
@@ -163,7 +167,7 @@ pub trait WorkspaceController<'a>: Debug {
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
     fn get_current_branch(&self) -> Result<Option<&str>>;
-    fn switch_branch(&mut self, branch: &str) -> Result<()>;
+    fn switch_branch(&mut self, branch: Option<&str>) -> Result<()>;
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
     fn get_status(&'a self) -> Result<Self::StatusIter>;
@@ -389,7 +393,7 @@ pub struct FilesystemOverlay<C: CacheLayer> {
     head: WorkspaceHead,
     overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
     base_path: PathBuf,
-    branch: String
+    branch: Option<String>
 }
 
 impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
@@ -407,19 +411,33 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         FSOverlayFile::FsFile(file)
     }
 
-    pub fn new<P: AsRef<Path>>(cache: C, base_path: P, branch: &str) -> Result<Self> {
+    pub fn new(cache: C, base_path: Cow<Path>, start_ref: RepoRef) -> Result<Self> {
         fs::create_dir_all(Self::file_path(base_path.as_ref()))?;
         let meta_path = Self::meta_path(base_path.as_ref());
         fs::create_dir_all(&meta_path)?;
         let head = WorkspaceHead::new(meta_path)?;
 
-        Ok(FilesystemOverlay {
+        let branch = match start_ref {
+            RepoRef::Branch(branch) => Some(branch.to_string()),
+            RepoRef::CacheRef(cache_ref) => None
+        };
+
+        let mut fs = FilesystemOverlay {
             cache,
             head,
             overlay_files: HashMap::new(),
-            base_path: base_path.as_ref().to_owned(),
-            branch: branch.to_owned()
-        })
+            base_path: base_path.into_owned(),
+            branch
+        };
+
+        if fs.is_clean()? {
+            if let RepoRef::CacheRef(cache_ref) = start_ref {
+                info!("Updating repository to {}", cache_ref);
+                fs.head.set_ref(Some(cache_ref))?;
+            }
+        }
+
+        Ok(fs)
     }
 
     fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>> {
@@ -658,6 +676,10 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         self.head.set_ref(Some(cache_ref))
     }
 
+    pub fn get_cache(&self) -> &C {
+        &self.cache
+    }
+
     #[cfg(test)]
     pub fn get_cache_mut(&mut self) -> &mut C {
         &mut self.cache
@@ -736,12 +758,14 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
 
         // Commit
         let new_commit_ref = self.cache.add_commit(commit)
-            .and_then(|cache_ref|
-                self.cache.merge_commit(&self.branch, cache_ref))?;
+            .and_then(|cache_ref| match self.branch {
+                Some(ref branch_name) =>
+                    self.cache.merge_commit(branch_name.as_str(), cache_ref),
+                None => Ok(cache_ref)
+            })?;
 
         // Set HEAD to (possibly merged) new head commit
-        let result = self.head.set_ref(self.cache.get_head_commit(&self.branch)?
-            .or_else(|| Some(new_commit_ref)))
+        let result = self.head.set_ref(Some(new_commit_ref))
             .map(|_| new_commit_ref);
 
         debug!("Updating overlay");
@@ -783,11 +807,11 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
     }
 
     fn get_current_branch(&self) -> Result<Option<&str>> {
-        Ok(Some(self.branch.as_ref()))
+        Ok(self.branch.as_ref().map(String::as_str))
     }
 
-    fn switch_branch(&mut self, new_branch: &str) -> Result<()> {
-        self.branch = new_branch.to_string();
+    fn switch_branch(&mut self, new_branch: Option<&str>) -> Result<()> {
+        self.branch = new_branch.map(str::to_string);
         Ok(())
     }
 
@@ -821,12 +845,14 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
             return Err(Error::UncleanWorkspace);
         }
 
-        self.cache.get_head_commit(self.branch.as_str())
-            .map_err(Into::into)
-        .and_then(|cache_ref|
-            cache_ref.ok_or_else(|| Error::MissingHeadRef(self.branch.clone())))
-        .and_then(|cache_ref|
-            self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
+        self.branch.as_ref().ok_or(Error::DetachedHead)
+            .and_then(|branch|
+                self.cache.get_head_commit(branch.as_str())
+                    .map_err(Into::into))
+            .and_then(|cache_ref|
+                cache_ref.ok_or_else(|| Error::MissingHeadRef(self.branch.clone().unwrap())))
+            .and_then(|cache_ref|
+                self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
     }
 }
 
@@ -1125,12 +1151,14 @@ pub mod testutil {
     use std::{
         io::{Read, Seek, SeekFrom},
         path::{Path, PathBuf},
-        collections::HashMap
+        collections::HashMap,
+        borrow::Cow
     };
 
     use crate::hashfilecache::HashFileCache;
     use crate::overlay::*;
     use crate::nullcache::NullCache;
+    use crate::types::RepoRef;
 
     use failure::Error;
 
@@ -1140,7 +1168,9 @@ pub mod testutil {
 
         let cache = HashFileCache::new(NullCache::default(), &cache_dir)
             .expect("Unable to create cache");
-        FilesystemOverlay::new(cache, &overlay_dir, "master")
+        FilesystemOverlay::new(cache,
+                               Cow::Borrowed(&overlay_dir),
+                               RepoRef::Branch("master"))
             .expect("Unable to create overlay")
     }
 
@@ -1168,11 +1198,13 @@ mod test {
         io::{Read, Write, Seek, SeekFrom},
         collections::HashSet,
         path::Path,
-        iter::FromIterator
+        iter::FromIterator,
+        borrow::Cow
     };
     use tempfile::tempdir;
     use chrono::{Utc, Offset};
     use crate::overlay::{Overlay, OverlayFile, OverlayDirEntry, FileState, WorkspaceController};
+    use crate::types::RepoRef;
     use super::testutil::*;
 
     #[cfg(target_os = "windows")]
@@ -1774,7 +1806,9 @@ mod test {
             crate::hashfilecache::HashFileCache::new(storage, &cache_dir)
                 .expect("Unable to create cache");
         let mut overlay =
-            crate::overlay::FilesystemOverlay::new(cache, &overlay_dir, "master")
+            crate::overlay::FilesystemOverlay::new(cache,
+                                                   Cow::Borrowed(&overlay_dir),
+                                                   RepoRef::Branch("master"))
                 .expect("Unable to create overlay");
 
         // 1. Create two test files and commit
@@ -1842,7 +1876,6 @@ mod test {
             cache.add_commit(new_commit)
                 .expect("Unable to add commit that alters a file");
         cache.inner_mut().set_reference("master", &newcommit_ref).unwrap();
-        drop(cache);
 
         // 4. Commit the other file
         overlay.commit("Altered first test file")
