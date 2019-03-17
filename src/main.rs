@@ -31,6 +31,7 @@ mod fuse;
 #[cfg(feature = "gitcache")]
 mod gitcache;
 mod cache;
+mod dispatch;
 mod overlay;
 mod types;
 mod utility;
@@ -49,10 +50,12 @@ use std::ffi::CString;
 use failure::Fallible;
 use clap::ArgMatches;
 
-use crate::hashfilecache::HashFileCache;
-use crate::overlay::{WorkspaceController, FilesystemOverlay};
-use crate::cache::CacheLayer;
-use crate::utility::RootrepoUrl;
+use crate::{
+    hashfilecache::HashFileCache,
+    overlay::{WorkspaceController, FilesystemOverlay},
+    cache::CacheLayer,
+    utility::RootrepoUrl
+};
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
