@@ -17,7 +17,6 @@ use crate::overlay::{self, *};
 use crate::types;
 use crate::cache::CacheLayer;
 use crate::utility::OpenHandleSet;
-use crate::dispatch::PathDispatcher;
 
 lazy_static! {
     static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
@@ -40,35 +39,37 @@ fn to_timespec<Tz: TimeZone>(time: &DateTime<Tz>) -> Timespec {
 }
 
 #[derive(Debug)]
-enum OpenObject<C> where C: CacheLayer+Debug+'static {
-    File(ControlFile<FilesystemOverlay<C>>),
+enum OpenObject<O> where O: Overlay+'static, <O as Overlay>::File: Debug {
+    File(<O as Overlay>::File),
     Directory(Vec<OverlayDirEntry>),
 }
 
-struct FsState<C> where C: CacheLayer+Debug+'static {
-    overlay: PathDispatcher<ControlDir<FilesystemOverlay<C>>>,
-    open_handles: OpenHandleSet<OpenObject<C>>
+#[derive(Debug)]
+struct FsState<O> where O: Overlay+Debug+'static, <O as Overlay>::File: Debug {
+    overlay: O,
+    open_handles: OpenHandleSet<OpenObject<O>>
 }
 
-pub struct DorkFS<C> where C: CacheLayer+Debug+'static {
-    state: RwLock<FsState<C>>,
+#[derive(Debug)]
+pub struct DorkFS<O> where O: Overlay+Debug+'static, <O as Overlay>::File: Debug {
+    state: RwLock<FsState<O>>,
     uid: u32,
     gid: u32,
     umask: u16
 }
 
-impl<C> FilesystemMT for DorkFS<C> where
-    C: CacheLayer+Debug+Send+Sync,
-    <C as CacheLayer>::File: Send+Sync+'static {
+impl<O> FilesystemMT for DorkFS<O> where
+    O: Overlay+Debug+Send+Sync,
+    <O as Overlay>::File: Debug+Send+Sync+'static {
     fn init(&self, _req: RequestInfo) -> ResultEmpty {
         Ok(())
     }
 
     fn getattr(&self, _req: RequestInfo, path: &Path, _fh: Option<u64>) -> ResultEntry {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
         let state = self.state.read().unwrap();
-        let (overlay, path) = state.overlay.get_overlay(path).unwrap();
 
-        let metadata = match overlay.metadata(path) {
+        let metadata = match state.overlay.metadata(path) {
             Ok(metadata) => metadata,
             Err(err) => {
                 info!("Unable to get attributes for {}: {}", path.to_string_lossy(), err);
@@ -106,10 +107,10 @@ impl<C> FilesystemMT for DorkFS<C> where
     }
 
     fn opendir(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
         let mut state = self.state.write().unwrap();
-        let (overlay, path) = state.overlay.get_overlay(path).unwrap();
 
-        match overlay.list_directory(path) {
+        match state.overlay.list_directory(path) {
             Ok(dir) => {
                 let dir_handle = state.open_handles.push(OpenObject::Directory(dir),
                                                          Cow::Borrowed(path.as_os_str()));
@@ -148,11 +149,11 @@ impl<C> FilesystemMT for DorkFS<C> where
     fn open(&self, _req: RequestInfo, path: &Path, flags: u32) -> ResultOpen {
         info!("Opening file {}", path.to_string_lossy());
 
+        let path = path.strip_prefix("/").expect("Expect absolute path");
         let mut state = self.state.write().unwrap();
-        let (overlay, path) = state.overlay.get_overlay_mut(path).unwrap();
 
         let is_writable = Self::is_writable(flags);
-        let file = overlay.open_file(path, is_writable);
+        let file = state.overlay.open_file(path, is_writable);
 
         match file {
             Ok(file) => {
@@ -202,19 +203,18 @@ impl<C> FilesystemMT for DorkFS<C> where
 
     fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32 )
         -> ResultCreate {
-        let path = parent.join(name);
+        let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
         let mut state = self.state.write().unwrap();
-        let (overlay, path) = state.overlay.get_overlay_mut(path.as_path()).unwrap();
 
-        if overlay.exists(&path) {
+        if state.overlay.exists(&path) {
             error!("File already exists: {}", path.to_string_lossy());
             return Err(libc::EEXIST)
         }
 
-        overlay.open_file(&path, Self::is_writable(flags))
+        state.overlay.open_file(&path, Self::is_writable(flags))
             .map(|file| {
                 let fh = state.open_handles.push(OpenObject::File(file),
-                                           Cow::Owned(path.to_path_buf().into_os_string()));
+                                           Cow::Owned(path.into_os_string()));
 
                 let current_time = get_time();
                 CreatedEntry {
@@ -264,13 +264,12 @@ impl<C> FilesystemMT for DorkFS<C> where
     }
 
     fn mkdir(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32) -> ResultEntry {
-        let path = parent.join(name);
+        let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
         let state = self.state.read().unwrap();
-        let (overlay, path) = state.overlay.get_overlay(&path).unwrap();
 
         info!("Creating overlay directory {}", path.to_string_lossy());
 
-        let ensure_result = overlay.get_overlay().ensure_directory(&path);
+        let ensure_result = state.overlay.ensure_directory(&path);
         match ensure_result {
             Ok(()) => {
                 let current_time = get_time();
@@ -355,9 +354,9 @@ impl<C> FilesystemMT for DorkFS<C> where
     }
 
     fn readlink(&self, _req: RequestInfo, path: &Path) -> Result<Vec<u8>, i32> {
+        let path = path.strip_prefix("/").expect("Expect absolute path");
         let mut state = self.state.write().unwrap();
-        let (overlay, path) = state.overlay.get_overlay_mut(path).unwrap();
-        overlay.open_file(path, false)
+        state.overlay.open_file(path, false)
             .map_err(|e| {
                 warn!("Unable to open symlink: {}", &e);
                 match e {
@@ -378,9 +377,9 @@ impl<C> FilesystemMT for DorkFS<C> where
 }
 
 
-impl<C> DorkFS<C> where
-    C: CacheLayer+Debug+Send+Sync+'static,
-    <C as CacheLayer>::File: Send+Sync+'static {
+impl<O> DorkFS<O> where
+    O: Overlay+Debug+Send+Sync+'static,
+    <O as Overlay>::File: Debug+Send+Sync+'static {
     fn is_writable(flags: u32) -> bool {
         ((flags as libc::c_int & libc::O_RDWR) != 0) ||
             ((flags as libc::c_int & libc::O_WRONLY) != 0)
@@ -394,32 +393,14 @@ impl<C> DorkFS<C> where
         Self::octal_to_val(u, g, o) & (!self.umask)
     }
 
-    pub fn with_overlays<I>(overlays: I, uid: u32, gid: u32, umask: u16) -> Result<Self, Error>
-        where I: Iterator<Item=(PathBuf, FilesystemOverlay<C>)> {
-        let mut dispatcher = PathDispatcher::new();
-        for (path, overlay) in overlays {
-            dispatcher.add_overlay(&path, ControlDir::new(overlay))?;
-        }
-
-        Self::with_path_dispatcher(dispatcher, uid, gid, umask)
-    }
-
-    pub fn with_path_dispatcher(dispatcher: PathDispatcher<ControlDir<FilesystemOverlay<C>>>,
-                                uid: u32,
-                                gid: u32,
-                                umask: u16) -> Result<Self, Error> {
-
-        let state = FsState {
-            overlay: dispatcher,
-            open_handles: OpenHandleSet::new()
-        };
-        let fs = DorkFS {
-            state: RwLock::new(state),
-            uid,
-            gid,
-            umask
-        };
-        Ok(fs)
+    pub fn with_overlay(overlay: O, uid: u32, gid: u32, umask: u16) -> Result<Self, Error> {
+        Ok(DorkFS {
+            state: RwLock::new(FsState {
+                overlay,
+                open_handles: OpenHandleSet::new()
+            }),
+            uid, gid, umask
+        })
     }
 
     pub fn mount<P: AsRef<Path>>(self, mountpoint: P) -> Result<(), Error> {
@@ -447,9 +428,10 @@ impl<C> DorkFS<C> where
     }
 
     fn delete_file(&self, parent: &Path, name: &OsStr) -> overlay::Result<()> {
-        let path = parent.join(name);
-        let mut state = self.state.write().unwrap();
-        let (overlay, path) = state.overlay.get_overlay_mut(&path).unwrap();
-        overlay.delete_file(path)
+        let path = parent.strip_prefix("/")
+            .expect("Expect absolute path")
+            .join(name);
+        let state = self.state.read().unwrap();
+        state.overlay.delete_file(path)
     }
 }

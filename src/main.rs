@@ -173,20 +173,21 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_fuse<C>(
+fn mount_fuse<O>(
     mountpoint: &str,
-    dispatcher: PathDispatcher<ControlDir<FilesystemOverlay<C>>>,
+    root_overlay: O,
     uid: u32,
     gid: u32,
     umask: u16)
-    where C: CacheLayer+Debug+'static+Send+Sync,
-          <C as CacheLayer>::File: 'static+Send+Sync {
-    let dorkfs = fuse::DorkFS::with_path_dispatcher(dispatcher, uid, gid, umask).unwrap();
-    dorkfs.mount(mountpoint).unwrap();
+    where O: Overlay+Debug+Send+Sync+'static,
+          <O as Overlay>::File: Debug+Send+Sync+'static {
+    fuse::DorkFS::with_overlay(root_overlay, uid, gid, umask)
+        .and_then(|dorkfs| dorkfs.mount(mountpoint))
+        .expect("Unable to mount filesystem");
 }
 
 fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch: Option<&RepoRef>)
-    -> Fallible<FilesystemOverlay<cache::BoxedCacheLayer>>
+    -> Fallible<ControlDir<FilesystemOverlay<cache::BoxedCacheLayer>>>
     where P: AsRef<Path>,
           Q: AsRef<Path> {
     let mut default_branch = String::new();
@@ -245,6 +246,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
                 }
             }
         )
+        .map(ControlDir::new)
         .map_err(Into::into)
 }
 
@@ -274,7 +276,7 @@ fn mount(args: &ArgMatches) {
                              branch.as_ref())
         .expect("Unable to create workspace");
 
-    let mut dispatcher = dispatch::PathDispatcher::new();
+/*    let mut dispatcher = dispatch::PathDispatcher::new();
 
     let head_commit = fs.get_current_head_ref().transpose()
         .map(|cache_ref|
@@ -338,7 +340,7 @@ fn mount(args: &ArgMatches) {
 
     dispatcher.add_overlay("", ControlDir::new(fs))
         .expect("Unable to mount root repository");
-
+*/
     #[cfg(target_os = "linux")]
     {
         let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
@@ -350,7 +352,7 @@ fn mount(args: &ArgMatches) {
         let gid = resolve_gid(args.value_of("gid"))
             .expect("Cannot parse GID");
 
-        mount_fuse(mountpoint, dispatcher, uid, gid, umask);
+        mount_fuse(mountpoint, fs, uid, gid, umask);
     }
 }
 

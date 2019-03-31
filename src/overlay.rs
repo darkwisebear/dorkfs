@@ -134,13 +134,14 @@ impl Display for FileState {
     }
 }
 
-pub trait Overlay: Debug {
+pub trait Overlay {
     type File: OverlayFile;
 
     fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File>;
     fn list_directory<I,P>(&self, path: P) -> Result<I>
         where I: FromIterator<OverlayDirEntry>,
               P: AsRef<Path>;
+    fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()>;
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
     fn exists<P: AsRef<Path>>(&self, path: P) -> bool {
         self.metadata(path).is_ok()
@@ -624,12 +625,6 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         self.clear_closed_files_in_path(&mut base_path)
     }
 
-    pub fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
-        fs::create_dir_all(&*overlay_path.abs_fs_path())
-            .map_err(|e| e.into())
-    }
-
     fn open_cache_file(&mut self, writable: bool, abs_fs_path: &Path, cache_path: &Path)
                        -> Result<FSOverlayFile<C>> {
         let cache_ref = self.resolve_object_ref(&cache_path)?;
@@ -1008,6 +1003,12 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 self.directory_entry_to_overlay_dir_entry(dir_entry)
             },
             Self::dir_entry_to_overlay_dir_entry)
+    }
+
+    fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
+        fs::create_dir_all(&*overlay_path.abs_fs_path())
+            .map_err(|e| e.into())
     }
 
     fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {

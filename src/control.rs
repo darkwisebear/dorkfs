@@ -474,6 +474,14 @@ impl<O> Overlay for ControlDir<O>
         }
     }
 
+    fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        if path.as_ref().starts_with(DORK_DIR_ENTRY) {
+            Err(Error::Generic(failure::err_msg("Cannot create directory within .dork")))
+        } else {
+            self.overlay.read().unwrap().ensure_directory(path)
+        }
+    }
+
     fn metadata<P: AsRef<Path>>(&self, path: P) -> overlay::Result<Metadata> {
         if path.as_ref() == Path::new(DORK_DIR_ENTRY) {
             Ok(Metadata {
