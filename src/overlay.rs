@@ -2,7 +2,8 @@ use std::fs::{self, ReadDir, DirEntry, File};
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
-use std::iter::FromIterator;
+use std::collections::hash_set;
+use std::iter::{self, FromIterator};
 use std::hash::{Hash, Hasher};
 use std::fmt::{self, Formatter, Display, Debug};
 use std::sync::{Arc, Weak, Mutex};
@@ -11,15 +12,18 @@ use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::cmp::max;
 use std::borrow::Cow;
+use std::vec;
 
 use chrono::{Utc, Offset};
 
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
             CacheError, Directory},
+    dispatch::PathDispatcher,
     types::*,
     utility::*
 };
+use crate::cache::DirectoryImpl;
 
 #[derive(Debug, Fail)]
 pub enum Error {
@@ -135,19 +139,18 @@ impl Display for FileState {
 }
 
 pub trait Overlay {
-    type File: OverlayFile;
+    type File: OverlayFile+'static;
+    type DirIter: Iterator<Item=Result<OverlayDirEntry>>+'static;
 
-    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool) -> Result<Self::File>;
-    fn list_directory<I,P>(&self, path: P) -> Result<I>
-        where I: FromIterator<OverlayDirEntry>,
-              P: AsRef<Path>;
-    fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()>;
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata>;
-    fn exists<P: AsRef<Path>>(&self, path: P) -> bool {
+    fn open_file(&mut self, path: &Path, writable: bool) -> Result<Self::File>;
+    fn list_directory(&self, path: &Path) -> Result<Self::DirIter>;
+    fn ensure_directory(&self, path: &Path) -> Result<()>;
+    fn metadata(&self, path: &Path) -> Result<Metadata>;
+    fn exists(&self, path: &Path) -> bool {
         self.metadata(path).is_ok()
     }
-    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<()>;
-    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<()>;
+    fn delete_file(&self, path: &Path) -> Result<()>;
+    fn revert_file(&self, path: &Path) -> Result<()>;
 }
 
 pub trait WorkspaceLog: Iterator<Item=Result<ReferencedCommit>> { }
@@ -242,6 +245,97 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
         }
     }
 }
+
+pub trait Repository<'a>: Overlay+WorkspaceController<'a> {}
+
+type BoxedRepository = Box<for<'a> Repository<'a,
+    Log=Box<dyn WorkspaceLog+'a>,
+    StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
+    File=Box<dyn OverlayFile>,
+    DirIter=Box<dyn Iterator<Item=Result<OverlayDirEntry>>>>
++Send+Sync>;
+
+#[derive(Debug)]
+struct RepositoryWrapper<R>(R) where for<'a> R: Repository<'a>+Debug;
+
+impl<T> OverlayFile for Box<T> where T: OverlayFile+?Sized {
+    fn truncate(&mut self, size: u64) -> Result<()> {
+        self.as_mut().truncate(size)
+    }
+}
+
+impl<R> Overlay for RepositoryWrapper<R> where for <'a> R: Repository<'a>+Debug {
+    type File = Box<dyn OverlayFile>;
+    type DirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
+
+    fn open_file(&mut self, path: &Path, writable: bool) -> Result<Self::File> {
+        self.0.open_file(path, writable)
+            .map(|f| Box::new(f) as Box<dyn OverlayFile>)
+    }
+
+    fn list_directory(&self, path: &Path) -> Result<Self::DirIter> {
+        self.0.list_directory(path).map(|dir| Box::new(dir) as Self::DirIter)
+    }
+
+    fn ensure_directory(&self, path: &Path) -> Result<()> {
+        self.0.ensure_directory(path)
+    }
+
+    fn metadata(&self, path: &Path) -> Result<Metadata> {
+        self.0.metadata(path)
+    }
+
+    fn delete_file(&self, path: &Path) -> Result<()> {
+        self.0.delete_file(path)
+    }
+
+    fn revert_file(&self, path: &Path) -> Result<()> {
+        self.0.revert_file(path)
+    }
+}
+
+impl<T> WorkspaceLog for Box<T> where T: WorkspaceLog+?Sized {}
+
+impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b>+Debug {
+    type Log = Box<WorkspaceLog+'a>;
+    type StatusIter = Box<Iterator<Item=Result<WorkspaceFileStatus>>+'a>;
+
+    fn commit(&mut self, message: &str) -> Result<CacheRef> {
+        self.0.commit(message)
+    }
+
+    fn get_current_head_ref(&self) -> Result<Option<CacheRef>> {
+        self.0.get_current_head_ref()
+    }
+
+    fn get_current_branch(&self) -> Result<Option<&str>> {
+        self.0.get_current_branch()
+    }
+
+    fn switch_branch(&mut self, branch: Option<&str>) -> Result<()> {
+        self.0.switch_branch(branch)
+    }
+
+    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()> {
+        self.0.create_branch(new_branch, repo_ref)
+    }
+
+    fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log> {
+        self.0.get_log(start_commit).map(|log|
+            Box::new(log) as Box<dyn WorkspaceLog>)
+    }
+
+    fn get_status(&'a self) -> Result<Self::StatusIter> {
+        self.0.get_status().map(|iter|
+            Box::new(iter) as Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>>)
+    }
+
+    fn update_head(&mut self) -> Result<CacheRef> {
+        self.0.update_head()
+    }
+}
+
+impl<'a, R> Repository<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b> {}
 
 #[derive(Debug, Clone)]
 pub struct OverlayPath {
@@ -394,7 +488,8 @@ pub struct FilesystemOverlay<C: CacheLayer> {
     head: WorkspaceHead,
     overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
     base_path: PathBuf,
-    branch: Option<String>
+    branch: Option<String>,
+    submodules: PathDispatcher<BoxedRepository>
 }
 
 impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
@@ -410,6 +505,10 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         let file = Arc::new(Mutex::new(file));
         self.overlay_files.insert(path.as_ref().to_owned(), Arc::downgrade(&file));
         FSOverlayFile::FsFile(file)
+    }
+
+    pub fn add_submodule<R>(&mut self, submodule: R) where for<'a> R: Repository<'a>+Debug+Send+Sync+'static {
+        self.submodules.push(Box::new(RepositoryWrapper(submodule)) as BoxedRepository)
     }
 
     pub fn new(cache: C, base_path: Cow<Path>, start_ref: RepoRef) -> Result<Self> {
@@ -428,7 +527,8 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             head,
             overlay_files: HashMap::new(),
             base_path: base_path.into_owned(),
-            branch
+            branch,
+            submodules: Vec::new()
         };
 
         if fs.is_clean()? {
@@ -503,12 +603,11 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         }
     }
 
-    fn iter_directory<I,T,F,G>(&self,
-                               overlay_path: &OverlayPath,
-                               from_directory_entry: F,
-                               mut from_dir_entry: G) -> Result<I>
-        where I: FromIterator<T>,
-              T: Eq+Hash,
+    fn iter_directory<T,F,G>(&self,
+                             overlay_path: &OverlayPath,
+                             from_directory_entry: F,
+                             mut from_dir_entry: G) -> Result<HashSet<T>>
+        where T: Eq+Hash,
               F: FnMut(DirectoryEntry) -> Result<T>,
               G: FnMut(&DirEntry) -> Result<OverlayOperation<T>> {
         // Get the directory contents from the cache if it's already there
@@ -539,7 +638,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             debug!("...but path doesn't exist");
         }
 
-        Ok(I::from_iter(dir_entries.into_iter()))
+        Ok(dir_entries)
     }
 
     fn dir_entry_to_overlay_dir_entry(dir_entry: &fs::DirEntry)
@@ -574,14 +673,14 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     }
 
     fn generate_tree(&self, overlay_path: &OverlayPath) -> Result<CacheRef> {
-        let dir_entries: HashSet<DirectoryEntry> = self.iter_directory(
+        let mut directory = self.iter_directory(
             &overlay_path,
             Ok,
             |e|
-                self.dir_entry_to_directory_entry(&e, overlay_path.clone()))?;
+                self.dir_entry_to_directory_entry(&e, overlay_path.clone()))?.into_iter();
 
-        let mut directory = dir_entries.into_iter();
-        self.cache.add_directory(&mut directory).map_err(Into::into)
+        self.cache.add_directory(&mut directory as &mut Iterator<Item=DirectoryEntry>)
+            .map_err(Into::into)
     }
 
     fn clear_closed_files_in_path(&mut self, path: &mut OverlayPath) -> Result<()> {
@@ -948,10 +1047,14 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
     }
 }
 
-impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
-    type File = FSOverlayFile<C>;
+type AddResultFn<T> = fn(T) -> Result<T>;
+type MapAddResultToHashSetIter<T> = iter::Map<hash_set::IntoIter<T>, AddResultFn<T>>;
 
-    fn open_file<P: AsRef<Path>>(&mut self, path: P, writable: bool)
+impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
+    type File = FSOverlayFile<C>;
+    type DirIter = MapAddResultToHashSetIter<OverlayDirEntry>;
+
+    fn open_file(&mut self, path: &Path, writable: bool)
         -> Result<FSOverlayFile<C>> {
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
@@ -993,25 +1096,27 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         }
     }
 
-    fn list_directory<I,P>(&self, path: P) -> Result<I>
-        where I: FromIterator<OverlayDirEntry>,
-              P: AsRef<Path> {
-        let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
-        self.iter_directory(
-            &overlay_path,
-            |dir_entry| {
-                self.directory_entry_to_overlay_dir_entry(dir_entry)
-            },
-            Self::dir_entry_to_overlay_dir_entry)
+    fn list_directory(&self, path: &Path) -> Result<Self::DirIter> {
+        let entries = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)
+            .and_then(|overlay_path|
+                self.iter_directory(
+                    &overlay_path,
+                    |dir_entry| {
+                        self.directory_entry_to_overlay_dir_entry(dir_entry)
+                    },
+                    Self::dir_entry_to_overlay_dir_entry))?;
+        let dir_iter = entries.into_iter()
+            .map(Ok as AddResultFn<OverlayDirEntry>);
+        Ok(dir_iter)
     }
 
-    fn ensure_directory<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    fn ensure_directory(&self, path: &Path) -> Result<()> {
         let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         fs::create_dir_all(&*overlay_path.abs_fs_path())
             .map_err(|e| e.into())
     }
 
-    fn metadata<P: AsRef<Path>>(&self, path: P) -> Result<Metadata> {
+    fn metadata(&self, path: &Path) -> Result<Metadata> {
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let abs_fs_path = overlay_path.abs_fs_path();
@@ -1054,9 +1159,9 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         }
     }
 
-    fn delete_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        if self.metadata(path.as_ref())?.object_type == ObjectType::Directory &&
-            !self.list_directory::<Vec<_>, _>(path.as_ref())?.is_empty() {
+    fn delete_file(&self, path: &Path) -> Result<()> {
+        if self.metadata(path.as_ref())?.object_type == ObjectType::Directory ||
+            self.list_directory(path)?.next().is_some() {
             return Err(Error::NonemptyDirectory)
         }
 
@@ -1089,10 +1194,9 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
         }
     }
 
-    fn revert_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    fn revert_file(&self, path: &Path) -> Result<()> {
         use std::path::Component::Normal;
 
-        let path = path.as_ref();
         if !path.is_relative() {
             return Err("Can only operate on relative paths".into());
         }
@@ -1287,12 +1391,14 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let test_path = Path::new("test.txt");
+
+        let mut test_file = overlay.open_file(test_path, true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
 
-        let mut staged_file = overlay.open_file("test.txt", false)
+        let mut staged_file = overlay.open_file(test_path, false)
             .expect("Unable to open staged file!");
         let mut contents = String::new();
         staged_file.read_to_string(&mut contents).expect("Unable to read from file");
@@ -1301,33 +1407,33 @@ mod test {
 
         overlay.commit("A test commit").expect("Unable to commit");
 
-        let mut committed_file = overlay.open_file("test.txt", false)
+        let mut committed_file = overlay.open_file(test_path, false)
             .expect("Unable to open committed file!");
         let mut contents = String::new();
         committed_file.read_to_string(&mut contents).expect("Unable to read from file");
         assert_eq!(contents.as_str(), "What a test!");
         drop(committed_file);
 
-        let metadata = overlay.metadata("test.txt")
+        let metadata = overlay.metadata(test_path)
             .expect("Unable to fetch metadata");
         assert_eq!("What a test!".len() as u64, metadata.size);
         assert_eq!(super::ObjectType::File, metadata.object_type);
 
-        let mut editable_file = overlay.open_file("test.txt", true)
+        let mut editable_file = overlay.open_file(test_path, true)
             .expect("Unable to open file for writing!");
         editable_file.seek(SeekFrom::End(0)).expect("Unable to seek to end!");
         write!(editable_file, "Yay!")
             .expect("Unable to append to file!");
         drop(editable_file);
 
-        let mut changed_file = overlay.open_file("test.txt", false)
+        let mut changed_file = overlay.open_file(test_path, false)
             .expect("Unable to open changed file!");
         let mut contents = String::new();
         changed_file.read_to_string(&mut contents).expect("Unable to read from file");
         assert_eq!(contents.as_str(), "What a test!Yay!");
         drop(changed_file);
 
-        let metadata = overlay.metadata("test.txt")
+        let metadata = overlay.metadata(test_path)
             .expect("Unable to fetch metadata");
         assert_eq!("What a test!Yay!".len() as u64, metadata.size);
         assert_eq!(super::ObjectType::File, metadata.object_type);
@@ -1340,21 +1446,24 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let test_path = Path::new("test.txt");
+        let test_path2 = Path::new("test2.txt");
+
+        let mut test_file = overlay.open_file(test_path, true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
 
         overlay.commit("A test commit").expect("Unable to commit");
 
-        let mut additional_file = overlay.open_file("test2.txt", true)
+        let mut additional_file = overlay.open_file(test_path2, true)
             .expect("Unable to create file");
         write!(additional_file, "Another file").expect("Couldn't write to test file");
         drop(additional_file);
 
         overlay.commit("A test commit with parent").expect("Unable to commit");
 
-        let mut first_file = overlay.open_file("test.txt", false)
+        let mut first_file = overlay.open_file(test_path, false)
             .expect("Unable to open first file");
         let mut content = String::new();
         first_file.read_to_string(&mut content)
@@ -1369,7 +1478,7 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("test.txt").into(), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1378,7 +1487,7 @@ mod test {
 
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut committed_file = overlay.open_file("test.txt", false)
+        let mut committed_file = overlay.open_file(Path::new("test.txt"), false)
             .expect("Unable to open committed file!");
         let mut contents = String::new();
         committed_file.read_to_string(&mut contents).expect("Unable to read from file");
@@ -1391,10 +1500,10 @@ mod test {
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
-        overlay.ensure_directory("a/nested/dir")
+        overlay.ensure_directory(Path::new("a/nested/dir"))
             .expect("Failed to create a nested directory");
 
-        let mut test_file = overlay.open_file("a/nested/dir/test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("a/nested/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1406,7 +1515,7 @@ mod test {
         overlay.commit("A test commit").expect("Unable to commit");
 
         for writable in &[true, false] {
-            let mut committed_file = overlay.open_file("a/nested/dir/test.txt", *writable)
+            let mut committed_file = overlay.open_file(Path::new("a/nested/dir/test.txt"), *writable)
                 .expect(format!("Unable to open committed file as {}",
                                 if *writable { "writable" } else { "readonly" }).as_str());
             let mut contents = String::new();
@@ -1416,7 +1525,9 @@ mod test {
             assert_eq!("What a test!", contents.as_str());
         }
 
-        let dir_entries: HashSet<OverlayDirEntry> = overlay.list_directory("a/nested/dir")
+        let dir_entries = overlay.list_directory(Path::new("a/nested/dir"))
+            .expect("Unable to list directory a/nested/dir")
+            .collect::<super::Result<HashSet<OverlayDirEntry>>>()
             .expect("Unable to get directory contents of a/nested/dir");
         assert_eq!(HashSet::<String>::from_iter(["test.txt"].iter().map(|s| s.to_string())),
                    HashSet::<String>::from_iter(dir_entries.iter().map(|e| e.name.clone())));
@@ -1429,19 +1540,21 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("test")
+        overlay.ensure_directory(Path::new("test"))
             .expect("Unable to create directory");
         overlay.commit("Test message")
             .expect("Unable to commit empty directory");
 
-        let dir: Vec<OverlayDirEntry> = overlay.list_directory("")
-            .expect("Unable to list directory");
-        let dir_names: HashSet<String> = dir.into_iter().map(|e| e.name).collect();
+        let dir = overlay.list_directory(Path::new(""))
+            .expect("Unable to list root directory");
+        let dir_names = dir.map(|e|
+            e.map(|e| e.name)).collect::<super::Result<HashSet<String>>>()
+            .expect("Error during directory iteration");
         assert_eq!(dir_names, HashSet::from_iter(["test"].iter().map(|s| s.to_string())));
 
-        let subdir: Vec<OverlayDirEntry> = overlay.list_directory("test")
-            .expect("Unable to list subdirectory test");
-        assert!(subdir.is_empty());
+        let mut subdir = overlay.list_directory(Path::new("test"))
+            .expect("Unable to list root directory");
+        assert!(subdir.next().is_none());
     }
 
     #[test]
@@ -1451,7 +1564,7 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         check_file_content(&mut test_file, "What a test!");
@@ -1480,7 +1593,7 @@ mod test {
         overlay.commit("A test commit with parent")
             .expect("Unable to create second commit");
 
-        let mut test_file = overlay.open_file("test.txt", false)
+        let mut test_file = overlay.open_file(Path::new("test.txt"), false)
             .expect("Unable to create file");
         check_file_content(&mut test_file, "What a test!Incredible!");
     }
@@ -1492,19 +1605,19 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
         overlay.commit("A test commit").expect("Unable to create first commit");
 
-        overlay.delete_file("test.txt").expect("File deletion failed");
+        overlay.delete_file(Path::new("test.txt")).expect("File deletion failed");
 
         assert!(overlay.get_status().unwrap()
             .any(|status|
                 status.ok() == Some(("test.txt", FileState::Deleted).into())));
 
-        overlay.open_file("test.txt", false).expect_err("File can still be opened");
+        overlay.open_file(Path::new("test.txt"), false).expect_err("File can still be opened");
     }
 
     #[test]
@@ -1514,14 +1627,14 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
-        overlay.delete_file("test.txt").expect("File deletion failed");
-        overlay.open_file("test.txt", false).expect_err("File can still be opened");
+        overlay.delete_file(Path::new("test.txt")).expect("File deletion failed");
+        overlay.open_file(Path::new("test.txt"), false).expect_err("File can still be opened");
         overlay.commit("A test commit").expect("Unable to create first commit");
-        overlay.open_file("test.txt", false).expect_err("File can still be opened");
+        overlay.open_file(Path::new("test.txt"), false).expect_err("File can still be opened");
     }
 
     #[test]
@@ -1531,14 +1644,14 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
         overlay.commit("A test commit").expect("Unable to create first commit");
-        overlay.delete_file("test.txt").expect("File deletion failed");
+        overlay.delete_file(Path::new("test.txt")).expect("File deletion failed");
         overlay.commit("Committing deleted file").expect("Unable to create second commit");
-        overlay.open_file("test.txt", false).expect_err("File can still be opened");
+        overlay.open_file(Path::new("test.txt"), false).expect_err("File can still be opened");
     }
 
     #[test]
@@ -1548,17 +1661,17 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("a/dir").expect("Unable to create dir");
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
-        overlay.delete_file("a/dir/test.txt").expect("File deletion failed");
-        overlay.delete_file("a/dir").expect("Dir deletion failed");
-        overlay.open_file("a/dr/test.txt", false)
+        overlay.delete_file(Path::new("a/dir/test.txt")).expect("File deletion failed");
+        overlay.delete_file(Path::new("a/dir")).expect("Dir deletion failed");
+        overlay.open_file(Path::new("a/dr/test.txt"), false)
             .expect_err("File can still be opened");
         overlay.commit("A test commit").expect("Unable to create first commit");
-        overlay.open_file("a/dir/test.txt", false)
+        overlay.open_file(Path::new("a/dir/test.txt"), false)
             .expect_err("File can still be opened");
     }
 
@@ -1569,16 +1682,16 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("a/dir").expect("Unable to create dir");
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
         overlay.commit("A test commit").expect("Unable to create first commit");
-        overlay.delete_file("a/dir/test.txt").expect("File deletion failed");
-        overlay.delete_file("a/dir").expect("Dir deletion failed");
+        overlay.delete_file(Path::new("a/dir/test.txt")).expect("File deletion failed");
+        overlay.delete_file(Path::new("a/dir")).expect("Dir deletion failed");
         overlay.commit("Committing deleted dir").expect("Unable to create second commit");
-        overlay.open_file("a/dir/test.txt", false)
+        overlay.open_file(Path::new("a/dir/test.txt"), false)
             .expect_err("File can still be opened");
     }
 
@@ -1593,11 +1706,13 @@ mod test {
 
     struct OverlayDir(Vec<OverlayDirEntry>);
 
-    impl<'a, F, O> DirLister for &'a O where F: OverlayFile, O: Overlay<File=F> {
+    impl<'a, F, O> DirLister for &'a O where F: OverlayFile+'static, O: Overlay<File=F> {
         type Dir = OverlayDir;
 
         fn dir<P>(self, path: P) -> <Self as DirLister>::Dir where P: AsRef<Path> {
-            OverlayDir(self.list_directory(path).unwrap())
+            let dir = self.list_directory(path.as_ref()).unwrap()
+                .collect::<super::Result<Vec<OverlayDirEntry>>>().unwrap();
+            OverlayDir(dir)
         }
     }
 
@@ -1626,8 +1741,8 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("a/dir").expect("Unable to create dir");
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1637,11 +1752,11 @@ mod test {
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
 
-        overlay.delete_file("a/dir/test.txt").unwrap();
-        overlay.delete_file("a/dir").unwrap();
+        overlay.delete_file(Path::new("a/dir/test.txt")).unwrap();
+        overlay.delete_file(Path::new("a/dir")).unwrap();
         assert!(overlay.dir("a") == &[]);
 
-        overlay.revert_file("a/dir").unwrap();
+        overlay.revert_file(Path::new("a/dir")).unwrap();
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
     }
@@ -1678,8 +1793,8 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("a/dir").expect("Unable to create dir");
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1689,10 +1804,10 @@ mod test {
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
 
-        overlay.delete_file("a/dir/test.txt").unwrap();
+        overlay.delete_file(Path::new("a/dir/test.txt")).unwrap();
         assert!(overlay.dir("a/dir") == &[]);
 
-        overlay.revert_file("a/dir/test.txt").unwrap();
+        overlay.revert_file(Path::new("a/dir/test.txt")).unwrap();
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
     }
@@ -1704,13 +1819,13 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("a/dir").expect("Unable to create dir");
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
 
-        let mut test_file = overlay.open_file("a/dir/test2.txt", true)
+        let mut test_file = overlay.open_file(Path::new("a/dir/test2.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What another test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1720,10 +1835,10 @@ mod test {
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt", "test2.txt"]);
 
-        overlay.delete_file("a/dir/test.txt").unwrap();
+        overlay.delete_file(Path::new("a/dir/test.txt")).unwrap();
         assert!(overlay.dir("a/dir") == &["test2.txt"]);
 
-        overlay.revert_file("a/dir/test.txt").unwrap();
+        overlay.revert_file(Path::new("a/dir/test.txt")).unwrap();
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt", "test2.txt"]);
     }
@@ -1735,8 +1850,8 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        overlay.ensure_directory("a/dir").expect("Unable to create dir");
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1746,21 +1861,21 @@ mod test {
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
 
-        let mut test_file = overlay.open_file("a/dir/test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
             .expect("Unable to open committed file");
         write!(test_file, "Now that's totally different!").expect("Couldn't write to test file");
         drop(test_file);
 
         assert!(overlay.dir("a/dir") == &["test.txt"]);
 
-        let mut test_file = overlay.open_file("a/dir/test.txt", false)
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), false)
             .expect("Unable to open test file");
         check_file_content(&mut test_file, "Now that's totally different!");
         drop(test_file);
 
-        overlay.revert_file("a/dir/test.txt").unwrap();
+        overlay.revert_file(Path::new("a/dir/test.txt")).unwrap();
 
-        let mut test_file = overlay.open_file("a/dir/test.txt", false)
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), false)
             .expect("Unable to open test file");
         check_file_content(&mut test_file, "What a test!");
 
@@ -1775,7 +1890,7 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let mut overlay = open_working_copy(tempdir.path());
 
-        let mut test_file = overlay.open_file("test.txt", true)
+        let mut test_file = overlay.open_file(Path::new("test.txt"), true)
             .expect("Unable to create file");
         write!(test_file, "What a test!").expect("Couldn't write to test file");
         drop(test_file);
@@ -1814,13 +1929,13 @@ mod test {
 
         // 1. Create two test files and commit
         let mut file1 =
-            overlay.open_file("test1.txt", true)
+            overlay.open_file(Path::new("test1.txt"), true)
                 .expect("Unable to create first test file");
         write!(file1, "A test file")
             .expect("Unable to write to first test file");
         drop(file1);
         let mut file2 =
-            overlay.open_file("test2.txt", true)
+            overlay.open_file(Path::new("test2.txt"), true)
                 .expect("Unable to create second test file");
         write!(file2, "Another test file")
             .expect("Unable to write to second test file");
@@ -1831,13 +1946,13 @@ mod test {
 
         // 2. Reopen the files, change one
         let mut file1 =
-            overlay.open_file("test1.txt", true)
+            overlay.open_file(Path::new("test1.txt"), true)
                 .expect("Unable to reopen first test file");
         write!(file1, "Alter one file in the overlay")
             .expect("Unable to change the first file");
         drop(file1);
         let mut file2 =
-            overlay.open_file("test2.txt", true)
+            overlay.open_file(Path::new("test2.txt"), true)
                 .expect("Unable to reopen second test file");
 
         // 3. Alter the other file directly in the cache
