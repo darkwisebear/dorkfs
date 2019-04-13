@@ -3,16 +3,20 @@ use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
 use std::iter::FromIterator;
 use std::fmt::{self, Debug, Formatter};
 use std::collections::{hash_map, HashMap};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 use std::str;
+use std::borrow::Cow;
 
 use chrono;
+use owning_ref::{RwLockReadGuardRef, OwningHandle};
 
 use crate::{
     types::*,
-    overlay::{self, *}
+    overlay::{self, *},
+    cache::CacheRef
 };
+use crate::cache::ReferencedCommit;
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
 
@@ -307,14 +311,15 @@ impl SpecialFileOps for BranchFileOps {
     fn init<O>(&self, control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         control_dir.get_current_branch()
-            .map(|branch| branch.unwrap_or("(detached)").as_bytes().to_vec())
+            .map(|branch|
+                branch.unwrap_or(Cow::Borrowed("(detached)")).as_bytes().to_vec())
     }
 
     fn close<O>(&self, control_dir: &mut O, buffer: &[u8]) -> overlay::Result<()>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         let target_branch = str::from_utf8(buffer)
             .map_err(overlay::Error::from_fail)?;
-        if Some(target_branch) != control_dir.get_current_branch()? {
+        if Some(Cow::Borrowed(target_branch)) != control_dir.get_current_branch()? {
             control_dir.switch_branch(Some(target_branch.trim_end_matches('\n')))
                 .map(|_|
                     info!("Successfully switched to branch {}", target_branch))
@@ -538,6 +543,122 @@ impl<O> Overlay for ControlDir<O>
         } else {
             self.overlay.read().unwrap().revert_file(path)
         }
+    }
+}
+
+struct DerefWrapper<T>(T);
+
+impl<T> Deref for DerefWrapper<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for DerefWrapper<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+struct ControlDirHandle<'a, T, U>(OwningHandle<RwLockReadGuardRef<'a, T>,
+    DerefWrapper<U>>) where for<'b> T: WorkspaceController<'b>+'a;
+
+pub struct ControlDirLog<'a, T>(ControlDirHandle<'a, T, <T as WorkspaceController<'a>>::Log>)
+    where for<'b> T: WorkspaceController<'b>;
+
+impl<'a, T> ControlDirLog<'a, T> where for<'b> T: WorkspaceController<'b> {
+    fn new(overlay: RwLockReadGuardRef<'a, T>, start_commit: &CacheRef) -> Result<Self> {
+        OwningHandle::try_new(overlay, |o|
+            unsafe {
+                (*o).get_log(start_commit).map(DerefWrapper)
+            })
+            .map(|h| ControlDirLog(ControlDirHandle(h)))
+    }
+}
+
+impl<'a, T> Iterator for ControlDirLog<'a, T>
+    where for<'b> T: WorkspaceController<'b>+'a {
+    type Item = Result<ReferencedCommit>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.0).0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0).0.size_hint()
+    }
+}
+
+impl<'a, T> WorkspaceLog for ControlDirLog<'a, T>
+    where for<'b> T: WorkspaceController<'b>+'a {}
+
+pub struct ControlDirStatusIter<'a, T>(
+    ControlDirHandle<'a, T, <T as WorkspaceController<'a>>::StatusIter>)
+    where for<'b> T: WorkspaceController<'b>;
+
+impl<'a, T> ControlDirStatusIter<'a, T> where for<'b> T: WorkspaceController<'b>+'a {
+    fn new(overlay: RwLockReadGuardRef<'a, T>) -> Result<Self> {
+        OwningHandle::try_new(overlay, |o|
+            unsafe {
+                (*o).get_status().map(DerefWrapper)
+            })
+            .map(|h|
+                ControlDirStatusIter(ControlDirHandle(h)))
+    }
+}
+
+impl<'a, T> Iterator for ControlDirStatusIter<'a, T>
+    where for<'b> T: WorkspaceController<'b>+'a {
+    type Item = Result<WorkspaceFileStatus>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.0).0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0).0.size_hint()
+    }
+}
+
+impl<'a, T> WorkspaceController<'a> for ControlDir<T>
+    where for<'b> T: Overlay+WorkspaceController<'b>+'a {
+    type Log = ControlDirLog<'a, T>;
+    type StatusIter = ControlDirStatusIter<'a, T>;
+
+    fn commit(&mut self, message: &str) -> overlay::Result<CacheRef> {
+        self.overlay.write().unwrap().commit(message)
+    }
+
+    fn get_current_head_ref(&self) -> overlay::Result<Option<CacheRef>> {
+        self.overlay.read().unwrap().get_current_head_ref()
+    }
+
+    fn get_current_branch(&self) -> overlay::Result<Option<Cow<str>>> {
+        self.overlay.read().unwrap().get_current_branch()
+            .map(|r| r.map(|o| Cow::Owned(o.into_owned())))
+    }
+
+    fn switch_branch(&mut self, branch: Option<&str>) -> overlay::Result<()> {
+        self.overlay.write().unwrap().switch_branch(branch)
+    }
+
+    fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef>) -> overlay::Result<()> {
+        self.overlay.write().unwrap().create_branch(new_branch, repo_ref)
+    }
+
+    fn get_log(&'a self, start_commit: &CacheRef) -> overlay::Result<Self::Log> {
+        let read_guard = self.overlay.read().unwrap();
+        ControlDirLog::new(RwLockReadGuardRef::new(read_guard), start_commit)
+    }
+
+    fn get_status(&'a self) -> overlay::Result<Self::StatusIter> {
+        let read_guard = self.overlay.read().unwrap();
+        ControlDirStatusIter::new(RwLockReadGuardRef::new(read_guard))
+    }
+
+    fn update_head(&mut self) -> overlay::Result<CacheRef> {
+        self.overlay.write().unwrap().update_head()
     }
 }
 

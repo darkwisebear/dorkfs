@@ -170,7 +170,7 @@ pub trait WorkspaceController<'a>: Debug {
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
-    fn get_current_branch(&self) -> Result<Option<&str>>;
+    fn get_current_branch(&self) -> Result<Option<Cow<str>>>;
     fn switch_branch(&mut self, branch: Option<&str>) -> Result<()>;
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
@@ -308,7 +308,7 @@ impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Re
         self.0.get_current_head_ref()
     }
 
-    fn get_current_branch(&self) -> Result<Option<&str>> {
+    fn get_current_branch(&self) -> Result<Option<Cow<str>>> {
         self.0.get_current_branch()
     }
 
@@ -507,8 +507,15 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         FSOverlayFile::FsFile(file)
     }
 
-    pub fn add_submodule<R>(&mut self, submodule: R) where for<'a> R: Repository<'a>+Debug+Send+Sync+'static {
-        self.submodules.push(Box::new(RepositoryWrapper(submodule)) as BoxedRepository)
+    pub fn add_submodule<P, R>(&mut self, path: P, submodule: R) -> Result<()>
+        where for<'a> R: Repository<'a>+Debug+Send+Sync+'static,
+              P: AsRef<Path> {
+        let repo = Box::new(RepositoryWrapper(submodule)) as BoxedRepository;
+        self.submodules.add_overlay(path, repo)
+            .map(|s| if s.is_some() {
+                warn!("Submodule replaced");
+            })
+            .map_err(|e| Error::Generic(e))
     }
 
     pub fn new(cache: C, base_path: Cow<Path>, start_ref: RepoRef) -> Result<Self> {
@@ -528,7 +535,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             overlay_files: HashMap::new(),
             base_path: base_path.into_owned(),
             branch,
-            submodules: Vec::new()
+            submodules: PathDispatcher::new()
         };
 
         if fs.is_clean()? {
@@ -900,8 +907,8 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         Ok(self.head.get_ref())
     }
 
-    fn get_current_branch(&self) -> Result<Option<&str>> {
-        Ok(self.branch.as_ref().map(String::as_str))
+    fn get_current_branch(&self) -> Result<Option<Cow<str>>> {
+        Ok(self.branch.as_ref().map(|b| Cow::Borrowed(b.as_str())))
     }
 
     fn switch_branch(&mut self, new_branch: Option<&str>) -> Result<()> {
