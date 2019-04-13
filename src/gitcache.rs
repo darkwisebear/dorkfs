@@ -177,13 +177,13 @@ impl CacheLayer for GitCache {
         }
     }
 
-    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
-        self.repo.blob_path(source_path)
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef> {
+        self.repo.blob_path(source_path.as_ref())
             .map(Self::oid_to_cache_ref)
             .map_err(|e| GitLayerError::GitError(e).into())
     }
 
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef> {
         self.repo.treebuilder(None)
             .and_then(|mut builder| {
                 for entry in items {
@@ -204,8 +204,8 @@ impl CacheLayer for GitCache {
             .map_err(|git_err| GitLayerError::GitError(git_err).into())
     }
 
-    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
-        match self.get_branch_oid(branch) {
+    fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>> {
+        match self.get_branch_oid(branch.as_ref()) {
             Ok(oid) => Ok(Some(Self::oid_to_cache_ref(oid))),
             Err(err) => match err.code() {
                 git2::ErrorCode::NotFound => Ok(None),
@@ -214,13 +214,13 @@ impl CacheLayer for GitCache {
         }
     }
 
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
         let reference = self.get_branch_oid(branch);
         match reference {
             Ok(reference) => self.repo.find_commit(reference),
             Err(git_err) => match git_err.code() {
-                git2::ErrorCode::NotFound => return self.create_branch(branch, cache_ref)
-                    .map(|_| cache_ref),
+                git2::ErrorCode::NotFound => return self.create_branch(branch, *cache_ref)
+                    .map(|_| *cache_ref),
                 _ => Err(git_err)
             }
         }
@@ -250,9 +250,9 @@ impl CacheLayer for GitCache {
         .map_err(|e| GitLayerError::GitError(e).into())
     }
 
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
+    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()> {
         self.repo.reference(Self::branch_to_ref(branch).as_str(),
-                            Self::cache_ref_to_oid(&cache_ref), false,
+                            Self::cache_ref_to_oid(cache_ref), false,
                             format!("Create reference {}", branch).as_str())
             .map_err(|e| GitLayerError::GitError(e).into())
             .map(|_| ())

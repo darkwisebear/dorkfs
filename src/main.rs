@@ -59,7 +59,7 @@ use crate::{
     utility::RepoUrl,
     types::RepoRef
 };
-use crate::overlay::Overlay;
+use crate::overlay::{BoxedRepository, RepositoryWrapper, Overlay};
 use crate::cache::CacheRef;
 use crate::dispatch::PathDispatcher;
 use crate::control::ControlDir;
@@ -188,7 +188,7 @@ fn mount_fuse<O>(
 }
 
 fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch: Option<&RepoRef>)
-    -> Fallible<ControlDir<FilesystemOverlay<cache::BoxedCacheLayer>>>
+    -> Fallible<BoxedRepository>
     where P: AsRef<Path>,
           Q: AsRef<Path> {
     let mut default_branch = String::new();
@@ -217,7 +217,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
             let cached_github =
                 HashFileCache::new(github, &cachedir)?;
 
-            (cache::boxed(cached_github), branch)
+            (cached_github, branch)
         }
     };
 
@@ -247,7 +247,8 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
                 }
             }
         )
-        .map(ControlDir::new)
+        .map(|overlay|
+            Box::new(RepositoryWrapper::new(ControlDir::new(overlay))) as BoxedRepository)
         .map_err(Into::into)
 }
 

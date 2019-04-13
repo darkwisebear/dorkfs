@@ -112,7 +112,7 @@ impl<O> FilesystemMT for DorkFS<O> where
 
         match state.overlay.list_directory(path) {
             Ok(dir) => {
-                let dir_handle = state.open_handles.push(OpenObject::Directory(dir),
+                let dir_handle = state.open_handles.push(OpenObject::Directory(Vec::from_iter(dir)),
                                                          Cow::Borrowed(path.as_os_str()));
                 Ok((dir_handle, 0))
             }
@@ -432,6 +432,6 @@ impl<O> DorkFS<O> where
             .expect("Expect absolute path")
             .join(name);
         let state = self.state.read().unwrap();
-        state.overlay.delete_file(path)
+        state.overlay.delete_file(&path)
     }
 }

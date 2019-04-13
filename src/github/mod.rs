@@ -179,13 +179,13 @@ impl CacheLayer for Github {
         self.query_object(cache_ref, true)
     }
 
-    fn add_file_by_path(&self, source_path: &Path) -> cache::Result<CacheRef> {
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> cache::Result<CacheRef> {
         let source = fs::File::open(source_path)?;
         self.post_blob_data(source)
     }
 
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> cache::Result<CacheRef> {
-        let git_tree_entries = items.map(restv3::GitTreeEntry::from);
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I) -> cache::Result<CacheRef> {
+        let git_tree_entries = items.into_iter().map(restv3::GitTreeEntry::from);
         let git_tree = restv3::GitTree {
             tree: git_tree_entries.collect(),
             base_tree: None
@@ -202,18 +202,18 @@ impl CacheLayer for Github {
                 self.post_git_object_json(git_commit_json, "commits"))
     }
 
-    fn get_head_commit(&self, branch: &str) -> cache::Result<Option<CacheRef>> {
-        self.get_ref_info(Some(branch))
+    fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> cache::Result<Option<CacheRef>> {
+        self.get_ref_info(Some(branch.as_ref()))
             .map(|ref_info_result|
                 ref_info_result.map(|(_, cache_ref)| cache_ref))
     }
 
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> cache::Result<CacheRef> {
+    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> cache::Result<CacheRef> {
         self.update_branch_head(branch, cache_ref)
     }
 
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<(), CacheError> {
-        self.create_git_ref(branch, cache_ref)
+    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<(), CacheError> {
+        self.create_git_ref(branch.as_ref(), *cache_ref)
     }
 }
 
@@ -611,8 +611,9 @@ query {{ \
         }
     }
 
-    fn update_branch_head(&self, branch: &str, cache_ref: CacheRef) -> cache::Result<CacheRef> {
-        if let Some((ref_name, _)) = self.get_ref_info(Some(branch))? {
+    fn update_branch_head<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef)
+        -> cache::Result<CacheRef> {
+        if let Some((ref_name, _)) = self.get_ref_info(Some(branch.as_ref()))? {
             // Ref exists, we need to issue a PATCH or a merge in case no fast-forward is
             // possible.
             let sha = cache_ref_to_sha(cache_ref.to_string());
@@ -656,14 +657,14 @@ query {{ \
                             Error::GitOperationFailure(response.status()).into()))
                     })
             } else if ff_ref_response_status.is_success() {
-                Ok(cache_ref)
+                Ok(*cache_ref)
             } else {
                 Err(CacheError::LayerError(
                     Error::GitOperationFailure(ff_ref_response_status).into()))
             }
         } else {
-            self.create_git_ref(branch, cache_ref)
-                .map(|_| cache_ref)
+            self.create_git_ref(branch.as_ref(), *cache_ref)
+                .map(|_| *cache_ref)
         }
     }
 
@@ -818,7 +819,7 @@ mod test {
         let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
         writeln!(temp_file, "Test executed on {}", ::chrono::Local::now().to_rfc2822()).unwrap();
         let file_cache_ref = github.add_file_by_path(
-            temp_file.into_temp_path().as_ref())
+            temp_file.into_temp_path())
             .expect("Unable to upload file contents");
         src_tree.get_mut("hashfilecache.rs")
             .expect("Cannot find github.rs in src").cache_ref = file_cache_ref;
@@ -840,7 +841,7 @@ mod test {
         };
 
         let new_commit_ref = github.add_commit(new_commit)
-            .and_then(|cache_ref| github.merge_commit("test", cache_ref))
+            .and_then(|cache_ref| github.merge_commit("test", &cache_ref))
             .expect("Unable to upload commit");
         assert_eq!(new_commit_ref, github.get_head_commit("test")
             .expect("Error getting new head commit")
@@ -886,14 +887,14 @@ mod test {
 
         let commit1ref =
             create_test_commit(&mut rng, &gh, current_head);
-        gh.merge_commit("mergetest", commit1ref)
+        gh.merge_commit("mergetest", &commit1ref)
             .expect("Unable to merge first commit to master");
         let commit2ref =
             create_test_commit(&mut rng, &gh, current_head);
-        let final_ref = gh.merge_commit("mergetest", commit2ref)
+        let final_ref = gh.merge_commit("mergetest", &commit2ref)
             .expect("Unable to merge second commit to master");
 
-        info!("Created parent commits {} and {}", commit1ref, commit2ref);
+        info!("Created parent commits {} and {}", commit1ref, &commit2ref);
 
         let new_head = gh.get_head_commit("mergetest")
             .expect("Unable to get new HEAD commit ref")

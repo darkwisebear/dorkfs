@@ -662,6 +662,9 @@ impl<'a, T> WorkspaceController<'a> for ControlDir<T>
     }
 }
 
+impl<'b, O> Repository<'b> for ControlDir<O>
+    where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {}
+
 #[cfg(test)]
 mod test {
     use std::{

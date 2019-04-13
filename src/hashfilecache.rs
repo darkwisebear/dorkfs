@@ -176,14 +176,14 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         }
     }
 
-    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef> {
         let cache_ref = self.cache.add_file_by_path(&source_path)?;
         let source_file = fs::File::open(source_path)?;
         self.store_file(&cache_ref, source_file)?;
         Ok(cache_ref)
     }
 
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef> {
         let entries = Vec::from_iter(items);
         let cache_ref = self.cache.add_directory(&mut entries.iter().cloned())?;
 
@@ -198,15 +198,15 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
         Ok(cache_ref)
     }
 
-    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
+    fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>> {
         self.cache.get_head_commit(branch)
     }
 
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
+    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
         self.cache.merge_commit(branch, cache_ref)
     }
 
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
+    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()> {
         self.cache.create_branch(branch, cache_ref)
     }
 }

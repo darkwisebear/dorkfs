@@ -13,6 +13,7 @@ use std::ffi::OsStr;
 use std::cmp::max;
 use std::borrow::Cow;
 use std::vec;
+use std::ops::{Deref, DerefMut};
 
 use chrono::{Utc, Offset};
 
@@ -248,7 +249,7 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
 
 pub trait Repository<'a>: Overlay+WorkspaceController<'a> {}
 
-type BoxedRepository = Box<for<'a> Repository<'a,
+pub type BoxedRepository = Box<for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
     File=Box<dyn OverlayFile>,
@@ -256,7 +257,13 @@ type BoxedRepository = Box<for<'a> Repository<'a,
 +Send+Sync>;
 
 #[derive(Debug)]
-struct RepositoryWrapper<R>(R) where for<'a> R: Repository<'a>+Debug;
+pub struct RepositoryWrapper<R>(R) where for<'a> R: Repository<'a>+Debug;
+
+impl<R> RepositoryWrapper<R> where for<'a> R: Repository<'a>+Debug {
+    pub fn new(repo: R) -> Self {
+        RepositoryWrapper(repo)
+    }
+}
 
 impl<T> OverlayFile for Box<T> where T: OverlayFile+?Sized {
     fn truncate(&mut self, size: u64) -> Result<()> {
@@ -336,6 +343,35 @@ impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Re
 }
 
 impl<'a, R> Repository<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b> {}
+
+impl Overlay for BoxedRepository {
+    type File = Box<dyn OverlayFile>;
+    type DirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
+
+    fn open_file(&mut self, path: &Path, writable: bool) -> Result<Self::File> {
+        self.deref_mut().open_file(path, writable)
+    }
+
+    fn list_directory(&self, path: &Path) -> Result<Self::DirIter> {
+        self.deref().list_directory(path)
+    }
+
+    fn ensure_directory(&self, path: &Path) -> Result<()> {
+        self.deref().ensure_directory(path)
+    }
+
+    fn metadata(&self, path: &Path) -> Result<Metadata> {
+        self.deref().metadata(path)
+    }
+
+    fn delete_file(&self, path: &Path) -> Result<()> {
+        self.deref().delete_file(path)
+    }
+
+    fn revert_file(&self, path: &Path) -> Result<()> {
+        self.deref().revert_file(path)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OverlayPath {
@@ -861,7 +897,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         let new_commit_ref = self.cache.add_commit(commit)
             .and_then(|cache_ref| match self.branch {
                 Some(ref branch_name) =>
-                    self.cache.merge_commit(branch_name.as_str(), cache_ref),
+                    self.cache.merge_commit(branch_name, &cache_ref),
                 None => Ok(cache_ref)
             })?;
 
@@ -928,7 +964,7 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
                 .ok_or_else(|| Error::Generic(format_err!("No HEAD in current workspace set")))?,
         };
 
-        self.cache.create_branch(new_branch, base_ref)
+        self.cache.create_branch(new_branch, &base_ref)
             .map_err(Into::into)
     }
 
