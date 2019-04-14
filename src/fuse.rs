@@ -110,9 +110,11 @@ impl<O> FilesystemMT for DorkFS<O> where
         let path = path.strip_prefix("/").expect("Expect absolute path");
         let mut state = self.state.write().unwrap();
 
-        match state.overlay.list_directory(path) {
+        match state.overlay.list_directory(path)
+            .and_then(|dir_iter|
+                dir_iter.collect::<Result<Vec<_>, _>>()) {
             Ok(dir) => {
-                let dir_handle = state.open_handles.push(OpenObject::Directory(Vec::from_iter(dir)),
+                let dir_handle = state.open_handles.push(OpenObject::Directory(dir),
                                                          Cow::Borrowed(path.as_os_str()));
                 Ok((dir_handle, 0))
             }

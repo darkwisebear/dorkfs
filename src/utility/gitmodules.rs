@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::io::Read;
 use regex::Regex;
 use std::fmt::{self, Display, Formatter};
+use std::iter;
 
 use failure::Fallible;
 
@@ -137,10 +138,12 @@ impl<'a> IntoIterator for &'a GitModules {
     }
 }
 
+type Extract2nd<U, V> = fn((U, V)) -> V;
+type Extract2ndFromHashIter<U, V> = iter::Map<hash_map::IntoIter<U, V>, Extract2nd<U, V>>;
+
 impl IntoIterator for GitModules {
     type Item = GitModule;
-    type IntoIter = ::std::iter::Map<hash_map::IntoIter<String, GitModule>,
-        fn((String, GitModule)) -> GitModule>;
+    type IntoIter = Extract2ndFromHashIter<String, GitModule>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter().map(|(_, module)| module)

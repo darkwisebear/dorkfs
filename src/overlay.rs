@@ -248,11 +248,12 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
 }
 
 pub trait Repository<'a>: Overlay+WorkspaceController<'a> {}
+pub trait DebuggableOverlayFile: OverlayFile+Debug {}
 
 pub type BoxedRepository = Box<for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
-    File=Box<dyn OverlayFile>,
+    File=Box<dyn DebuggableOverlayFile+Send+Sync>,
     DirIter=Box<dyn Iterator<Item=Result<OverlayDirEntry>>>>
 +Send+Sync>;
 
@@ -271,13 +272,14 @@ impl<T> OverlayFile for Box<T> where T: OverlayFile+?Sized {
     }
 }
 
-impl<R> Overlay for RepositoryWrapper<R> where for <'a> R: Repository<'a>+Debug {
-    type File = Box<dyn OverlayFile>;
+impl<R> Overlay for RepositoryWrapper<R> where for <'a> R: Repository<'a>+Debug,
+                                               <R as Overlay>::File: DebuggableOverlayFile+Send+Sync {
+    type File = Box<dyn DebuggableOverlayFile+Send+Sync>;
     type DirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
     fn open_file(&mut self, path: &Path, writable: bool) -> Result<Self::File> {
         self.0.open_file(path, writable)
-            .map(|f| Box::new(f) as Box<dyn OverlayFile>)
+            .map(|f| Box::new(f) as Box<dyn DebuggableOverlayFile+Send+Sync>)
     }
 
     fn list_directory(&self, path: &Path) -> Result<Self::DirIter> {
@@ -342,10 +344,12 @@ impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Re
     }
 }
 
-impl<'a, R> Repository<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b> {}
+impl<'a, R> Repository<'a> for RepositoryWrapper<R>
+    where for<'b> R: Repository<'b>,
+          <R as Overlay>::File: DebuggableOverlayFile+Send+Sync {}
 
 impl Overlay for BoxedRepository {
-    type File = Box<dyn OverlayFile>;
+    type File = Box<dyn DebuggableOverlayFile+Send+Sync>;
     type DirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
     fn open_file(&mut self, path: &Path, writable: bool) -> Result<Self::File> {
@@ -545,13 +549,14 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     pub fn add_submodule<P, R>(&mut self, path: P, submodule: R) -> Result<()>
         where for<'a> R: Repository<'a>+Debug+Send+Sync+'static,
+              <R as Overlay>::File: DebuggableOverlayFile+Send+Sync,
               P: AsRef<Path> {
         let repo = Box::new(RepositoryWrapper(submodule)) as BoxedRepository;
         self.submodules.add_overlay(path, repo)
             .map(|s| if s.is_some() {
                 warn!("Submodule replaced");
             })
-            .map_err(|e| Error::Generic(e))
+            .map_err(Error::Generic)
     }
 
     pub fn new(cache: C, base_path: Cow<Path>, start_ref: RepoRef) -> Result<Self> {
@@ -1203,9 +1208,10 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
     }
 
     fn delete_file(&self, path: &Path) -> Result<()> {
-        if self.metadata(path.as_ref())?.object_type == ObjectType::Directory ||
+        let obj_type = self.metadata(path)?.object_type;
+        if obj_type == ObjectType::Directory &&
             self.list_directory(path)?.next().is_some() {
-            return Err(Error::NonemptyDirectory)
+                return Err(Error::NonemptyDirectory)
         }
 
         let overlay_path =
@@ -2042,5 +2048,28 @@ mod test {
 
         // 5. Check if the locally unchanged file contains the changes from the cache
         check_file_content(&mut file2, "Altered content");
+    }
+
+    #[test]
+    fn check_thread_safety() {
+        use crate::nullcache::NullCache;
+        use super::{RepositoryWrapper, BoxedRepository};
+        use crate::control::ControlDir;
+        use std::fmt::Debug;
+
+        fn bounds_test<O>(mut overlay: O) where O: Overlay+Debug+Send+Sync+'static,
+                                                <O as Overlay>::File: Debug+Send+Sync+'static {
+            assert!(overlay.open_file(Path::new("test.txt"), true).is_ok());
+            dbg!(overlay);
+        }
+
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let fs_overlay = open_working_copy(tempdir.path());
+        let control_overlay = ControlDir::new(fs_overlay);
+        let boxed_overlay = Box::new(RepositoryWrapper::new(control_overlay))
+            as BoxedRepository;
+        bounds_test(boxed_overlay);
     }
 }

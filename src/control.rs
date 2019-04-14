@@ -69,6 +69,10 @@ pub enum ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     InnerOverlayFile(O::File)
 }
 
+impl<O> DebuggableOverlayFile for ControlFile<O>
+    where for<'a> O: Overlay+WorkspaceController<'a>,
+          <O as Overlay>::File: Debug {}
+
 impl<O> OverlayFile for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     fn truncate(&mut self, size: u64) -> overlay::Result<()> {
         match self {

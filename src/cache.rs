@@ -431,17 +431,4 @@ mod test {
         let bytes: Result<Vec<u8>, Error> = iter.collect();
         assert_eq!(vec![0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf], bytes.unwrap());
     }
-
-    #[test]
-    fn check_thread_safety() {
-        use crate::nullcache::NullCache;
-        use super::CacheLayer;
-
-        fn bounds_test<F: FnOnce()+Send+Sync+'static>(f: F) {
-            f()
-        }
-
-        let test_cache_layer = NullCache::default();
-        bounds_test(move || assert!(test_cache_layer.get_head_commit("(unused)").is_ok()));
-    }
 }
