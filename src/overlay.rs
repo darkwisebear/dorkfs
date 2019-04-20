@@ -809,7 +809,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         } else if let Some(cache_file) = cache_file {
                 Ok(FSOverlayFile::CacheFile(cache_file))
         } else {
-            Err(format_err!("File not found!").into())
+            Err(Error::FileNotFound)
         }
     }
 
