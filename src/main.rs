@@ -43,12 +43,11 @@ mod github;
 #[cfg(test)]
 mod nullcache;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::fmt::Debug;
 use std::borrow::Cow;
 use std::ffi::CString;
-use std::iter;
 use std::io::Read;
 
 use failure::Fallible;
@@ -56,15 +55,12 @@ use clap::ArgMatches;
 
 use crate::{
     hashfilecache::HashFileCache,
-    overlay::{WorkspaceController, FilesystemOverlay},
-    cache::CacheLayer,
+    overlay::{WorkspaceController, FilesystemOverlay, BoxedRepository, RepositoryWrapper, Overlay},
+    cache::{CacheLayer, CacheRef},
+    control::ControlDir,
     utility::RepoUrl,
     types::RepoRef
 };
-use crate::overlay::{BoxedRepository, RepositoryWrapper, Overlay};
-use crate::cache::{CacheRef, CacheObject};
-use crate::dispatch::PathDispatcher;
-use crate::control::ControlDir;
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
@@ -244,7 +240,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
     -> Fallible<BoxedRepository>
     where P: AsRef<Path>,
           Q: AsRef<Path> {
-    let mut default_branch = String::new();
+    let mut default_branch;
     let overlaydir = overlaydir.as_ref();
 
     let (rootrepo, branch) = match rootrepo_url {
@@ -343,10 +339,10 @@ fn mount(args: &ArgMatches) {
     let rootrepo_url = RepoUrl::from_str(rootrepo).expect("Unable to parse root URL");
     let cachedir = cachedir_base.join("cache");
 
-    let mut fs = new_overlay(cachedir_base.join("overlay"),
-                             &cachedir,
-                             &rootrepo_url,
-                             branch.as_ref())
+    let fs = new_overlay(cachedir_base.join("overlay"),
+                         &cachedir,
+                         &rootrepo_url,
+                         branch.as_ref())
         .expect("Unable to create workspace");
 
     #[cfg(target_os = "linux")]

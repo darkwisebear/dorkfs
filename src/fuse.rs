@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::ffi::{OsStr, OsString};
 use std::sync::RwLock;
@@ -12,10 +12,8 @@ use chrono::{DateTime, TimeZone, Timelike};
 use fuse_mt::*;
 use libc;
 
-use crate::control::*;
 use crate::overlay::{self, *};
 use crate::types;
-use crate::cache::CacheLayer;
 use crate::utility::OpenHandleSet;
 
 lazy_static! {

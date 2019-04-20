@@ -25,9 +25,6 @@ use crate::{
     types::*,
     utility::*
 };
-use crate::cache::DirectoryImpl;
-use crate::github::initialize_github_submodules;
-use crate::overlay::FSOverlayFile::FsFile;
 
 #[derive(Debug, Fail)]
 pub enum Error {
@@ -576,7 +573,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
         let branch = match start_ref {
             RepoRef::Branch(branch) => Some(branch.to_string()),
-            RepoRef::CacheRef(cache_ref) => None
+            RepoRef::CacheRef(_) => None
         };
 
         let mut fs = FilesystemOverlay {
