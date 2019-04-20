@@ -16,6 +16,7 @@ use std::vec;
 use std::ops::{Deref, DerefMut};
 
 use chrono::{Utc, Offset};
+use either::Either;
 
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
@@ -25,6 +26,8 @@ use crate::{
     utility::*
 };
 use crate::cache::DirectoryImpl;
+use crate::github::initialize_github_submodules;
+use crate::overlay::FSOverlayFile::FsFile;
 
 #[derive(Debug, Fail)]
 pub enum Error {
@@ -188,7 +191,8 @@ pub trait WorkspaceController<'a>: Debug {
 #[derive(Debug)]
 pub enum FSOverlayFile<C: CacheLayer+Debug> {
     FsFile(Arc<Mutex<File>>),
-    CacheFile(C::File)
+    CacheFile(C::File),
+    BoxedFile(BoxedOverlayFile)
 }
 
 impl<C: CacheLayer+Debug> OverlayFile for FSOverlayFile<C> {
@@ -210,6 +214,7 @@ impl<C: CacheLayer+Debug> Read for FSOverlayFile<C> {
                 file.read(buf)
             }
             FSOverlayFile::CacheFile(ref mut read) => read.read(buf),
+            FSOverlayFile::BoxedFile(ref mut read) => read.read(buf),
         }
     }
 }
@@ -221,16 +226,19 @@ impl<C: CacheLayer+Debug> Write for FSOverlayFile<C> {
                 let mut file = file.lock().unwrap();
                 file.write(buf)
             }
-            FSOverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            FSOverlayFile::CacheFile(..) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            FSOverlayFile::BoxedFile(ref mut file) => file.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let FSOverlayFile::FsFile(ref mut file) = *self {
-            let mut file = file.lock().unwrap();
-            file.flush()
-        } else {
-            Ok(())
+        match *self {
+            FSOverlayFile::FsFile(ref mut file) => {
+                let mut file = file.lock().unwrap();
+                file.flush()
+            }
+            FSOverlayFile::CacheFile(..) => Ok(()),
+            FSOverlayFile::BoxedFile(ref mut file) => file.flush(),
         }
     }
 }
@@ -243,6 +251,7 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
                 file.seek(pos)
             }
             FSOverlayFile::CacheFile(ref mut seek) => seek.seek(pos),
+            FSOverlayFile::BoxedFile(ref mut file) => file.seek(pos),
         }
     }
 }
@@ -250,11 +259,14 @@ impl<C: CacheLayer+Debug> Seek for FSOverlayFile<C> {
 pub trait Repository<'a>: Overlay+WorkspaceController<'a> {}
 pub trait DebuggableOverlayFile: OverlayFile+Debug {}
 
+pub type BoxedOverlayFile = Box<dyn DebuggableOverlayFile+Send+Sync>;
+pub type BoxedDirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
+
 pub type BoxedRepository = Box<for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
-    File=Box<dyn DebuggableOverlayFile+Send+Sync>,
-    DirIter=Box<dyn Iterator<Item=Result<OverlayDirEntry>>>>
+    File=BoxedOverlayFile,
+    DirIter=BoxedDirIter>
 +Send+Sync>;
 
 #[derive(Debug)]
@@ -547,12 +559,9 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
         FSOverlayFile::FsFile(file)
     }
 
-    pub fn add_submodule<P, R>(&mut self, path: P, submodule: R) -> Result<()>
-        where for<'a> R: Repository<'a>+Debug+Send+Sync+'static,
-              <R as Overlay>::File: DebuggableOverlayFile+Send+Sync,
-              P: AsRef<Path> {
-        let repo = Box::new(RepositoryWrapper(submodule)) as BoxedRepository;
-        self.submodules.add_overlay(path, repo)
+    pub fn add_submodule<P>(&mut self, path: P, submodule: BoxedRepository) -> Result<()>
+        where P: AsRef<Path> {
+        self.submodules.add_overlay(path, submodule)
             .map(|s| if s.is_some() {
                 warn!("Submodule replaced");
             })
@@ -1097,13 +1106,18 @@ impl<'a, C: CacheLayer> Iterator for FSStatusIter<'a, C> {
 
 type AddResultFn<T> = fn(T) -> Result<T>;
 type MapAddResultToHashSetIter<T> = iter::Map<hash_set::IntoIter<T>, AddResultFn<T>>;
+type HashOrBoxedDirIter = Either<MapAddResultToHashSetIter<OverlayDirEntry>, BoxedDirIter>;
 
 impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
     type File = FSOverlayFile<C>;
-    type DirIter = MapAddResultToHashSetIter<OverlayDirEntry>;
+    type DirIter = HashOrBoxedDirIter;
 
     fn open_file(&mut self, path: &Path, writable: bool)
         -> Result<FSOverlayFile<C>> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay_mut(path)? {
+            return overlay.open_file(subpath, writable).map(FSOverlayFile::BoxedFile);
+        }
+
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let abs_fs_path = overlay_path.abs_fs_path();
@@ -1145,6 +1159,10 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
     }
 
     fn list_directory(&self, path: &Path) -> Result<Self::DirIter> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay(path)? {
+            return overlay.list_directory(subpath).map(Either::Right);
+        }
+
         let entries = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)
             .and_then(|overlay_path|
                 self.iter_directory(
@@ -1155,16 +1173,25 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
                     Self::dir_entry_to_overlay_dir_entry))?;
         let dir_iter = entries.into_iter()
             .map(Ok as AddResultFn<OverlayDirEntry>);
-        Ok(dir_iter)
+
+        Ok(Either::Left(dir_iter))
     }
 
     fn ensure_directory(&self, path: &Path) -> Result<()> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay(path)? {
+            return overlay.ensure_directory(subpath);
+        }
+
         let overlay_path = OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         fs::create_dir_all(&*overlay_path.abs_fs_path())
             .map_err(|e| e.into())
     }
 
     fn metadata(&self, path: &Path) -> Result<Metadata> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay(path)? {
+            return overlay.metadata(subpath);
+        }
+
         let overlay_path =
             OverlayPath::with_overlay_path(Self::file_path(&self.base_path), path)?;
         let abs_fs_path = overlay_path.abs_fs_path();
@@ -1208,6 +1235,10 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
     }
 
     fn delete_file(&self, path: &Path) -> Result<()> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay(path)? {
+            return overlay.delete_file(subpath);
+        }
+
         let obj_type = self.metadata(path)?.object_type;
         if obj_type == ObjectType::Directory &&
             self.list_directory(path)?.next().is_some() {
@@ -1244,6 +1275,10 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
     }
 
     fn revert_file(&self, path: &Path) -> Result<()> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay(path)? {
+            return overlay.revert_file(subpath);
+        }
+
         use std::path::Component::Normal;
 
         if !path.is_relative() {

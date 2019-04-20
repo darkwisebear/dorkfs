@@ -23,6 +23,7 @@ extern crate base64;
 extern crate bytes;
 extern crate regex;
 extern crate owning_ref;
+extern crate either;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;
@@ -48,6 +49,7 @@ use std::fmt::Debug;
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::iter;
+use std::io::Read;
 
 use failure::Fallible;
 use clap::ArgMatches;
@@ -60,7 +62,7 @@ use crate::{
     types::RepoRef
 };
 use crate::overlay::{BoxedRepository, RepositoryWrapper, Overlay};
-use crate::cache::CacheRef;
+use crate::cache::{CacheRef, CacheObject};
 use crate::dispatch::PathDispatcher;
 use crate::control::ControlDir;
 
@@ -187,11 +189,63 @@ fn mount_fuse<O>(
         .expect("Unable to mount filesystem");
 }
 
+fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
+                                gitmodules: R,
+                                cachedir: P,
+                                workspace_dir: Q,
+                                fs: &mut FilesystemOverlay<C>) -> Fallible<()>
+    where R: Read, P: AsRef<Path>, Q: AsRef<Path>, C: CacheLayer {
+    let head_commit = match fs.get_current_head_ref()? {
+        Some(head_commit) =>
+            get_commit(fs.get_cache(), &head_commit)?,
+        None => return Ok(()),
+    };
+
+    match rootrepo_url {
+        RepoUrl::GithubHttps {
+            apiurl, org, ..
+        } => match github::initialize_github_submodules(
+            gitmodules, apiurl.as_ref(), org.as_ref()) {
+            Ok(submodules) => {
+                for (submodule_path, submodule_url) in submodules.into_iter() {
+                    let cache = fs.get_cache();
+                    let gitlink_ref =
+                        cache::resolve_object_ref(cache, &head_commit, &submodule_path)
+                            .map_err(failure::Error::from)
+                            .and_then(|cache_ref|
+                                cache_ref.ok_or(
+                                    format_err!("Unable to find gitlink for submodule in path {}",
+                                                    submodule_path.display())));
+                    match gitlink_ref {
+                        Ok(gitlink_ref) =>
+                            new_overlay(workspace_dir.as_ref().join(&submodule_path),
+                                        cachedir.as_ref(),
+                                        &submodule_url,
+                                        Some(&RepoRef::CacheRef(gitlink_ref)))
+                                .and_then(|submodule|
+                                    fs.add_submodule(submodule_path, submodule)
+                                        .map_err(Into::into))?,
+
+                        Err(err) =>
+                            error!("Unable to initialize submodule at {}: {}. Skipping.",
+                                   submodule_path.display(), err)
+                    }
+                }
+            }
+
+            Err(err) => warn!("Unable to initialize submodules: {}", err)
+        }
+    }
+
+    Ok(())
+}
+
 fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch: Option<&RepoRef>)
     -> Fallible<BoxedRepository>
     where P: AsRef<Path>,
           Q: AsRef<Path> {
     let mut default_branch = String::new();
+    let overlaydir = overlaydir.as_ref();
 
     let (rootrepo, branch) = match rootrepo_url {
         RepoUrl::GithubHttps { apiurl, org, repo } => {
@@ -222,7 +276,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
     };
 
     FilesystemOverlay::new(rootrepo,
-                           Cow::Borrowed(overlaydir.as_ref()),
+                           Cow::Owned(overlaydir.join("root")),
                            branch)
         .and_then(|mut overlay|
             match overlay.update_head() {
@@ -247,6 +301,23 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
                 }
             }
         )
+        .and_then(|mut fs| {
+            match fs.open_file(Path::new(".gitmodules"), false) {
+                Ok(file) => {
+                    let submodule_dir = overlaydir.join("submodules");
+                    mount_submodules(rootrepo_url,
+                                     file,
+                                     cachedir.as_ref(),
+                                     submodule_dir,
+                                     &mut fs)?;
+                }
+
+                Err(overlay::Error::FileNotFound) => debug!("No .gitmodules found, skipping submodule scan"),
+                Err(err) => warn!("Unable to open .gitmodules: {}", err)
+            }
+
+            Ok(fs)
+        })
         .map(|overlay|
             Box::new(RepositoryWrapper::new(ControlDir::new(overlay))) as BoxedRepository)
         .map_err(Into::into)
@@ -272,77 +343,12 @@ fn mount(args: &ArgMatches) {
     let rootrepo_url = RepoUrl::from_str(rootrepo).expect("Unable to parse root URL");
     let cachedir = cachedir_base.join("cache");
 
-    let mut fs = new_overlay(cachedir_base.join("overlay/root"),
+    let mut fs = new_overlay(cachedir_base.join("overlay"),
                              &cachedir,
                              &rootrepo_url,
                              branch.as_ref())
         .expect("Unable to create workspace");
 
-/*    let mut dispatcher = dispatch::PathDispatcher::new();
-
-    let head_commit = fs.get_current_head_ref().transpose()
-        .map(|cache_ref|
-            cache_ref
-                .map_err(failure::Error::from)
-                .and_then(|cache_ref|
-                    get_commit(fs.get_cache(), &cache_ref)))
-        .transpose()
-        .expect("Unable to retrieve HEAD commit");
-
-    if let Some(head_commit) = head_commit {
-        match fs.open_file(".gitmodules", false) {
-            Ok(file) => {
-                let workspace_dir = cachedir_base.join("overlay/submodules");
-
-                match rootrepo_url {
-                    RepoUrl::GithubHttps {
-                        apiurl, org, ..
-                    } => {
-                        match github::initialize_github_submodules(
-                            file, apiurl.as_ref(), org.as_ref()) {
-                            Ok(submodules) => {
-                                for (submodule_path, submodule_url) in submodules.into_iter() {
-                                    let cache = fs.get_cache().as_ref();
-                                    let gitlink_ref = cache::resolve_object_ref(cache, &head_commit, &submodule_path)
-                                        .map_err(failure::Error::from)
-                                        .and_then(|cache_ref|
-                                            cache_ref.ok_or(format_err!(
-                                            "Unable to find gitlink for submodule in path {}",
-                                            submodule_path.display())));
-                                    match gitlink_ref {
-                                        Ok(gitlink_ref) => {
-                                            new_overlay(workspace_dir.join(&submodule_path),
-                                                        &cachedir,
-                                                        &submodule_url,
-                                                        Some(&RepoRef::CacheRef(gitlink_ref)))
-                                                .and_then(|submodule|
-                                                    dispatcher.add_overlay(
-                                                        submodule_path,
-                                                        ControlDir::new(submodule)))
-                                                .expect("Unable to create submodule workspace");
-                                        }
-
-                                        Err(err) =>
-                                            warn!("Unable to initialize submodule: {}. Skipping.",
-                                                  err)
-                                    }
-                                }
-                            }
-
-                            Err(err) => warn!("Unable to initialize submodules: {}", err)
-                        }
-                    }
-                }
-            }
-
-            Err(overlay::Error::FileNotFound) => debug!("No .gitmodules found, skipping submodule scan"),
-            Err(err) => warn!("Unable to open .gitmodules: {}", err)
-        }
-    }
-
-    dispatcher.add_overlay("", ControlDir::new(fs))
-        .expect("Unable to mount root repository");
-*/
     #[cfg(target_os = "linux")]
     {
         let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
