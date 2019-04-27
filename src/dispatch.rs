@@ -1,135 +1,103 @@
-use std::ffi::{OsString, OsStr};
 use std::fmt::Debug;
-use std::path::{Component, Path};
-use std::cell::UnsafeCell;
+use std::path::{Path, PathBuf};
+use std::mem::replace;
 
 use failure::Fallible;
 
 #[derive(Debug)]
 struct DispatcherEntry<O: Debug> {
-    name: OsString,
-    overlay: Option<UnsafeCell<O>>,
-    subpaths: Vec<DispatcherEntry<O>>
-}
-
-// Implementing Sync is still ok since we make sure that get_overlay[_mut] will obey to the
-// Rust memory safety rules, so sending references is ok as with usual types.
-unsafe impl<O: Debug+Sync> Sync for DispatcherEntry<O> {}
-
-impl<O: Debug> DispatcherEntry<O> {
-    fn find_subpath_index(&self, name: &OsStr) -> Result<usize, usize> {
-        self.subpaths.binary_search_by(|entry|
-            entry.name.as_os_str().cmp(name))
-    }
+    subpath: PathBuf,
+    overlay: O
 }
 
 #[derive(Debug)]
 pub struct PathDispatcher<O: Debug> {
-    root: DispatcherEntry<O>
+    entries: Vec<DispatcherEntry<O>>,
+    root: Option<O>
 }
 
 impl<O: Debug> PathDispatcher<O> {
     pub fn new() -> Self {
         PathDispatcher {
-            root: DispatcherEntry {
-                name: OsString::new(),
-                overlay: None,
-                subpaths: Vec::new()
-            }
+            entries: Vec::new(),
+            root: None
         }
     }
 
+    #[cfg(test)]
     pub fn with_root_overlay(root_overlay: O) -> Self {
         PathDispatcher {
-            root: DispatcherEntry {
-                name: OsString::new(),
-                overlay: Some(UnsafeCell::new(root_overlay)),
-                subpaths: Vec::new()
-            }
+            entries: Vec::new(),
+            root: Some(root_overlay)
         }
-
     }
 
-    unsafe fn resolve_path<'a, 'b>(&'a self, path: &'b Path) -> Fallible<Option<(&'a mut O, &'b Path)>> {
-        let mut cur_overlay = self.root.overlay.as_ref()
-            .map(|o| o.get());
-        let mut cur_subpath = &self.root;
-        let mut cur_path_suffix = path;
+    fn resolve_path<'a, 'b>(&'a self, path: &'b Path) -> Option<(usize, &'b Path)> {
+        match self.entries.binary_search_by_key(&path,
+                                                |entry|
+                                                    entry.subpath.as_path()) {
+            Ok(exact) => Some((exact, Path::new(""))),
 
-        for component in path.components() {
-            match component {
-                Component::Normal(name) => match cur_subpath.find_subpath_index(name) {
-                    Ok(subpath_index) => {
-                        let subpath = &cur_subpath.subpaths[subpath_index];
-                        cur_path_suffix = cur_path_suffix.strip_prefix(&subpath.name).unwrap();
-
-                        if let Some(ref suboverlay) = subpath.overlay {
-                            cur_overlay = Some(suboverlay.get());
-                        }
-                        cur_subpath = subpath;
+            Err(insert) =>
+                if insert > 0 {
+                    let prefix = self.entries[insert-1].subpath.as_path();
+                    if let Ok(suffix) = path.strip_prefix(prefix) {
+                        Some((insert-1, suffix))
+                    } else {
+                        None
                     }
-
-                    Err(_) => break,
+                } else {
+                    None
                 }
-
-                Component::CurDir =>
-                    cur_path_suffix = cur_path_suffix.strip_prefix(".").unwrap(),
-                Component::RootDir =>
-                    cur_path_suffix = cur_path_suffix.strip_prefix("/").unwrap(),
-
-                Component::Prefix(_) | Component::ParentDir =>
-                    bail!(r#"Path for resolve_path must not contain a prefix or "..""#)
-            }
         }
-
-        let overlay = cur_overlay.and_then(|o| o.as_mut());
-        Ok(overlay.map(move |o| (o, cur_path_suffix)))
     }
 
     pub fn get_overlay<'a, 'b, P>(&'a self, path: &'b P) -> Fallible<Option<(&'a O, &'b Path)>>
         where P: AsRef<Path>+?Sized {
-        unsafe {
-            self.resolve_path(path.as_ref())
-                .map(|o|
-                    o.map(|(r, p)| (r as &O, p)))
+        let path = path.as_ref();
+        match self.resolve_path(path) {
+            Some((index, suffix)) => {
+                let entry = &self.entries[index];
+                Ok(Some((&entry.overlay, suffix)))
+            }
+            None => {
+                Ok(self.root.as_ref().map(move |root| (root, path)))
+            }
         }
     }
 
     pub fn get_overlay_mut<'a, 'b, P>(&'a mut self, path: &'b P) -> Fallible<Option<(&'a mut O, &'b Path)>>
         where P: AsRef<Path>+?Sized {
-        unsafe {
-            self.resolve_path(path.as_ref())
+        let path = path.as_ref();
+        match self.resolve_path(path) {
+            Some((index, suffix)) => {
+                let entry = &mut self.entries[index];
+                Ok(Some((&mut entry.overlay, suffix)))
+            }
+            None => {
+                Ok(self.root.as_mut().map(move |root| (root, path)))
+            }
         }
     }
 
-    pub fn add_overlay<P: AsRef<Path>>(&mut self, path: P, overlay: O) -> Fallible<Option<O>> {
-        let mut cur_subpath = &mut self.root;
-        for component in path.as_ref().components() {
-            match component {
-                Component::Normal(name) => {
-                    match cur_subpath.find_subpath_index(name) {
-                        Ok(existing) => cur_subpath = &mut cur_subpath.subpaths[existing],
-                        Err(insert) => {
-                            let new_subpath = DispatcherEntry {
-                                name: name.to_os_string(),
-                                overlay: None,
-                                subpaths: Vec::new()
-                            };
-                            cur_subpath.subpaths.insert(insert, new_subpath);
-                            cur_subpath = &mut cur_subpath.subpaths[insert];
-                        }
-                    }
+    pub fn add_overlay<P: Into<PathBuf>>(&mut self, path: P, overlay: O) -> Fallible<Option<O>> {
+        let path = path.into();
+        if path.as_os_str() == "/" {
+            Ok(self.root.replace(overlay))
+        } else {
+            match self.entries.binary_search_by_key(&path.as_path(),
+                                                    |entry|
+                                                        entry.subpath.as_path()) {
+                Ok(exact) => Ok(Some(replace(&mut self.entries[exact].overlay, overlay))),
+                Err(pos) => {
+                    self.entries.insert(pos, DispatcherEntry {
+                        subpath: path,
+                        overlay
+                    });
+                    Ok(None)
                 }
-
-                Component::RootDir | Component::CurDir => (),
-
-                Component::Prefix(_) | Component::ParentDir =>
-                    bail!(r#"Path for add_overlay must not contain a prefix or "..""#)
             }
         }
-
-        Ok(cur_subpath.overlay.replace(UnsafeCell::new(overlay))
-            .map(UnsafeCell::into_inner))
     }
 }
 
@@ -140,33 +108,27 @@ mod test {
     #[test]
     fn add_and_retrieve() {
         let mut dispatcher = PathDispatcher::with_root_overlay(0);
-        assert!(dispatcher.add_overlay("/somewhere/else", 1).unwrap().is_none());
+        assert!(dispatcher.add_overlay("somewhere/else", 1).unwrap().is_none());
 
-        let (&root_overlay, path) = dispatcher.get_overlay("")
-            .unwrap()
-            .expect("No overlay found");
-        assert_eq!(root_overlay, 0);
-        assert_eq!(path.as_os_str(), "");
-
-        let (&root_overlay_slash, path) = dispatcher.get_overlay(Path::new("/"))
+        let (&root_overlay_slash, path) = dispatcher.get_overlay(Path::new(""))
             .unwrap()
             .expect("No overlay found");
         assert_eq!(root_overlay_slash, 0);
         assert_eq!(path.as_os_str(), "");
 
-        let (&somewhere_else, path) = dispatcher.get_overlay(Path::new("/somewhere/else"))
+        let (&somewhere_else, path) = dispatcher.get_overlay(Path::new("somewhere/else"))
             .unwrap()
             .expect("No overlay found");
         assert_eq!(somewhere_else, 1);
         assert_eq!(path.as_os_str(), "");
 
-        let (&totally_different, path) = dispatcher.get_overlay(Path::new("/totally/different"))
+        let (&totally_different, path) = dispatcher.get_overlay(Path::new("totally/different"))
             .unwrap()
             .expect("No overlay found");
         assert_eq!(totally_different, 0);
         assert_eq!(path.as_os_str(), "totally/different");
 
-        let (&submodule_path, path) = dispatcher.get_overlay(Path::new("/somewhere/else/README.md"))
+        let (&submodule_path, path) = dispatcher.get_overlay(Path::new("somewhere/else/README.md"))
             .unwrap()
             .expect("No overlay found");
         assert_eq!(path.as_os_str(), "README.md");
@@ -176,8 +138,8 @@ mod test {
     #[test]
     fn without_root_overlay() {
         let mut dispatcher = PathDispatcher::new();
-        assert!(dispatcher.add_overlay("/submodule/first", 0).unwrap().is_none());
-        assert_eq!(dispatcher.get_overlay("/anywhere").unwrap(), None);
-        assert_eq!(dispatcher.get_overlay("/submodule/first/dir").unwrap(), Some((&0, Path::new("dir"))));
+        assert!(dispatcher.add_overlay("submodule/first", 0).unwrap().is_none());
+        assert_eq!(dispatcher.get_overlay("anywhere").unwrap(), None);
+        assert_eq!(dispatcher.get_overlay("submodule/first/dir").unwrap(), Some((&0, Path::new("dir"))));
     }
 }

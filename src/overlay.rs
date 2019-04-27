@@ -558,7 +558,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     pub fn add_submodule<P>(&mut self, path: P, submodule: BoxedRepository) -> Result<()>
         where P: AsRef<Path> {
-        self.submodules.add_overlay(path, submodule)
+        self.submodules.add_overlay(path.as_ref(), submodule)
             .map(|s| if s.is_some() {
                 warn!("Submodule replaced");
             })
