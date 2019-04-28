@@ -122,6 +122,8 @@ impl<O> Seek for ControlFile<O> where for<'a> O: Overlay+WorkspaceController<'a>
 }
 
 pub trait SpecialFileOps: Clone+Debug {
+    const CLEAR_ON_WRITE: bool = false;
+
     fn init<O>(&self, _control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay+WorkspaceController<'o>+Send+Sync+'static {
         Ok(Vec::new())
@@ -164,7 +166,8 @@ impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
         let file = BufferedFile {
             buf: Cursor::new(self.ops.init(control_dir.get_overlay().deref())?),
             ops: self.ops.clone(),
-            overlay: Arc::clone(&control_dir.overlay)
+            overlay: Arc::clone(&control_dir.overlay),
+            cleared: false
         };
         Ok(Box::new(file) as Box<dyn ControlOverlayFile+Send+Sync>)
     }
@@ -179,10 +182,11 @@ impl<F: SpecialFileOps+Send+Sync> BufferedFileFactory<F> {
 }
 
 #[derive(Debug)]
-struct BufferedFile<F, O> where F: SpecialFileOps, for <'a> O: Overlay+WorkspaceController<'a> {
+struct BufferedFile<F, O> where F: SpecialFileOps, for<'a> O: Overlay+WorkspaceController<'a> {
     buf: Cursor<Vec<u8>>,
     ops: F,
-    overlay: Arc<RwLock<O>>
+    overlay: Arc<RwLock<O>>,
+    cleared: bool
 }
 
 impl<F, O> Read for BufferedFile<F, O> where F: SpecialFileOps,
@@ -195,6 +199,11 @@ impl<F, O> Read for BufferedFile<F, O> where F: SpecialFileOps,
 impl<F, O> Write for BufferedFile<F, O> where F: SpecialFileOps,
                                               for<'a> O: Overlay+WorkspaceController<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if F::CLEAR_ON_WRITE && !self.cleared {
+            self.buf.set_position(0);
+            self.buf.get_mut().clear();
+            self.cleared = true;
+        }
         self.buf.write(buf)
     }
 
@@ -313,6 +322,8 @@ impl SpecialFileOps for CommitFileOps {
 struct BranchFileOps;
 
 impl SpecialFileOps for BranchFileOps {
+    const CLEAR_ON_WRITE: bool = true;
+
     fn init<O>(&self, control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         control_dir.get_current_branch()
