@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::mem::replace;
+use std::iter;
+use std::slice;
 
 use failure::Fallible;
 
@@ -14,6 +16,22 @@ struct DispatcherEntry<O: Debug> {
 pub struct PathDispatcher<O: Debug> {
     entries: Vec<DispatcherEntry<O>>,
     root: Option<O>
+}
+
+#[derive(Debug)]
+pub struct Iter<'a, O: Debug>(
+iter::Chain<
+    iter::Map<slice::Iter<'a, DispatcherEntry<O>>,
+        fn(&DispatcherEntry<O>) -> (&O, &Path)>,
+    iter::FilterMap<iter::Once<&'a Option<O>>,
+        fn(&Option<O>) -> Option<(&O, &Path)>>>);
+
+impl<'a, O: Debug> Iterator for Iter<'a, O> {
+    type Item = (&'a O, &'a Path);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
 }
 
 impl<O: Debug> PathDispatcher<O> {
@@ -99,11 +117,32 @@ impl<O: Debug> PathDispatcher<O> {
             }
         }
     }
+
+    fn entry_to_iter_tuple(entry: &DispatcherEntry<O>) -> (&O, &Path) {
+        (&entry.overlay, entry.subpath.as_path())
+    }
+
+    fn root_overlay_to_iter_tuple(root_overlay: &Option<O>) -> Option<(&O, &Path)> {
+        root_overlay.as_ref().map(|root_overlay| (root_overlay, Path::new("")))
+    }
+
+    pub fn iter(&self) -> Iter<O> {
+        Iter(self.entries.iter()
+            .map(Self::entry_to_iter_tuple as fn(&DispatcherEntry<O>) -> (&O, &Path))
+            .chain(iter::once(&self.root)
+                .filter_map(Self::root_overlay_to_iter_tuple as fn(&Option<O>) -> Option<(&O, &Path)>)))
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn assert_submodule_paths<O: Debug>(dispatcher: &PathDispatcher<O>, ref_paths: &[&str]) {
+        let paths = dispatcher.iter()
+            .flat_map(|(_, path)| path.to_str().into_iter());
+        assert!(paths.zip(ref_paths).all(|(lhs, rhs)| lhs == *rhs));
+    }
 
     #[test]
     fn add_and_retrieve() {
@@ -133,6 +172,8 @@ mod test {
             .expect("No overlay found");
         assert_eq!(path.as_os_str(), "README.md");
         assert_eq!(submodule_path, 1);
+
+        assert_submodule_paths(&dispatcher, &["somewhere/else", ""]);
     }
 
     #[test]
@@ -140,6 +181,9 @@ mod test {
         let mut dispatcher = PathDispatcher::new();
         assert!(dispatcher.add_overlay("submodule/first", 0).unwrap().is_none());
         assert_eq!(dispatcher.get_overlay("anywhere").unwrap(), None);
-        assert_eq!(dispatcher.get_overlay("submodule/first/dir").unwrap(), Some((&0, Path::new("dir"))));
+        assert_eq!(dispatcher.get_overlay("submodule/first/dir").unwrap(),
+                   Some((&0, Path::new("dir"))));
+
+        assert_submodule_paths(&dispatcher, &["submodule/first"]);
     }
 }

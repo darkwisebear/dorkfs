@@ -273,7 +273,8 @@ impl WorkspaceStatusFileOps {
             let state_string = match state {
                 FileState::New => "N ",
                 FileState::Modified => "M ",
-                FileState::Deleted => "D "
+                FileState::Deleted => "D ",
+                FileState::SubmoduleUpdated => "S ",
             };
             status.push_str(state_string);
             status.push_str(path.display().to_string().as_str());

@@ -21,7 +21,7 @@ use either::Either;
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
             CacheError, Directory},
-    dispatch::PathDispatcher,
+    dispatch::{self, PathDispatcher},
     types::*,
     utility::*
 };
@@ -125,7 +125,8 @@ pub trait OverlayFile: Read+Write+Seek {
 pub enum FileState {
     New,
     Modified,
-    Deleted
+    Deleted,
+    SubmoduleUpdated
 }
 
 impl Display for FileState {
@@ -133,7 +134,8 @@ impl Display for FileState {
         let literal = match self {
             FileState::New => "new",
             FileState::Modified => "modified",
-            FileState::Deleted => "deleted"
+            FileState::Deleted => "deleted",
+            FileState::SubmoduleUpdated => "submodule modified"
         };
         f.write_str(literal)
     }
@@ -832,6 +834,14 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
     pub fn get_cache_mut(&mut self) -> &mut C {
         &mut self.cache
     }
+
+    fn get_head_commit(&self) -> Result<Option<Commit>> {
+        self.head.cache_ref
+            .map(|head_ref| self.cache.get(&head_ref)
+                .and_then(CacheObject::into_commit)
+                .map_err(Error::CacheError))
+            .transpose()
+    }
 }
 
 pub struct CacheLayerLog<'a, C: CacheLayer+'a> {
@@ -879,7 +889,7 @@ impl<'a, C: CacheLayer+'a> Iterator for CacheLayerLog<'a, C> {
 
 impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C> {
     type Log = CacheLayerLog<'a, C>;
-    type StatusIter = FSStatusIter<'a, C>;
+    type StatusIter = iter::Chain<FSStatusIter<'a, C>, BoxedRepoDispatcherIter<'a, C>>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
         // lock all opened files to block writes as long as the commit is pending
@@ -983,9 +993,10 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
         CacheLayerLog::new(&self.cache, start_commit)
     }
 
-    fn get_status(&'a self) -> Result<FSStatusIter<'a, C>> {
+    fn get_status(&'a self) -> Result<Self::StatusIter> {
         let path = OverlayPath::new(Self::file_path(&self.base_path));
-        Ok(FSStatusIter::new(path, self))
+        Ok(FSStatusIter::new(path, self)
+            .chain(BoxedRepoDispatcherIter::new(self)?))
     }
 
     fn update_head(&mut self) -> Result<CacheRef> {
@@ -1001,6 +1012,60 @@ impl<'a, C: CacheLayer+Debug+'a> WorkspaceController<'a> for FilesystemOverlay<C
                 cache_ref.ok_or_else(|| Error::MissingHeadRef(self.branch.clone().unwrap())))
             .and_then(|cache_ref|
                 self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
+    }
+}
+
+pub struct BoxedRepoDispatcherIter<'a, C>(dispatch::Iter<'a, BoxedRepository>, &'a FilesystemOverlay<C>)
+    where C: CacheLayer+'a;
+
+impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+'a {
+    fn new(overlay: &'a FilesystemOverlay<C>) -> Result<Self> {
+        let iter = overlay.submodules.iter();
+        Ok(BoxedRepoDispatcherIter(iter, overlay))
+    }
+}
+
+impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
+    where C: CacheLayer+'a {
+    type Item = Result<WorkspaceFileStatus>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let BoxedRepoDispatcherIter(iter, fs) = self;
+
+        let head_commit = match fs.get_head_commit() {
+            Ok(Some(commit)) => commit,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e))
+        };
+
+        iter.by_ref().filter_map(|(overlay, submodule_path)| {
+            let cache = fs.get_cache();
+            let gitlink_ref = match
+                cache::resolve_object_ref(cache, &head_commit, submodule_path)
+                    .map_err(Error::Generic)
+                    .and_then(|cache_ref|
+                        cache_ref.ok_or(Error::Generic(
+                            format_err!("Unable to find gitlink for submodule in path {}",
+                                        submodule_path.display())))) {
+                Ok(gitlink) => gitlink,
+                Err(e) => return Some(Err(e))
+            };
+
+            let head_ref = match overlay.get_current_head_ref()
+                .and_then(|r|
+                    r.ok_or(Error::MissingHeadRef(format!("No head ref for submodule {}",
+                                                              submodule_path.display())))) {
+                Ok(head) => head,
+                Err(e) => return Some(Err(e))
+            };
+
+            if gitlink_ref != head_ref {
+                Some(Ok(WorkspaceFileStatus(submodule_path.to_path_buf(),
+                                            FileState::SubmoduleUpdated)))
+            } else {
+                None
+            }
+        }).next()
     }
 }
 
@@ -1216,10 +1281,9 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
                             format_err!(r#"File "{}" not found in directory"#,
                             file_name.to_string_lossy()))))?;
 
-            let head_commit = self.head.cache_ref
-                .ok_or_else(|| CacheError::RuntimeError(format_err!("Inexistent HEAD commit")))
-                .and_then(|head_ref| self.cache.get(&head_ref))
-                .and_then(CacheObject::into_commit)?;
+            let head_commit = self.get_head_commit()
+                .and_then(|commit|
+                    commit.ok_or_else(|| Error::Generic(format_err!("Inexistent HEAD commit"))))?;
 
             let metadata = Metadata {
                 object_type: ObjectType::from_cache_object_type(dir_entry.object_type)?,
