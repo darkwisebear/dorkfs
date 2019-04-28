@@ -134,6 +134,15 @@ impl<O: Debug> PathDispatcher<O> {
     }
 }
 
+impl<'a, O: Debug> IntoIterator for &'a PathDispatcher<O> {
+    type Item = <Iter<'a, O> as Iterator>::Item;
+    type IntoIter = Iter<'a, O>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

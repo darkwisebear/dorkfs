@@ -661,7 +661,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
 
     fn iter_directory<T,F,G>(&self,
                              overlay_path: &OverlayPath,
-                             from_directory_entry: F,
+                             mut from_directory_entry: F,
                              mut from_dir_entry: G) -> Result<HashSet<T>>
         where T: Eq+Hash,
               F: FnMut(DirectoryEntry) -> Result<T>,
@@ -672,7 +672,7 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
                 debug!("Reading dir {} with ref {} from cache", overlay_path.overlay_path().display(), &cache_dir_ref);
                 let dir = self.cache.get(&cache_dir_ref)?
                     .into_directory()?;
-                dir.into_iter().map(from_directory_entry).collect()
+                dir.into_iter().map(&mut from_directory_entry).collect()
             } else {
                 debug!("Directory \"{}\" not existing in cache",
                        overlay_path.overlay_path().display());
@@ -692,6 +692,46 @@ impl<C: CacheLayer+Debug> FilesystemOverlay<C> {
             }
         } else {
             debug!("...but path doesn't exist");
+        }
+
+        // Now check for changed submodules
+        for (overlay, subpath) in &self.submodules {
+            let parent = match subpath.parent() {
+                Some(parent) => parent,
+                None => {
+                    warn!("Unable to get parent directory of submodule {}. Skipping.",
+                          subpath.display());
+                    continue;
+                }
+            };
+
+            // If the submodule is located in this directory
+            if parent == overlay_path.overlay_path() {
+                let submodule_head_ref = match overlay.get_current_head_ref()? {
+                    Some(cache_ref) => cache_ref,
+                    None => {
+                        info!("Submodule {} doesn't have a commit yet. Skipping.", subpath.display());
+                        continue;
+                    }
+                };
+
+                let gitlink_name = match subpath.file_name() {
+                    Some(filename) => filename,
+                    None => {
+                        warn!("Unable to get directory name of submodule {}. Skipping.",
+                              subpath.display());
+                        continue;
+                    }
+                };
+
+                let directory_entry = DirectoryEntry {
+                    name: os_string_to_string(gitlink_name.to_os_string())?,
+                    cache_ref: submodule_head_ref,
+                    object_type: cache::ObjectType::Commit,
+                    size: 0
+                };
+                dir_entries.replace(from_directory_entry(directory_entry)?);
+            }
         }
 
         Ok(dir_entries)
