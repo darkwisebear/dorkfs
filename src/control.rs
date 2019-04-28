@@ -375,8 +375,19 @@ impl SpecialFileOps for HeadFileOps {
 
     fn close<O>(&self, control_dir: &mut O, _buffer: &[u8]) -> Result<()>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
-        control_dir.update_head()
-            .map(|cache_ref| info!("Updating workspace to {}", cache_ref))
+        match control_dir.update_head() {
+            Ok(cache_ref) => {
+                info!("Updating workspace to {}", cache_ref);
+                Ok(())
+            }
+
+            Err(Error::DetachedHead) => {
+                info!("HEAD detached, not updating");
+                Ok(())
+            }
+
+            Err(e) => Err(e)
+        }
     }
 }
 
