@@ -952,9 +952,16 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
                 if ioerr.kind() == io::ErrorKind::NotFound {
                     let mut whiteout_path = abs_fs_path.to_owned();
                     whiteout_path.set_extension("d");
-                    if whiteout_path.exists() {
-                        Err(format_err!("File was deleted in the workspace").into())
+                    let whiteout_exists = whiteout_path.exists();
+
+                    if whiteout_exists && !writable {
+                        info!("File was deleted in the workspace");
+                        Err(Error::FileNotFound)
                     } else {
+                        if whiteout_exists {
+                            fs::remove_file(whiteout_path)?;
+                        }
+
                         self.open_cache_file(writable, abs_fs_path, cache_path)
                             .map_err(Into::into)
                     }
@@ -1600,6 +1607,31 @@ mod test {
         overlay.revert_file("a/dir").unwrap();
         assert!(overlay.dir("a") == &["dir"]);
         assert!(overlay.dir("a/dir") == &["test.txt"]);
+    }
+
+    #[test]
+    fn rewrite_deleted_file() {
+        crate::init_logging();
+
+        let tempdir = tempdir().expect("Unable to create temporary dir!");
+        let mut overlay = open_working_copy(tempdir.path());
+
+        overlay.ensure_directory(Path::new("a/dir")).expect("Unable to create dir");
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
+            .expect("Unable to create file");
+        write!(test_file, "What a test!").expect("Couldn't write to test file");
+        drop(test_file);
+
+        overlay.commit("Create file in subdir").unwrap();
+
+        overlay.delete_file(Path::new("a/dir/test.txt"))
+            .expect("Unable to delete file");
+
+        let mut test_file = overlay.open_file(Path::new("a/dir/test.txt"), true)
+            .expect("Unable to create file");
+        write!(test_file, "Totally different content!")
+            .expect("Couldn't write to test file after delete");
+        drop(test_file);
     }
 
     #[test]
