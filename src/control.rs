@@ -750,6 +750,31 @@ mod test {
     }
 
     #[test]
+    fn revert_nonexistent_file() {
+        crate::init_logging();
+
+        let dir = tempdir().expect("Unable to create temp test directory");
+        let working_copy = open_working_copy(&dir);
+        let mut control_overlay = super::ControlDir::new(working_copy);
+
+        let mut file1 =
+            control_overlay.open_file("file1.txt", true)
+                .expect("Unable to open test file");
+        file1.write(b"Test 1")
+            .expect("Unable to write to test file");
+        drop(file1);
+        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+
+        let mut revert_file =
+            control_overlay.open_file(".dork/revert", true)
+                .expect("Unable to open revert file");
+        revert_file.write_all(b"file2.txt")
+            .expect("unable to write to revert file");
+        drop(revert_file);
+        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+    }
+
+    #[test]
     fn revert_directory() {
         crate::init_logging();
 

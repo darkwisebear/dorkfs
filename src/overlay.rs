@@ -1091,12 +1091,16 @@ impl<C: CacheLayer+Debug> Overlay for FilesystemOverlay<C> {
             }
         }
 
-        debug!("Remove overlay file {}", cur_path.display());
-        if cur_path.is_dir() {
-            fs::remove_dir_all(&cur_path)
+        if cur_path.exists() {
+            debug!("Remove overlay file {}", cur_path.display());
+            if cur_path.is_dir() {
+                fs::remove_dir_all(&cur_path)
+            } else {
+                fs::remove_file(&cur_path)
+            }.map_err(Error::IoError)?;
         } else {
-            fs::remove_file(&cur_path)
-        }.map_err(Error::IoError)?;
+            debug!("File {} unchanged", path.display());
+        }
 
         // Now check for all parent directories in the overlay whether they still contain files.
         // If not, we can safely remove them.
