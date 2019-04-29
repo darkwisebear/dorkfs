@@ -135,7 +135,7 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .takes_value(true)
             .required(true)
             .help("Connection specification to the root repository. For GitHub this string has \
-            the following form: github+<GitHub API URL>/<org>/<repo>"))
+            the following form: github+<GitHub URL>/<org>/<repo>"))
         .arg(Arg::with_name("uid")
             .takes_value(true)
             .long("uid")
