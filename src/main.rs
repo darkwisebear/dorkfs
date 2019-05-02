@@ -46,6 +46,7 @@ use std::borrow::Cow;
 use std::ffi::CString;
 
 use failure::Fallible;
+use clap::ArgMatches;
 
 use crate::hashfilecache::HashFileCache;
 use crate::overlay::{WorkspaceController, FilesystemOverlay};
@@ -122,7 +123,7 @@ fn resolve_gid(gid: Option<&str>) -> Fallible<u32> {
 fn parse_arguments() -> clap::ArgMatches<'static> {
     use clap::{App, Arg};
 
-    App::new("dorkfs")
+    let mount = App::new("mount")
         .arg(Arg::with_name("cachedir")
             .takes_value(true)
             .required(true)
@@ -153,8 +154,12 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .takes_value(true)
             .long("branch")
             .short("b")
-            .help("Remote branch that shall be tracked instead of the default branch"))
-        .get_matches()
+            .help("Remote branch that shall be tracked instead of the default branch"));
+
+    let dorkfs = App::new("dorkfs")
+        .subcommand(mount);
+
+    dorkfs.get_matches()
 }
 
 #[cfg(target_os = "linux")]
@@ -230,10 +235,7 @@ pub fn init_logging() {
     INIT_LOGGING.call_once(env_logger::init);
 }
 
-fn main() {
-    init_logging();
-
-    let args = parse_arguments();
+fn mount(args: &ArgMatches) {
     let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
     let rootrepo = args.value_of("rootrepo").expect("No root URL given");
     let branch = args.value_of("branch");
@@ -253,5 +255,15 @@ fn main() {
             .expect("Cannot parse GID");
 
         mount_fuse(mountpoint, fs, uid, gid, umask);
+    }
+}
+
+fn main() {
+    init_logging();
+
+    let args = parse_arguments();
+    match args.subcommand() {
+        ("mount", Some(subargs)) => mount(subargs),
+        _ => print!("{}", args.usage())
     }
 }
