@@ -134,6 +134,7 @@ pub struct HashFileCache<C: CacheLayer+Debug> {
 impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
     type File = HashFile;
     type Directory = HashDirectory;
+    type GetFuture = Result<CacheObject<HashFile, HashDirectory>>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         match self.open_object_file(cache_ref)
@@ -208,6 +209,10 @@ impl<C: CacheLayer+Debug> CacheLayer for HashFileCache<C> {
 
     fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()> {
         self.cache.create_branch(branch, cache_ref)
+    }
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
+        self.get(cache_ref)
     }
 }
 

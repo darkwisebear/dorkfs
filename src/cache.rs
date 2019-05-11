@@ -17,6 +17,7 @@ use failure::{Fail, Error};
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
 use chrono::{DateTime, FixedOffset};
+use futures::IntoFuture;
 
 pub trait LayerError: Fail {}
 
@@ -372,6 +373,7 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
 pub trait CacheLayer: Debug {
     type File: ReadonlyFile+Debug;
     type Directory: Directory+Debug;
+    type GetFuture: IntoFuture<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef>;
@@ -381,6 +383,8 @@ pub trait CacheLayer: Debug {
     fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>>;
     fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef>;
     fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()>;
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture;
 }
 
 pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)

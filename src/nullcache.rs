@@ -91,6 +91,7 @@ pub struct NullCache {
 impl CacheLayer for NullCache {
     type File = NullFile;
     type Directory = NullDirectory;
+    type GetFuture = cache::Result<CacheObject<NullFile, NullDirectory>>;
 
     fn get(&self, cache_ref: &CacheRef) -> cache::Result<CacheObject<Self::File, Self::Directory>> {
         Err(CacheError::ObjectNotFound(cache_ref.clone()))
@@ -140,5 +141,9 @@ impl CacheLayer for NullCache {
 
     fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<(), CacheError> {
         self.merge_commit(branch, cache_ref).map(|_| ())
+    }
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
+        self.get(cache_ref)
     }
 }

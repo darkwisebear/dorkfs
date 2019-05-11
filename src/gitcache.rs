@@ -130,6 +130,7 @@ impl GitCache {
 impl CacheLayer for GitCache {
     type File = File;
     type Directory = Vec<DirectoryEntry>;
+    type GetFuture = Result<CacheObject<File, Vec<DirectoryEntry>>>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let gitobj =
@@ -256,5 +257,9 @@ impl CacheLayer for GitCache {
                             format!("Create reference {}", branch.as_ref()).as_str())
             .map_err(|e| GitLayerError::GitError(e).into())
             .map(|_| ())
+    }
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
+        self.get(cache_ref)
     }
 }
