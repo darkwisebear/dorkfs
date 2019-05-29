@@ -43,6 +43,59 @@ mod github;
 #[cfg(test)]
 mod nullcache;
 
+mod tokio_runtime {
+    use std::{
+        sync::{
+            mpsc::channel,
+            Mutex,
+            Weak,
+            Arc
+        },
+        time::Duration
+    };
+
+    use tokio::{
+        prelude::*,
+        runtime::Runtime,
+        timer::timeout::Error as TimeoutError
+    };
+
+    lazy_static! {
+        static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
+    }
+
+    pub fn get() -> Arc<Runtime> {
+        let mut runtime = TOKIO_RUNTIME.lock().unwrap();
+        match runtime.upgrade() {
+            Some(tokio) => tokio,
+            None => {
+                let new_runtime = Runtime::new().expect("Unable to instantiate tokio runtime");
+                let new_runtime = Arc::new(new_runtime);
+                *runtime = Arc::downgrade(&new_runtime);
+                new_runtime
+            }
+        }
+    }
+
+    pub fn execute<T, E, I, F>(tokio: &Runtime, request_future: I, timeout: Duration)
+        -> Result<T, TimeoutError<E>>
+        where T: Send+'static,
+              E: Send+'static,
+              I: IntoFuture<Future=F, Item=T, Error=E>+Send+'static,
+              F: Future<Item=T, Error=E>+Send+'static {
+        let (send, recv) = channel();
+
+        let finalizing_future = request_future
+            .into_future()
+            .timeout(timeout)
+            .then(move |r| send.send(r)
+                .map_err(|_| unreachable!("Unexpected send error during GitHub request")));
+
+        tokio.executor().spawn(finalizing_future);
+        recv.recv().expect("Unexpected receive error during GitHub request")
+    }
+}
+
 use std::path::Path;
 use std::str::FromStr;
 use std::fmt::Debug;

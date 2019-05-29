@@ -9,6 +9,7 @@ use std::str::{self, FromStr};
 use std::collections::HashMap;
 use std::default::Default;
 use std::borrow::Cow;
+use std::time::Duration;
 
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
@@ -25,10 +26,7 @@ use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, 
                    CacheLayer, LayerError, Commit};
 use crate::utility::{RepoUrl, gitmodules::GitModules};
 use crate::overlay::FSOverlayFile::CacheFile;
-
-lazy_static! {
-    static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
-}
+use crate::tokio_runtime;
 
 pub fn initialize_github_submodules<R: Read>(file: R,
                                        apiurl: &str,
@@ -219,7 +217,7 @@ impl GithubRequestBuilder {
         self.issue_request(request_builder, Body::from(query))
     }
 
-    pub fn get_blob_data(&self, cache_ref: &CacheRef) -> impl Future<Item=Vec<u8>, Error=Error> {
+    fn get_blob_data(&self, cache_ref: &CacheRef) -> impl Future<Item=Vec<u8>, Error=Error> {
         let path = format!("{base}/repos/{org}/{repo}/git/blobs/{sha}",
                            base = self.0.rest_base_uri,
                            org = self.0.org,
@@ -587,7 +585,7 @@ impl CacheLayer for Github {
     type File = GithubBlob;
     type Directory = GithubTree;
     // Replace with existential type once https://github.com/rust-lang/rfcs/pull/2515 lands.
-    type GetFuture = Box<Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>>;
+    type GetFuture = Box<Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send+'static>;
 
     fn get(&self, cache_ref: &CacheRef)
            -> cache::Result<CacheObject<Self::File, Self::Directory>> {
@@ -650,18 +648,6 @@ impl CacheLayer for Github {
 impl Github {
     pub fn new(base_url: &str, org: &str, repo: &str, token: &str)
                -> Result<Self, Error> {
-        let tokio = {
-            let mut runtime = TOKIO_RUNTIME.lock().unwrap();
-            match runtime.upgrade() {
-                Some(tokio) => tokio,
-                None => {
-                    let t = Arc::new(Runtime::new()?);
-                    *runtime = Arc::downgrade(&t);
-                    t
-                }
-            }
-        };
-
         let http_client =
             Client::builder().build(HttpsConnector::new(4)?);
 
@@ -693,7 +679,7 @@ impl Github {
         };
 
         Ok(Github {
-            tokio,
+            tokio: tokio_runtime::get(),
             request_builder: GithubRequestBuilder(Arc::new(request_builder)),
             object_cache: Default::default()
         })
@@ -755,22 +741,15 @@ impl Github {
 
     fn execute_request<T, E, F>(&self, request_future: F) -> cache::Result<T>
         where T: Send+'static,
-              E: Into<CacheError>+'static,
+              E: Into<CacheError>+Send+'static,
               F: Future<Item=T, Error=E>+Send+'static {
-        let (send, recv) = channel();
-
-        let finalizing_future = request_future
-            .map_err(Into::into)
-            .timeout(::std::time::Duration::from_secs(60))
-            .then(move |r|
-                send.send(r.map_err(|e|
-                    e.into_inner().unwrap_or(CacheError::from(Error::TimeoutError))))
-                    .map_err(|_|
-                        unreachable!("Unexpected send error during GitHub request")));
-
-        self.tokio.executor().spawn(finalizing_future);
-        recv.recv().expect("Unexpected receive error during GitHub request")
-            .map_err(Into::into)
+        tokio_runtime::execute(self.tokio.as_ref(), request_future, Duration::from_secs(60))
+            .map_err(|e|
+                if let Some(inner_err) = e.into_inner() {
+                    inner_err.into()
+                } else {
+                    CacheError::from(Error::TimeoutError)
+                })
     }
 
     fn get_ref_info(&self, branch: Option<&str>) -> Result<Option<(String, CacheRef)>, CacheError> {

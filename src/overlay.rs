@@ -261,7 +261,7 @@ pub trait DebuggableOverlayFile: OverlayFile+Debug {}
 pub type BoxedOverlayFile = Box<dyn DebuggableOverlayFile+Send+Sync>;
 pub type BoxedDirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
-pub type BoxedRepository = Box<for<'a> Repository<'a,
+pub type BoxedRepository = Box<dyn for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
     File=BoxedOverlayFile,
