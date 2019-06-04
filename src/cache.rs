@@ -387,10 +387,12 @@ pub trait CacheLayer: Debug {
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture;
 }
 
-pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
+pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P)
     -> result::Result<Option<CacheRef>, Error>
     where C: CacheLayer+?Sized,
+          T: ::std::ops::Deref<Target=C>,
           P: AsRef<Path> {
+    let cache = cache.deref();
     let mut objs = vec![commit.tree];
     let path = path.as_ref();
 

@@ -243,10 +243,12 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
                                 cachedir: P,
                                 workspace_dir: Q,
                                 fs: &mut FilesystemOverlay<C>) -> Fallible<()>
-    where R: Read, P: AsRef<Path>, Q: AsRef<Path>, C: CacheLayer {
+    where R: Read, P: AsRef<Path>, Q: AsRef<Path>, C: CacheLayer+'static {
     let head_commit = match fs.get_current_head_ref()? {
-        Some(head_commit) =>
-            get_commit(fs.get_cache(), &head_commit)?,
+        Some(head_commit) => {
+            let cache = fs.get_cache();
+            get_commit(&*cache, &head_commit)?
+        }
         None => return Ok(()),
     };
 

@@ -651,6 +651,7 @@ impl<'a, T> Iterator for ControlDirStatusIter<'a, T>
 impl<'a, T> WorkspaceController<'a> for ControlDir<T>
     where for<'b> T: Overlay+WorkspaceController<'b>+'a {
     type Log = ControlDirLog<'a, T>;
+    type LogStream = <T as WorkspaceController<'a>>::LogStream;
     type StatusIter = ControlDirStatusIter<'a, T>;
 
     fn commit(&mut self, message: &str) -> overlay::Result<CacheRef> {
@@ -677,6 +678,10 @@ impl<'a, T> WorkspaceController<'a> for ControlDir<T>
     fn get_log(&'a self, start_commit: &CacheRef) -> overlay::Result<Self::Log> {
         let read_guard = self.overlay.read().unwrap();
         ControlDirLog::new(RwLockReadGuardRef::new(read_guard), start_commit)
+    }
+
+    fn get_log_stream(&self, start_commit: CacheRef) -> Self::LogStream {
+        self.overlay.read().unwrap().get_log_stream(start_commit)
     }
 
     fn get_status(&'a self) -> overlay::Result<Self::StatusIter> {
