@@ -547,7 +547,7 @@ impl WorkspaceHead {
 
 #[derive(Debug)]
 pub struct FilesystemOverlay<C: CacheLayer> {
-    cache: Arc<RwLock<C>>,
+    cache: Arc<C>,
     head: WorkspaceHead,
     overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
     base_path: PathBuf,
@@ -591,7 +591,7 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
         };
 
         let mut fs = FilesystemOverlay {
-            cache: Arc::new(RwLock::new(cache)),
+            cache: Arc::new(cache),
             head,
             overlay_files: HashMap::new(),
             base_path: base_path.into_owned(),
@@ -610,12 +610,11 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
     }
 
     fn resolve_object_ref<P: AsRef<Path>>(&self, path: P) -> Result<Option<CacheRef>> {
-        let cache = self.cache.read().unwrap();
         match self.head.get_ref() {
             Some(head) => {
-                let commit = cache.get(&head)?.into_commit()
+                let commit = self.cache.get(&head)?.into_commit()
                     .expect("Head ref is not a commit");
-                cache::resolve_object_ref(cache, &commit, path)
+                cache::resolve_object_ref(self.cache.as_ref(), &commit, path)
                     .map_err(Error::Generic)
             }
 
@@ -640,7 +639,7 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
                 let cache_ref = self.generate_tree(&overlay_path)?;
                 (cache_ref, cache::ObjectType::Directory)
             } else if file_type.is_file() {
-                let cache_ref = self.cache.read().unwrap().add_file_by_path(&dir_entry.path())?;
+                let cache_ref = self.cache.add_file_by_path(&dir_entry.path())?;
                 (cache_ref, cache::ObjectType::File)
             } else {
                 unimplemented!("TODO: Implement tree generation for further file types, e.g. links!");
@@ -683,7 +682,7 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
         let dir_entries_result: Result<HashSet<T>> =
             if let Some(cache_dir_ref) = self.resolve_object_ref(overlay_path.overlay_path())? {
                 debug!("Reading dir {} with ref {} from cache", overlay_path.overlay_path().display(), &cache_dir_ref);
-                let dir = self.cache.read().unwrap().get(&cache_dir_ref)?
+                let dir = self.cache.get(&cache_dir_ref)?
                     .into_directory()?;
                 dir.into_iter().map(&mut from_directory_entry).collect()
             } else {
@@ -788,7 +787,7 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
             |e|
                 self.dir_entry_to_directory_entry(&e, overlay_path.clone()))?.into_iter();
 
-        self.cache.read().unwrap().add_directory(&mut directory as &mut Iterator<Item=DirectoryEntry>)
+        self.cache.add_directory(&mut directory as &mut Iterator<Item=DirectoryEntry>)
             .map_err(Into::into)
     }
 
@@ -839,7 +838,7 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
         debug!("Opening cache ref {:?}", cache_ref);
 
         let cache_file = if let Some(existing_ref) = cache_ref {
-            let cache_object = self.cache.read().unwrap().get(&existing_ref)?;
+            let cache_object = self.cache.get(&existing_ref)?;
             Some(cache_object.into_file()?)
         } else {
             None
@@ -880,17 +879,12 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
     }
 
     pub fn get_cache<'a>(&'a self) -> impl Deref<Target=C>+'a {
-        self.cache.read().unwrap()
-    }
-
-    #[cfg(test)]
-    pub fn get_cache_mut<'a>(&'a mut self) -> impl DerefMut<Target=C>+'a {
-        self.cache.write().unwrap()
+        self.cache.as_ref()
     }
 
     fn get_head_commit(&self) -> Result<Option<Commit>> {
         self.head.cache_ref
-            .map(|head_ref| self.cache.read().unwrap().get(&head_ref)
+            .map(|head_ref| self.cache.get(&head_ref)
                 .and_then(CacheObject::into_commit)
                 .map_err(Error::CacheError))
             .transpose()
@@ -941,7 +935,7 @@ impl<C: CacheLayer, T: Deref<Target=C>> Iterator for CacheLayerLog<C, T> {
 }
 
 pub struct CacheLayerLogStream<C> where C: CacheLayer {
-    cache: Arc<RwLock<C>>,
+    cache: Arc<C>,
     current_poll: (CacheRef, <<C as CacheLayer>::GetFuture as IntoFuture>::Future)
 }
 
@@ -955,10 +949,8 @@ impl<C> Debug for CacheLayerLogStream<C> where C: CacheLayer {
 }
 
 impl<C> CacheLayerLogStream<C> where C: CacheLayer {
-    fn new(start_commit: CacheRef, cache: Arc<RwLock<C>>) -> Self {
-        let curr_poll = cache.read().unwrap()
-            .get_poll(&start_commit)
-            .into_future();
+    fn new(start_commit: CacheRef, cache: Arc<C>) -> Self {
+        let curr_poll = cache.get_poll(&start_commit).into_future();
         Self {
             cache,
             current_poll: (start_commit, curr_poll)
@@ -985,9 +977,7 @@ impl<C> stream::Stream for CacheLayerLogStream<C> where C: CacheLayer {
                             warn!("Non-linear history not supported yet!");
                         }
 
-                        *cur_poll = self.cache.read().unwrap()
-                        .get_poll(&commit.parents[0])
-                        .into_future();
+                        *cur_poll = self.cache.get_poll(&commit.parents[0]).into_future();
                         replace(cur_ref, commit.parents[0])
                     } else {
                         *cur_ref = CacheRef::null();
@@ -1007,7 +997,7 @@ impl<C> stream::Stream for CacheLayerLogStream<C> where C: CacheLayer {
 
 impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
     where C: CacheLayer+'static {
-    type Log = CacheLayerLog<C, sync::RwLockReadGuard<'a, C>>;
+    type Log = CacheLayerLog<C, &'a C>;
     type LogStream = CacheLayerLogStream<C>;
     type StatusIter = iter::Chain<FSStatusIter<'a, C>, BoxedRepoDispatcherIter<'a, C>>;
 
@@ -1035,10 +1025,10 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
         };
 
         // Commit
-        let new_commit_ref = self.cache.read().unwrap().add_commit(commit)
+        let new_commit_ref = self.cache.add_commit(commit)
             .and_then(|cache_ref| match self.branch {
                 Some(ref branch_name) =>
-                    self.cache.write().unwrap().merge_commit(branch_name, &cache_ref),
+                    self.cache.merge_commit(branch_name, &cache_ref),
                 None => Ok(cache_ref)
             })?;
 
@@ -1052,7 +1042,7 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
             debug!("Updating file {}", path.display());
             self.resolve_object_ref(path)
                 .and_then(|cache_ref| match cache_ref {
-                    Some(cache_ref) => self.cache.read().unwrap().get(&cache_ref)
+                    Some(cache_ref) => self.cache.get(&cache_ref)
                         .and_then(CacheObject::into_file)
                         .map_err(Error::CacheError)
                         .and_then(|mut cache_file| {
@@ -1097,7 +1087,7 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
         -> Result<()> {
         let base_ref = match repo_ref {
             Some(RepoRef::CacheRef(cache_ref)) => cache_ref,
-            Some(RepoRef::Branch(branch)) => self.cache.read().unwrap().get_head_commit(branch)
+            Some(RepoRef::Branch(branch)) => self.cache.get_head_commit(branch)
                 .map_err(Error::CacheError)
                 .and_then(|cache_ref|
                     cache_ref.ok_or_else(|| format_err!("Branch {} doesn't exsit", branch).into()))?,
@@ -1105,12 +1095,12 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
                 .ok_or_else(|| Error::Generic(format_err!("No HEAD in current workspace set")))?,
         };
 
-        self.cache.write().unwrap().create_branch(new_branch, &base_ref)
+        self.cache.create_branch(new_branch, &base_ref)
             .map_err(Into::into)
     }
 
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log> {
-        CacheLayerLog::new(self.cache.read().unwrap(), start_commit)
+        CacheLayerLog::new(&self.cache, start_commit)
     }
 
     fn get_log_stream(&self, start_commit: CacheRef) -> Self::LogStream {
@@ -1130,7 +1120,7 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
 
         self.branch.as_ref().ok_or(Error::DetachedHead)
             .and_then(|branch|
-                self.cache.read().unwrap().get_head_commit(branch.as_str())
+                self.cache.get_head_commit(branch.as_str())
                     .map_err(Into::into))
             .and_then(|cache_ref|
                 cache_ref.ok_or_else(|| Error::MissingHeadRef(self.branch.clone().unwrap())))
@@ -1396,7 +1386,7 @@ impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
             let dir_entry = self.resolve_object_ref(parent_dir)
                 .and_then(|cache_ref|
                     cache_ref.ok_or_else(|| format_err!("Parent directory not found!").into()))
-                .and_then(|cache_ref| self.cache.read().unwrap().get(&cache_ref)
+                .and_then(|cache_ref| self.cache.get(&cache_ref)
                     .and_then(|obj| obj.into_directory())
                     .map_err(Error::from))
                 .and_then(|dir|

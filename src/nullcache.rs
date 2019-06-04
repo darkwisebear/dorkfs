@@ -6,7 +6,8 @@ use std::{
     fs::File,
     collections::HashMap,
     borrow::Borrow,
-    ffi::OsStr
+    ffi::OsStr,
+    sync::Mutex
 };
 
 use tiny_keccak::Keccak;
@@ -85,7 +86,7 @@ pub type NullDirectory = Vec<DirectoryEntry>;
 
 #[derive(Debug, Default)]
 pub struct NullCache {
-    branches: HashMap<String, CacheRef>
+    branches: Mutex<HashMap<String, CacheRef>>
 }
 
 impl CacheLayer for NullCache {
@@ -131,15 +132,15 @@ impl CacheLayer for NullCache {
     }
 
     fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>, CacheError> {
-        Ok(self.branches.get(branch.as_ref()).cloned())
+        Ok(self.branches.lock().unwrap().get(branch.as_ref()).cloned())
     }
 
-    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef, CacheError> {
-        self.branches.insert(branch.as_ref().to_string(), *cache_ref);
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef, CacheError> {
+        self.branches.lock().unwrap().insert(branch.as_ref().to_string(), *cache_ref);
         Ok(*cache_ref)
     }
 
-    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<(), CacheError> {
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<(), CacheError> {
         self.merge_commit(branch, cache_ref).map(|_| ())
     }
 

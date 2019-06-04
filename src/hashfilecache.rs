@@ -338,11 +338,11 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer+Debug,
         self.cache.get_head_commit(branch)
     }
 
-    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
         self.cache.merge_commit(branch, cache_ref)
     }
 
-    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()> {
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<()> {
         self.cache.create_branch(branch, cache_ref)
     }
 

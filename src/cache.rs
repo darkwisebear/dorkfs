@@ -381,8 +381,8 @@ pub trait CacheLayer: Debug {
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
 
     fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>>;
-    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef>;
-    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()>;
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef>;
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<()>;
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture;
 }

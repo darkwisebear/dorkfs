@@ -624,14 +624,14 @@ impl CacheLayer for Github {
                 ref_info_result.map(|(_, cache_ref)| cache_ref))
     }
 
-    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> cache::Result<CacheRef> {
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> cache::Result<CacheRef> {
         let update_branch_future =
             self.request_builder.update_branch_head(branch.as_ref(), *cache_ref)
                 .map_err(CacheError::from);
         self.execute_request(update_branch_future)
     }
 
-    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> cache::Result<()> {
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> cache::Result<()> {
         let create_git_ref_future =
             self.request_builder.create_git_ref(branch.as_ref(), *cache_ref)
                 .map_err(CacheError::from);

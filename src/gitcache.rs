@@ -215,7 +215,7 @@ impl CacheLayer for GitCache {
         }
     }
 
-    fn merge_commit<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
         let reference = self.get_branch_oid(branch.as_ref());
         match reference {
             Ok(reference) => self.repo.find_commit(reference),
@@ -251,7 +251,7 @@ impl CacheLayer for GitCache {
         .map_err(|e| GitLayerError::GitError(e).into())
     }
 
-    fn create_branch<S: AsRef<str>>(&mut self, branch: S, cache_ref: &CacheRef) -> Result<()> {
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<()> {
         self.repo.reference(Self::branch_to_ref(branch.as_ref()).as_str(),
                             Self::cache_ref_to_oid(cache_ref), false,
                             format!("Create reference {}", branch.as_ref()).as_str())
