@@ -506,10 +506,19 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
         special_files.insert_buffered("revert", RevertFileOps);
         special_files.insert_buffered("HEAD", HeadFileOps);
 
-        let (reader, task) = crate::utility::collect_strings(overlay.get_log_stream(unimplemented!()));
-        let tokio = crate::tokio_runtime::get();
-        tokio.executor().spawn(task);
-        special_files.insert("log", LogFileFactory { reader });
+        match overlay.get_current_head_ref() {
+            Ok(Some(start_commit)) => {
+                let (reader, task) =
+                    crate::utility::collect_strings(overlay.get_log_stream(start_commit));
+                let tokio = crate::tokio_runtime::get();
+                tokio.executor().spawn(task);
+                special_files.insert("log", LogFileFactory { reader });
+            }
+
+            Ok(None) => info!("Not creating log due to missing HEAD"),
+
+            Err(e) => warn!("Not creating log file due to error during HEAD retrieval: {}", e)
+        }
 
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
