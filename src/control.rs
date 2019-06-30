@@ -1,22 +1,24 @@
 use std::path::Path;
 use std::io::{self, Read, Write, Seek, SeekFrom, Cursor};
-use std::iter::FromIterator;
+use std::iter::{self, FromIterator};
 use std::fmt::{self, Debug, Formatter};
 use std::collections::{hash_map, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 use std::str;
 use std::borrow::Cow;
+use std::vec;
 
 use chrono;
 use owning_ref::{RwLockReadGuardRef, OwningHandle};
 
 use crate::{
-    types::*,
-    overlay::{self, *},
-    cache::CacheRef
+    types::{Metadata, ObjectType, RepoRef},
+    utility::{SharedBuffer, SharedBufferReader},
+    overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
+              WorkspaceFileStatus, FileState, OverlayDirEntry, WorkspaceLog, Repository},
+    cache::{CacheRef, ReferencedCommit}
 };
-use crate::cache::ReferencedCommit;
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
 
@@ -41,7 +43,7 @@ pub trait ControlOverlayFile: OverlayFile {
     ///
     /// # Panics
     /// This method shall not panic as it will be called inside a Drop implementation.
-    fn close(&mut self) -> Result<()>;
+    fn close(&mut self) -> overlay::Result<()>;
 }
 
 pub struct DynamicOverlayFileWrapper(Box<dyn ControlOverlayFile+Send+Sync>);
@@ -140,6 +142,64 @@ pub trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceCont
     fn get_file<'a, 'b>(&'a self, _control_dir: &'b ControlDir<O>)
         -> overlay::Result<Box<dyn ControlOverlayFile+Send+Sync>> {
         Err(format_err!("This special file type cannot be accessed like a normal file").into())
+    }
+}
+
+#[derive(Debug)]
+struct LogFileFactory {
+    reader: SharedBufferReader
+}
+
+impl<O> SpecialFile<O> for LogFileFactory where for<'a> O: Overlay+WorkspaceController<'a> {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
+        Ok(Metadata {
+            object_type: ObjectType::File,
+            modified_date: chrono::Utc::now(),
+            size: self.reader.len() as u64
+        })
+    }
+
+    fn get_file<'a, 'b>(&'a self, _control_dir: &'b ControlDir<O>)
+                        -> overlay::Result<Box<dyn ControlOverlayFile+Send+Sync>> {
+        Ok(Box::new(LogStreamFile(self.reader.clone())) as _)
+    }
+}
+
+static NO_LOG_STRING: &[u8] = b"(empty log)";
+
+struct LogStreamFile(SharedBufferReader);
+
+impl Read for LogStreamFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for LogStreamFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+impl Seek for LogStreamFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl OverlayFile for LogStreamFile {
+    fn truncate(&mut self, size: u64) -> overlay::Result<()> {
+        Err(overlay::Error::from(io::Error::from(io::ErrorKind::PermissionDenied)))
+    }
+}
+
+impl ControlOverlayFile for LogStreamFile {
+    fn close(&mut self) -> overlay::Result<()> {
+        Ok(())
     }
 }
 
@@ -375,7 +435,7 @@ impl SpecialFileOps for RevertFileOps {
 struct HeadFileOps;
 
 impl SpecialFileOps for HeadFileOps {
-    fn init<O>(&self, control_dir: &O) -> Result<Vec<u8>>
+    fn init<O>(&self, control_dir: &O) -> overlay::Result<Vec<u8>>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         control_dir.get_current_head_ref()
             .map(|cache_ref|
@@ -384,7 +444,7 @@ impl SpecialFileOps for HeadFileOps {
                     .unwrap_or_else(|| b"(no HEAD)".to_vec()))
     }
 
-    fn close<O>(&self, control_dir: &mut O, _buffer: &[u8]) -> Result<()>
+    fn close<O>(&self, control_dir: &mut O, _buffer: &[u8]) -> overlay::Result<()>
         where for<'o> O: Overlay + WorkspaceController<'o> + Send + Sync + 'static {
         match control_dir.update_head() {
             Ok(cache_ref) => {
@@ -392,7 +452,7 @@ impl SpecialFileOps for HeadFileOps {
                 Ok(())
             }
 
-            Err(Error::DetachedHead) => {
+            Err(overlay::Error::DetachedHead) => {
                 info!("HEAD detached, not updating");
                 Ok(())
             }
@@ -411,9 +471,13 @@ impl<O> SpecialFileRegistry<O> where for<'a> O: Overlay+WorkspaceController<'a>+
         SpecialFileRegistry(HashMap::new())
     }
 
+    fn insert<S>(&mut self, name: &'static str, file: S) where S: SpecialFile<O>+'static {
+        self.0.insert(name, Box::new(file) as _);
+    }
+
     fn insert_buffered<T>(&mut self, name: &'static str, ops: T)
         where T: SpecialFileOps+Send+Sync+'static {
-        self.0.insert(name, Box::new(BufferedFileFactory::new(ops)) as _);
+        self.insert(name, BufferedFileFactory::new(ops));
     }
 
     fn get(&self, name: &str) -> Option<&dyn SpecialFile<O>> {
@@ -441,6 +505,12 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
         special_files.insert_buffered("create_branch", CreateBranchFileOps);
         special_files.insert_buffered("revert", RevertFileOps);
         special_files.insert_buffered("HEAD", HeadFileOps);
+
+        let (reader, task) = crate::utility::collect_strings(overlay.get_log_stream(unimplemented!()));
+        let tokio = crate::tokio_runtime::get();
+        tokio.executor().spawn(task);
+        special_files.insert("log", LogFileFactory { reader });
+
         ControlDir {
             overlay: Arc::new(RwLock::new(overlay)),
             special_files
@@ -459,12 +529,12 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
 
 pub enum ControlDirIter<O: Overlay> {
     OverlayDirIter(O::DirIter),
-    RootDirIter(::std::iter::Chain<O::DirIter, ::std::vec::IntoIter<Result<OverlayDirEntry>>>),
-    DorkfsDirIter(::std::vec::IntoIter<Result<OverlayDirEntry>>)
+    RootDirIter(iter::Chain<O::DirIter, vec::IntoIter<overlay::Result<OverlayDirEntry>>>),
+    DorkfsDirIter(vec::IntoIter<overlay::Result<OverlayDirEntry>>)
 }
 
 impl<O: Overlay> Iterator for ControlDirIter<O> {
-    type Item = Result<OverlayDirEntry>;
+    type Item = overlay::Result<OverlayDirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match *self {
@@ -502,7 +572,7 @@ impl<O> Overlay for ControlDir<O>
         }
     }
 
-    fn list_directory(&self, path: &Path) -> Result<Self::DirIter> {
+    fn list_directory(&self, path: &Path) -> overlay::Result<Self::DirIter> {
         let result = match path.to_str() {
             Some("") => {
                 let root_dir = self.overlay.read().unwrap().list_directory(&path)?;
@@ -528,9 +598,10 @@ impl<O> Overlay for ControlDir<O>
         Ok(result)
     }
 
-    fn ensure_directory(&self, path: &Path) -> Result<()> {
+    fn ensure_directory(&self, path: &Path) -> overlay::Result<()> {
         if path.starts_with(DORK_DIR_ENTRY) {
-            Err(Error::Generic(failure::err_msg("Cannot create directory within .dork")))
+            Err(overlay::Error::Generic(
+                failure::err_msg("Cannot create directory within .dork")))
         } else {
             self.overlay.read().unwrap().ensure_directory(path)
         }
@@ -595,7 +666,7 @@ pub struct ControlDirLog<'a, T>(ControlDirHandle<'a, T, <T as WorkspaceControlle
     where for<'b> T: WorkspaceController<'b>;
 
 impl<'a, T> ControlDirLog<'a, T> where for<'b> T: WorkspaceController<'b> {
-    fn new(overlay: RwLockReadGuardRef<'a, T>, start_commit: &CacheRef) -> Result<Self> {
+    fn new(overlay: RwLockReadGuardRef<'a, T>, start_commit: &CacheRef) -> overlay::Result<Self> {
         OwningHandle::try_new(overlay, |o|
             unsafe {
                 (*o).get_log(start_commit).map(DerefWrapper)
@@ -606,7 +677,7 @@ impl<'a, T> ControlDirLog<'a, T> where for<'b> T: WorkspaceController<'b> {
 
 impl<'a, T> Iterator for ControlDirLog<'a, T>
     where for<'b> T: WorkspaceController<'b>+'a {
-    type Item = Result<ReferencedCommit>;
+    type Item = overlay::Result<ReferencedCommit>;
 
     fn next(&mut self) -> Option<Self::Item> {
         (self.0).0.next()
@@ -625,7 +696,7 @@ pub struct ControlDirStatusIter<'a, T>(
     where for<'b> T: WorkspaceController<'b>;
 
 impl<'a, T> ControlDirStatusIter<'a, T> where for<'b> T: WorkspaceController<'b>+'a {
-    fn new(overlay: RwLockReadGuardRef<'a, T>) -> Result<Self> {
+    fn new(overlay: RwLockReadGuardRef<'a, T>) -> overlay::Result<Self> {
         OwningHandle::try_new(overlay, |o|
             unsafe {
                 (*o).get_status().map(DerefWrapper)
@@ -637,7 +708,7 @@ impl<'a, T> ControlDirStatusIter<'a, T> where for<'b> T: WorkspaceController<'b>
 
 impl<'a, T> Iterator for ControlDirStatusIter<'a, T>
     where for<'b> T: WorkspaceController<'b>+'a {
-    type Item = Result<WorkspaceFileStatus>;
+    type Item = overlay::Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
         (self.0).0.next()

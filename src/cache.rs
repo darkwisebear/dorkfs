@@ -17,7 +17,7 @@ use failure::{Fail, Error};
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
 use chrono::{DateTime, FixedOffset};
-use futures::IntoFuture;
+use futures::Future;
 
 pub trait LayerError: Fail {}
 
@@ -315,7 +315,7 @@ pub struct ReferencedCommit(pub CacheRef, pub Commit);
 
 impl Display for ReferencedCommit {
     fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
-        write!(f, "\nCommit:    {}\n\n{}", self.0, self.1)
+        write!(f, "Commit:    {}\n\n{}\n", self.0, self.1)
     }
 }
 
@@ -370,10 +370,10 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     }
 }
 
-pub trait CacheLayer: Debug {
+pub trait CacheLayer: Debug+Send+Sync+'static {
     type File: ReadonlyFile+Debug;
     type Directory: Directory+Debug;
-    type GetFuture: IntoFuture<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>;
+    type GetFuture: Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
     fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef>;

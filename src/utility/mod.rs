@@ -3,10 +3,13 @@ mod gitconfig;
 
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::fmt::{Debug, Display};
+use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicUsize};
 use std::borrow::{Cow, Borrow};
+use std::io::{self, Read, Seek, Write, BufRead, SeekFrom, Cursor};
+use std::error;
 
+use futures::prelude::*;
 use failure::Fallible;
 
 pub fn os_string_to_string(s: OsString) -> Fallible<String> {
@@ -124,6 +127,118 @@ impl<'a> RepoUrl<'a> {
                 .ok_or_else(|| format_err!("Incomplete repo URL"))
                 .map(|path| (&repo[..pos], path)))
     }
+}
+
+pub type SyncedBuffer = Mutex<Vec<u8>>;
+
+#[derive(Default, Debug)]
+pub struct SharedBuffer {
+    buffer: Arc<SyncedBuffer>
+}
+
+impl SharedBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_content(content: Box<[u8]>) -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(Vec::from(content)))
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.lock().unwrap().len()
+    }
+
+    pub fn build_reader(&self) -> SharedBufferReader {
+        SharedBufferReader { buffer: Arc::clone(&self.buffer), pos: 0 }
+    }
+}
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_all(buf).map(|_| buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedBufferReader {
+    buffer: Arc<SyncedBuffer>,
+    pos: usize
+}
+
+impl SharedBufferReader {
+    pub fn len(&self) -> usize {
+        self.buffer.lock().unwrap().len()
+    }
+}
+
+impl Read for SharedBufferReader {
+    fn read(&mut self, dest_buf: &mut [u8]) -> io::Result<usize> {
+        let buffer = self.buffer.lock().unwrap();
+
+        let old_pos = self.pos;
+        let src_buf = &buffer[old_pos..];
+        let count = usize::min(dest_buf.len(), src_buf.len());
+
+        let src_chunk = &src_buf[..count];
+        let dest_chunk = &mut dest_buf[..count];
+
+        dest_chunk.copy_from_slice(src_chunk);
+        let new_pos = old_pos+count;
+
+        self.pos = new_pos;
+
+        Ok(count)
+    }
+}
+
+impl Seek for SharedBufferReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Start(pos) => {
+                self.pos = pos as usize;
+                Ok(pos)
+            }
+
+            SeekFrom::Current(offset) =>
+                if offset >= 0 {
+                    self.pos.checked_add(offset as usize)
+                } else {
+                    self.pos.checked_sub((-offset) as usize)
+                }.map(|val| val as u64).ok_or(io::ErrorKind::InvalidInput.into()),
+
+            SeekFrom::End(offset) =>
+                self.pos.checked_sub(offset as usize)
+                    .map(|val| val as u64)
+                    .ok_or(io::ErrorKind::InvalidInput.into())
+        }
+    }
+}
+
+pub fn collect_strings<T, E, S>(stream: S) -> (SharedBufferReader, impl Future<Item=(), Error=()>)
+    where T: ToString,
+          E: From<io::Error>+Display+Send+'static,
+          S: Stream<Item=T, Error=E>+Send+'static {
+    let mut writer = SharedBuffer::default();
+    let reader = writer.build_reader();
+
+    let folding = stream.for_each(move |item|
+        writer.write_all(item.to_string().as_bytes())
+            .map_err(E::from))
+        .map_err(|e| warn!("Unable to completely render log file to buffer: {}", e));
+
+    (reader, folding)
 }
 
 #[cfg(test)]

@@ -92,7 +92,7 @@ pub struct NullCache {
 impl CacheLayer for NullCache {
     type File = NullFile;
     type Directory = NullDirectory;
-    type GetFuture = cache::Result<CacheObject<NullFile, NullDirectory>>;
+    type GetFuture = ::futures::future::FutureResult<CacheObject<NullFile, NullDirectory>, cache::CacheError>;
 
     fn get(&self, cache_ref: &CacheRef) -> cache::Result<CacheObject<Self::File, Self::Directory>> {
         Err(CacheError::ObjectNotFound(cache_ref.clone()))
@@ -145,6 +145,6 @@ impl CacheLayer for NullCache {
     }
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
-        self.get(cache_ref)
+        self.get(cache_ref).into()
     }
 }

@@ -2,7 +2,8 @@ use std::{
     fs::File,
     io::Write,
     path::Path,
-    fmt::{self, Debug, Formatter}
+    fmt::{self, Debug, Formatter},
+    result
 };
 
 use git2;
@@ -10,7 +11,7 @@ use tempfile;
 
 use crate::cache::*;
 
-type GitResult<T> = ::std::result::Result<T, git2::Error>;
+type GitResult<T> = result::Result<T, git2::Error>;
 
 #[derive(Debug, Fail)]
 enum GitLayerError {

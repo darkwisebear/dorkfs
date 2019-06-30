@@ -104,6 +104,7 @@ use std::ffi::CString;
 use std::io::Read;
 
 use failure::Fallible;
+use futures::IntoFuture;
 use clap::ArgMatches;
 
 use crate::{
@@ -243,7 +244,11 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
                                 cachedir: P,
                                 workspace_dir: Q,
                                 fs: &mut FilesystemOverlay<C>) -> Fallible<()>
-    where R: Read, P: AsRef<Path>, Q: AsRef<Path>, C: CacheLayer+'static {
+    where R: Read,
+          P: AsRef<Path>,
+          Q: AsRef<Path>,
+          C: CacheLayer+Send+Sync+'static,
+          <<C as CacheLayer>::GetFuture as futures::IntoFuture>::Future: Send {
     let head_commit = match fs.get_current_head_ref()? {
         Some(head_commit) => {
             let cache = fs.get_cache();

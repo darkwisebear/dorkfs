@@ -173,7 +173,7 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
 
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog+'a;
-    type LogStream: stream::Stream<Item=ReferencedCommit, Error=Error>+'static;
+    type LogStream: stream::Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
     type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
@@ -269,7 +269,7 @@ pub type BoxedDirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
 pub type BoxedRepository = Box<dyn for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
-    LogStream=Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>>,
+    LogStream=Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>+Send>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
     File=BoxedOverlayFile,
     DirIter=BoxedDirIter>
@@ -325,7 +325,7 @@ impl<T> WorkspaceLog for Box<T> where T: WorkspaceLog+?Sized {}
 
 impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b>+Debug {
     type Log = Box<dyn WorkspaceLog+'a>;
-    type LogStream = Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>>;
+    type LogStream = Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>+Send>;
     type StatusIter = Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
@@ -546,7 +546,7 @@ impl WorkspaceHead {
 }
 
 #[derive(Debug)]
-pub struct FilesystemOverlay<C: CacheLayer> {
+pub struct FilesystemOverlay<C> where C: CacheLayer {
     cache: Arc<C>,
     head: WorkspaceHead,
     overlay_files: HashMap<PathBuf, Weak<Mutex<File>>>,
@@ -996,7 +996,7 @@ impl<C> stream::Stream for CacheLayerLogStream<C> where C: CacheLayer {
 }
 
 impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
-    where C: CacheLayer+'static {
+    where C: CacheLayer {
     type Log = CacheLayerLog<C, &'a C>;
     type LogStream = CacheLayerLogStream<C>;
     type StatusIter = iter::Chain<FSStatusIter<'a, C>, BoxedRepoDispatcherIter<'a, C>>;
