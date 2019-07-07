@@ -4,13 +4,14 @@ mod gitconfig;
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
-use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicUsize};
+use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicUsize, Condvar};
 use std::borrow::{Cow, Borrow};
 use std::io::{self, Read, Seek, Write, BufRead, SeekFrom, Cursor};
 use std::error;
 
-use futures::prelude::*;
+use futures::{task::{self, Task}, prelude::*};
 use failure::Fallible;
+use tokio::io::AsyncWrite;
 
 pub fn os_string_to_string(s: OsString) -> Fallible<String> {
     s.into_string()
@@ -129,7 +130,44 @@ impl<'a> RepoUrl<'a> {
     }
 }
 
-pub type SyncedBuffer = Mutex<Vec<u8>>;
+const BUF_PREFILL: usize = 2048;
+
+#[derive(Debug)]
+struct SyncedBufferContent {
+    buf: Vec<u8>,
+    task: Option<Task>,
+    finished: bool,
+    max_pos: usize
+}
+
+impl Default for SyncedBufferContent {
+    fn default() -> Self {
+        Self {
+            buf: Vec::default(),
+            task: None,
+            finished: false,
+            max_pos: 0
+        }
+    }
+}
+
+impl SyncedBufferContent {
+    fn set_max_read_pos(&mut self, read_pos: usize) {
+        self.max_pos = self.max_pos.max(read_pos);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SyncedBuffer(Mutex<SyncedBufferContent>, Condvar);
+
+impl SyncedBuffer {
+    fn new(content: SyncedBufferContent) -> Self {
+        Self(Mutex::new(content), Condvar::new())
+    }
+}
+
+impl SyncedBuffer {
+}
 
 #[derive(Default, Debug)]
 pub struct SharedBuffer {
@@ -142,32 +180,54 @@ impl SharedBuffer {
     }
 
     pub fn with_content(content: Box<[u8]>) -> Self {
+        let inner = SyncedBufferContent {
+            buf: Vec::from(content),
+            finished: true,
+            ..SyncedBufferContent::default()
+        };
+        let buffer = SyncedBuffer::new(inner);
+
         Self {
-            buffer: Arc::new(Mutex::new(Vec::from(content)))
+            buffer: Arc::new(buffer)
         }
     }
 
     pub fn len(&self) -> usize {
-        self.buffer.lock().unwrap().len()
+        self.buffer.0.lock().unwrap().buf.len()
     }
 
     pub fn build_reader(&self) -> SharedBufferReader {
         SharedBufferReader { buffer: Arc::clone(&self.buffer), pos: 0 }
     }
+
+    fn finish(&mut self) {
+        self.buffer.0.lock().unwrap().finished = true;
+        self.buffer.1.notify_all();
+    }
 }
 
 impl Write for SharedBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_all(buf).map(|_| buf.len())
+        let mut inner = self.buffer.0.lock().unwrap();
+        if inner.buf.len() - inner.max_pos >= BUF_PREFILL && task::is_in_task() {
+            inner.task = Some(task::current());
+            Err(io::ErrorKind::WouldBlock.into())
+        } else {
+            inner.buf.extend_from_slice(buf);
+            self.buffer.1.notify_all();
+            Ok(buf.len())
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
 
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(())
+impl AsyncWrite for SharedBuffer {
+    fn shutdown(&mut self) -> Result<Async<()>, io::Error> {
+        self.finish();
+        Ok(Async::Ready(()))
     }
 }
 
@@ -179,27 +239,44 @@ pub struct SharedBufferReader {
 
 impl SharedBufferReader {
     pub fn len(&self) -> usize {
-        self.buffer.lock().unwrap().len()
+        self.buffer.0.lock().unwrap().buf.len()
     }
 }
 
 impl Read for SharedBufferReader {
     fn read(&mut self, dest_buf: &mut [u8]) -> io::Result<usize> {
-        let buffer = self.buffer.lock().unwrap();
+        let mut inner = self.buffer.0.lock().unwrap();
+        let result = loop {
+            let buffer = inner.buf.as_slice();
 
-        let old_pos = self.pos;
-        let src_buf = &buffer[old_pos..];
-        let count = usize::min(dest_buf.len(), src_buf.len());
+            let old_pos = self.pos;
+            let src_buf = &buffer[old_pos..];
+            let count = usize::min(dest_buf.len(), src_buf.len());
 
-        let src_chunk = &src_buf[..count];
-        let dest_chunk = &mut dest_buf[..count];
+            if count > 0 {
+                let src_chunk = &src_buf[..count];
+                let dest_chunk = &mut dest_buf[..count];
 
-        dest_chunk.copy_from_slice(src_chunk);
-        let new_pos = old_pos+count;
+                dest_chunk.copy_from_slice(src_chunk);
+                let new_pos = old_pos + count;
 
-        self.pos = new_pos;
+                self.pos = new_pos;
+                inner.set_max_read_pos(new_pos);
 
-        Ok(count)
+                break Ok(count);
+            } else {
+                if inner.finished {
+                    break Ok(0);
+                } else {
+                    if let Some(task) = inner.task.take() {
+                        task.notify();
+                    }
+                    inner = self.buffer.1.wait(inner).unwrap();
+                }
+            }
+        };
+
+        result
     }
 }
 
@@ -233,9 +310,10 @@ pub fn collect_strings<T, E, S>(stream: S) -> (SharedBufferReader, impl Future<I
     let mut writer = SharedBuffer::default();
     let reader = writer.build_reader();
 
-    let folding = stream.for_each(move |item|
-        writer.write_all(item.to_string().as_bytes())
-            .map_err(E::from))
+    let folding = stream.fold(writer, |writer, item|
+        tokio::io::write_all(writer, item.to_string().into_bytes())
+            .map(|(writer, _)| writer))
+        .map(|mut w| w.finish())
         .map_err(|e| warn!("Unable to completely render log file to buffer: {}", e));
 
     (reader, folding)
