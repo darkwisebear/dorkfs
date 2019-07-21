@@ -15,7 +15,7 @@ use futures::Future;
 
 use crate::{
     types::{Metadata, ObjectType, RepoRef},
-    utility::{SharedBuffer, SharedBufferReader},
+    utility::SharedBufferReader,
     overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
               WorkspaceFileStatus, FileState, OverlayDirEntry, WorkspaceLog, Repository},
     cache::{CacheRef, ReferencedCommit},
@@ -158,7 +158,7 @@ impl Read for ConstantSpecialFile {
 }
 
 impl Write for ConstantSpecialFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
         Err(io::ErrorKind::PermissionDenied.into())
     }
 
@@ -174,7 +174,7 @@ impl Seek for ConstantSpecialFile {
 }
 
 impl OverlayFile for ConstantSpecialFile {
-    fn truncate(&mut self, size: u64) -> overlay::Result<()> {
+    fn truncate(&mut self, _sze: u64) -> overlay::Result<()> {
         Err(overlay::Error::Generic(failure::err_msg("Cannot truncate constant file")))
     }
 }
@@ -201,7 +201,7 @@ impl ConstantFileFactory {
 }
 
 impl<O> SpecialFile<O> for ConstantFileFactory where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
+    fn metadata(&self, _control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
         let object_type = if self.is_link {
             ObjectType::Symlink
         } else {
@@ -231,7 +231,7 @@ struct LogFileFactory {
 }
 
 impl<O> SpecialFile<O> for LogFileFactory where for<'a> O: Overlay+WorkspaceController<'a> {
-    fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
+    fn metadata(&self, _control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
         Ok(Metadata {
             object_type: ObjectType::File,
             modified_date: chrono::Utc::now(),
@@ -254,7 +254,7 @@ impl Read for LogStreamFile {
 }
 
 impl Write for LogStreamFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
         Err(io::ErrorKind::PermissionDenied.into())
     }
 
@@ -270,7 +270,7 @@ impl Seek for LogStreamFile {
 }
 
 impl OverlayFile for LogStreamFile {
-    fn truncate(&mut self, size: u64) -> overlay::Result<()> {
+    fn truncate(&mut self, _size: u64) -> overlay::Result<()> {
         Err(overlay::Error::from(io::Error::from(io::ErrorKind::PermissionDenied)))
     }
 }
@@ -644,10 +644,6 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
     pub fn as_inner_overlay_mut<'a>(&'a self) -> impl ::std::ops::DerefMut<Target=O>+'a {
         self.overlay.write().unwrap()
     }
-
-    pub fn get_overlay(&self) -> Arc<RwLock<O>> {
-        Arc::clone(&self.overlay)
-    }
 }
 
 pub enum ControlDirIter<O: Overlay> {
@@ -908,7 +904,7 @@ mod test {
                 open_working_copy,
                 check_file_content
             },
-            Overlay, OverlayFile, WorkspaceController
+            Overlay, WorkspaceController
         }
     };
 

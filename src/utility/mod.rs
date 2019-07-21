@@ -4,10 +4,9 @@ mod gitconfig;
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
-use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicUsize, Condvar};
+use std::sync::{Arc, Mutex, Condvar};
 use std::borrow::{Cow, Borrow};
-use std::io::{self, Read, Seek, Write, BufRead, SeekFrom, Cursor};
-use std::error;
+use std::io::{self, Read, Seek, Write, SeekFrom};
 
 use futures::{task::{self, Task}, prelude::*};
 use failure::Fallible;
@@ -160,42 +159,12 @@ impl SyncedBufferContent {
 #[derive(Debug, Default)]
 pub struct SyncedBuffer(Mutex<SyncedBufferContent>, Condvar);
 
-impl SyncedBuffer {
-    fn new(content: SyncedBufferContent) -> Self {
-        Self(Mutex::new(content), Condvar::new())
-    }
-}
-
-impl SyncedBuffer {
-}
-
 #[derive(Default, Debug)]
 pub struct SharedBuffer {
     buffer: Arc<SyncedBuffer>
 }
 
 impl SharedBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_content(content: Box<[u8]>) -> Self {
-        let inner = SyncedBufferContent {
-            buf: Vec::from(content),
-            finished: true,
-            ..SyncedBufferContent::default()
-        };
-        let buffer = SyncedBuffer::new(inner);
-
-        Self {
-            buffer: Arc::new(buffer)
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.buffer.0.lock().unwrap().buf.len()
-    }
-
     pub fn build_reader(&self) -> SharedBufferReader {
         SharedBufferReader { buffer: Arc::clone(&self.buffer), pos: 0 }
     }
@@ -307,7 +276,7 @@ pub fn collect_strings<T, E, S>(stream: S) -> (SharedBufferReader, impl Future<I
     where T: ToString,
           E: From<io::Error>+Display+Send+'static,
           S: Stream<Item=T, Error=E>+Send+'static {
-    let mut writer = SharedBuffer::default();
+    let writer = SharedBuffer::default();
     let reader = writer.build_reader();
 
     let folding = stream.fold(writer, |writer, item|

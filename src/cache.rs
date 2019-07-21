@@ -44,9 +44,6 @@ pub enum CacheError {
     #[fail(display = "Runtime error {}: {}", _0, _1)]
     Custom(&'static str, Error),
 
-    #[fail(display = "Runtime error {}", _0)]
-    RuntimeError(Error),
-
     #[fail(display = "Layer error: {}", _0)]
     LayerError(Error)
 }

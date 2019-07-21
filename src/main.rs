@@ -107,7 +107,6 @@ use std::ffi::CString;
 use std::io::Read;
 
 use failure::Fallible;
-use futures::IntoFuture;
 use clap::ArgMatches;
 
 use crate::{

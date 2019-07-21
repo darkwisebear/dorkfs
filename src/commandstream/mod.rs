@@ -5,10 +5,10 @@ use std::{
 
 use crate::{
     cache::CacheRef,
-    overlay::{self, WorkspaceController}
+    overlay::WorkspaceController
 };
 
-use futures::{failed, Async, Future, Stream, future::Either};
+use futures::{failed, Future, Stream, future::Either};
 use tokio::{
     self,
     prelude::{AsyncRead, AsyncWrite}
@@ -89,7 +89,8 @@ impl<W: for<'a> WorkspaceController<'a>+'static> CommandExecutor<W> {
                                             .map_err(failure::Error::from);
                         Either::A(log_stream
                             .fold(target, |target, commit| {
-                                let commit_string = commit.to_string();
+                                let mut commit_string = commit.to_string();
+                                commit_string.push('\n');
                                 tokio::io::write_all(target, commit_string)
                                     .map(|(target, _)| target)
                                     .map_err(failure::Error::from)
@@ -122,7 +123,7 @@ impl<W: for<'a> WorkspaceController<'a>+'static> CommandExecutor<W> {
         };
 
         tokio::io::write_all(target, message)
-            .map(|w| ())
+            .map(|_| ())
             .map_err(failure::Error::from)
     }
 }
@@ -142,8 +143,6 @@ pub fn parse_command<S: AsyncRead>(source: S) -> impl Future<Item=(S, Command), 
 pub fn create_command_socket<P, W>(path: P, command_executor: CommandExecutor<W>)
     -> impl Future<Item=(), Error=failure::Error> where P: AsRef<Path>,
                                                         W: for<'a> WorkspaceController<'a> {
-    use tokio_uds;
-
     debug!("Creating command socket at {}", path.as_ref().display());
 
     let listener = tokio_uds::UnixListener::bind(&path)

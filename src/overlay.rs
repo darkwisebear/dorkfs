@@ -6,7 +6,7 @@ use std::collections::hash_set;
 use std::iter::{self, FromIterator};
 use std::hash::{Hash, Hasher};
 use std::fmt::{self, Formatter, Display, Debug};
-use std::sync::{self, Arc, Weak, Mutex, RwLock};
+use std::sync::{Arc, Weak, Mutex};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
@@ -438,6 +438,7 @@ impl OverlayPath {
         self.rel_overlay_path.as_path()
     }
 
+    #[cfg(test)]
     pub fn rel_fs_path(&self) -> &Path {
         self.abs_fs_path.strip_prefix(&self.base_path).unwrap()
     }
