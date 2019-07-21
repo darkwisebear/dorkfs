@@ -11,13 +11,15 @@ use std::vec;
 
 use chrono;
 use owning_ref::{RwLockReadGuardRef, OwningHandle};
+use futures::Future;
 
 use crate::{
     types::{Metadata, ObjectType, RepoRef},
     utility::{SharedBuffer, SharedBufferReader},
     overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
               WorkspaceFileStatus, FileState, OverlayDirEntry, WorkspaceLog, Repository},
-    cache::{CacheRef, ReferencedCommit}
+    cache::{CacheRef, ReferencedCommit},
+    tempfile::TempDir
 };
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
@@ -145,6 +147,84 @@ pub trait SpecialFile<O>: Debug+Send+Sync where for<'a> O: Overlay+WorkspaceCont
     }
 }
 
+struct ConstantSpecialFile {
+    data: Cursor<Arc<[u8]>>
+}
+
+impl Read for ConstantSpecialFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.data.read(buf)
+    }
+}
+
+impl Write for ConstantSpecialFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for ConstantSpecialFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.data.seek(pos)
+    }
+}
+
+impl OverlayFile for ConstantSpecialFile {
+    fn truncate(&mut self, size: u64) -> overlay::Result<()> {
+        Err(overlay::Error::Generic(failure::err_msg("Cannot truncate constant file")))
+    }
+}
+
+impl ControlOverlayFile for ConstantSpecialFile {
+    fn close(&mut self) -> overlay::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ConstantFileFactory {
+    data: Arc<[u8]>,
+    is_link: bool
+}
+
+impl ConstantFileFactory {
+    fn new<B: Into<Box<[u8]>>>(data: B, is_link: bool) -> Self {
+        Self {
+            data: Arc::from(data.into()),
+            is_link
+        }
+    }
+}
+
+impl<O> SpecialFile<O> for ConstantFileFactory where for<'a> O: Overlay+WorkspaceController<'a> {
+    fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
+        let object_type = if self.is_link {
+            ObjectType::Symlink
+        } else {
+            ObjectType:: File
+        };
+
+        Ok(Metadata {
+            object_type,
+            modified_date: chrono::Utc::now(),
+            size: self.data.len() as u64
+        })
+    }
+
+    fn get_file<'a, 'b>(&'a self, _control_dir: &'b ControlDir<O>)
+        -> overlay::Result<Box<dyn ControlOverlayFile+Send+Sync>> {
+        let file = ConstantSpecialFile {
+            data: Cursor::new(Arc::clone(&self.data))
+        };
+
+        Ok(Box::new(file) as Box<dyn ControlOverlayFile+Send+Sync>)
+    }
+}
+
 #[derive(Debug)]
 struct LogFileFactory {
     reader: SharedBufferReader
@@ -164,8 +244,6 @@ impl<O> SpecialFile<O> for LogFileFactory where for<'a> O: Overlay+WorkspaceCont
         Ok(Box::new(LogStreamFile(self.reader.clone())) as _)
     }
 }
-
-static NO_LOG_STRING: &[u8] = b"(empty log)";
 
 struct LogStreamFile(SharedBufferReader);
 
@@ -213,7 +291,7 @@ impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
           F: SpecialFileOps+Send+Sync+'static {
     fn metadata(&self, control_dir: &ControlDir<O>) -> overlay::Result<Metadata> {
         let metadata = Metadata {
-            size: self.ops.init(control_dir.get_overlay().deref())?.len() as u64,
+            size: self.ops.init(control_dir.as_inner_overlay().deref())?.len() as u64,
             object_type: ObjectType::File,
             modified_date: chrono::Utc::now()
         };
@@ -224,7 +302,7 @@ impl<O, F> SpecialFile<O> for BufferedFileFactory<F>
     fn get_file<'a, 'b>(&'a self, control_dir: &'b ControlDir<O>)
         -> overlay::Result<Box<dyn ControlOverlayFile+Send+Sync>> {
         let file = BufferedFile {
-            buf: Cursor::new(self.ops.init(control_dir.get_overlay().deref())?),
+            buf: Cursor::new(self.ops.init(control_dir.as_inner_overlay().deref())?),
             ops: self.ops.clone(),
             overlay: Arc::clone(&control_dir.overlay),
             cleared: false
@@ -500,11 +578,12 @@ impl<O> SpecialFileRegistry<O> where for<'a> O: Overlay+WorkspaceController<'a>+
 #[derive(Debug)]
 pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     overlay: Arc<RwLock<O>>,
-    special_files: SpecialFileRegistry<O>
+    special_files: SpecialFileRegistry<O>,
+    tempdir: TempDir
 }
 
 impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
-    pub fn new(overlay: O) -> Self {
+    pub fn new(overlay: O, tempdir: TempDir) -> Self {
         let mut special_files = SpecialFileRegistry::new();
         special_files.insert_buffered("log", LogFileOps);
         special_files.insert_buffered("commit", CommitFileOps);
@@ -528,19 +607,46 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
             Err(e) => warn!("Not creating log file due to error during HEAD retrieval: {}", e)
         }
 
+        let overlay = Arc::new(RwLock::new(overlay));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let dorkcmd_path = tempdir.path().join("dorkcmd");
+            let link_file_factory = ConstantFileFactory::new(
+                dorkcmd_path.as_os_str().as_bytes(), true);
+            special_files.insert("cmd", link_file_factory);
+
+            let command_executor =
+                crate::commandstream::CommandExecutor::new(Arc::clone(&overlay));
+            let command_socket_future =
+                crate::commandstream::create_command_socket(dorkcmd_path, command_executor);
+            crate::tokio_runtime::get().executor().spawn(command_socket_future
+                .map_err(|e| {
+                    error!("Error during command socket processing: {}", e);
+                    ()
+                }));
+        }
+
         ControlDir {
-            overlay: Arc::new(RwLock::new(overlay)),
-            special_files
+            overlay,
+            special_files,
+            tempdir
         }
     }
 
-    pub fn get_overlay<'a>(&'a self) -> impl Deref<Target=O>+'a {
+    pub fn as_inner_overlay<'a>(&'a self) -> impl Deref<Target=O>+'a {
         self.overlay.read().unwrap()
     }
 
     #[cfg(test)]
-    pub fn get_overlay_mut<'a>(&'a self) -> impl ::std::ops::DerefMut<Target=O>+'a {
+    pub fn as_inner_overlay_mut<'a>(&'a self) -> impl ::std::ops::DerefMut<Target=O>+'a {
         self.overlay.write().unwrap()
+    }
+
+    pub fn get_overlay(&self) -> Arc<RwLock<O>> {
+        Arc::clone(&self.overlay)
     }
 }
 
@@ -812,7 +918,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         let mut file = control_overlay.open_file(Path::new("test.txt"), true)
             .expect("Unable to create test file");
@@ -826,7 +932,7 @@ mod test {
             .expect("Unable to write commit message");
         drop(commit_file);
 
-        let workspace_controller = control_overlay.get_overlay();
+        let workspace_controller = control_overlay.as_inner_overlay();
         let head_ref = workspace_controller.get_current_head_ref()
             .expect("Unable to get new head revision")
             .expect("No head revision existing");
@@ -844,7 +950,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         // Create first test commit
         let mut file1 =
@@ -854,7 +960,7 @@ mod test {
             .expect("Unable to write to test file");
         drop(file1);
 
-        let first_commit = control_overlay.get_overlay_mut()
+        let first_commit = control_overlay.as_inner_overlay_mut()
             .commit("Commit to first branch")
             .expect("Unable to create first commit");
 
@@ -899,11 +1005,11 @@ mod test {
             .expect("Unable to write to test file");
         drop(file2);
 
-        let second_commit = control_overlay.get_overlay_mut().commit("Commit to second branch")
+        let second_commit = control_overlay.as_inner_overlay_mut().commit("Commit to second branch")
             .expect("Unable to create second commit");
 
         // Switch back to master
-        control_overlay.get_overlay_mut().switch_branch(Some("master")).unwrap();
+        control_overlay.as_inner_overlay_mut().switch_branch(Some("master")).unwrap();
 
         // Check if checked-out workspace is unchanged
         let mut file2 =
@@ -931,7 +1037,7 @@ mod test {
             first_commit.to_string().as_str());
 
         // Switch back to feature branch
-        control_overlay.get_overlay_mut().switch_branch(Some("feature")).unwrap();
+        control_overlay.as_inner_overlay_mut().switch_branch(Some("feature")).unwrap();
 
         // ...and check if the second file is still gone
         assert!(control_overlay.open_file(Path::new("file2.txt"), false).is_err());
@@ -972,7 +1078,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         let mut log_file = control_overlay.open_file(Path::new(".dork/log"), false)
             .expect("Unable to open log file");
@@ -987,7 +1093,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
         control_overlay.delete_file(Path::new(".dork/log")).unwrap_err();
 
         let mut file = control_overlay.open_file(Path::new("test.txt"), true)
@@ -1005,7 +1111,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         let mut file1 =
             control_overlay.open_file(Path::new("file1.txt"), true)
@@ -1013,7 +1119,7 @@ mod test {
         file1.write(b"Test 1")
             .expect("Unable to write to test file");
         drop(file1);
-        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(1, control_overlay.as_inner_overlay().get_status().unwrap().count());
 
         let mut revert_file =
             control_overlay.open_file(Path::new(".dork/revert"), true)
@@ -1021,7 +1127,7 @@ mod test {
         revert_file.write_all(b"file1.txt")
             .expect("unable to write to revert file");
         drop(revert_file);
-        assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(0, control_overlay.as_inner_overlay().get_status().unwrap().count());
     }
 
     #[test]
@@ -1030,7 +1136,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         let mut file1 =
             control_overlay.open_file(Path::new("file1.txt"), true)
@@ -1038,7 +1144,7 @@ mod test {
         file1.write(b"Test 1")
             .expect("Unable to write to test file");
         drop(file1);
-        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(1, control_overlay.as_inner_overlay().get_status().unwrap().count());
 
         let mut revert_file =
             control_overlay.open_file(".dork/revert", true)
@@ -1046,7 +1152,7 @@ mod test {
         revert_file.write_all(b"file2.txt")
             .expect("unable to write to revert file");
         drop(revert_file);
-        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(1, control_overlay.as_inner_overlay().get_status().unwrap().count());
     }
 
     #[test]
@@ -1055,7 +1161,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         let mut file1 =
             control_overlay.open_file("file1.txt", true)
@@ -1063,7 +1169,7 @@ mod test {
         file1.write(b"Test 1")
             .expect("Unable to write to test file");
         drop(file1);
-        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(1, control_overlay.as_inner_overlay().get_status().unwrap().count());
 
         let mut file2 =
             control_overlay.open_file(Path::new("dir/file2.txt"), true)
@@ -1071,7 +1177,7 @@ mod test {
         file2.write(b"Test 2")
             .expect("Unable to write to test file");
         drop(file2);
-        assert_eq!(2, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(2, control_overlay.as_inner_overlay().get_status().unwrap().count());
 
         let mut revert_file =
             control_overlay.open_file(Path::new(".dork/revert"), true)
@@ -1079,7 +1185,7 @@ mod test {
         revert_file.write_all(b"file1.txt")
             .expect("unable to write to revert file");
         drop(revert_file);
-        assert_eq!(1, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(1, control_overlay.as_inner_overlay().get_status().unwrap().count());
 
         let mut revert_file =
             control_overlay.open_file(Path::new(".dork/revert"), true)
@@ -1087,7 +1193,7 @@ mod test {
         revert_file.write_all(b"dir")
             .expect("unable to write to revert dir");
         drop(revert_file);
-        assert_eq!(0, control_overlay.get_overlay().get_status().unwrap().count());
+        assert_eq!(0, control_overlay.as_inner_overlay().get_status().unwrap().count());
     }
 
     #[test]
@@ -1096,25 +1202,25 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir);
 
         let mut test_file =
             control_overlay.open_file(Path::new("test.txt"), true).unwrap();
         write!(test_file, "A test text").unwrap();
         drop(test_file);
 
-        let first_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
+        let first_commit = control_overlay.as_inner_overlay_mut().commit("A test commit").unwrap();
 
         let mut test_file =
             control_overlay.open_file(Path::new("test2.txt"), true).unwrap();
         write!(&mut test_file, "A second test").unwrap();
         drop(test_file);
 
-        let second_commit = control_overlay.get_overlay_mut().commit("A test commit").unwrap();
+        let second_commit = control_overlay.as_inner_overlay_mut().commit("A test commit").unwrap();
 
-        control_overlay.get_overlay_mut().set_head(first_commit).unwrap();
+        control_overlay.as_inner_overlay_mut().set_head(first_commit).unwrap();
         assert_eq!(Some(first_commit),
-                   control_overlay.get_overlay_mut().get_current_head_ref().unwrap());
+                   control_overlay.as_inner_overlay_mut().get_current_head_ref().unwrap());
 
         let mut head_file =
             control_overlay.open_file(Path::new(".dork/HEAD"), true).unwrap();
@@ -1122,6 +1228,6 @@ mod test {
         drop(head_file);
 
         assert_eq!(Some(second_commit),
-                   control_overlay.get_overlay_mut().get_current_head_ref().unwrap());
+                   control_overlay.as_inner_overlay_mut().get_current_head_ref().unwrap());
     }
 }

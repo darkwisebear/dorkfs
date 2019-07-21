@@ -37,3 +37,4 @@ either = "1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse_mt = "0.4"
+tokio-uds = "0.2"

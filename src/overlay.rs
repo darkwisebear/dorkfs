@@ -555,7 +555,7 @@ pub struct FilesystemOverlay<C> where C: CacheLayer {
     submodules: PathDispatcher<BoxedRepository>
 }
 
-impl<C: CacheLayer+'static> FilesystemOverlay<C> {
+impl<C: CacheLayer> FilesystemOverlay<C> {
     fn file_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("files")
     }
@@ -2277,7 +2277,8 @@ mod test {
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let fs_overlay = open_working_copy(tempdir.path());
-        let control_overlay = ControlDir::new(fs_overlay);
+        let control_overlay =
+            ControlDir::new(fs_overlay, tempdir);
         let boxed_overlay = Box::new(RepositoryWrapper::new(control_overlay))
             as BoxedRepository;
         bounds_test(boxed_overlay);

@@ -27,6 +27,8 @@ extern crate either;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;
+#[cfg(target_os = "linux")]
+extern crate tokio_uds;
 
 #[cfg(target_os = "linux")]
 mod fuse;
@@ -42,6 +44,7 @@ mod hashfilecache;
 mod github;
 #[cfg(test)]
 mod nullcache;
+mod commandstream;
 
 mod tokio_runtime {
     use std::{
@@ -331,6 +334,8 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
         }
     };
 
+    let tempdir = tempfile::tempdir()?;
+
     FilesystemOverlay::new(rootrepo,
                            Cow::Owned(overlaydir.join("root")),
                            branch)
@@ -374,8 +379,10 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
 
             Ok(fs)
         })
-        .map(|overlay|
-            Box::new(RepositoryWrapper::new(ControlDir::new(overlay))) as BoxedRepository)
+        .map(move |overlay| {
+            let control_dir = ControlDir::new(overlay, tempdir);
+            Box::new(RepositoryWrapper::new(control_dir)) as BoxedRepository
+        })
         .map_err(Into::into)
 }
 
