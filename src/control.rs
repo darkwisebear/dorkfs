@@ -457,7 +457,15 @@ impl SpecialFileOps for HeadFileOps {
                 Ok(())
             }
 
-            Err(e) => Err(e)
+            Err(overlay::Error::UncleanWorkspace) => {
+                info!("Workspace unclean, not updating HEAD and workspace");
+                Ok(())
+            }
+
+            Err(e) => {
+                error!("Unable to update workspace to newest HEAD: {}", e);
+                Ok(())
+            }
         }
     }
 }
