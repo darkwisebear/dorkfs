@@ -1,6 +1,7 @@
 use std::{
     path::Path,
-    sync::{Arc, RwLock}
+    sync::{Arc, RwLock},
+    marker::PhantomData
 };
 
 use crate::{
@@ -11,10 +12,13 @@ use crate::{
 use futures::{failed, Future, Stream, future::Either};
 use tokio::{
     self,
-    prelude::{AsyncRead, AsyncWrite}
+    prelude::{AsyncRead, AsyncWrite},
+    codec::{Decoder, FramedRead}
 };
+use bytes::BytesMut;
 use failure;
 use serde_json;
+use serde::de;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,26 +54,21 @@ impl<W: for<'a> WorkspaceController<'a>+'static> CommandExecutor<W> {
         }
     }
 
-    pub fn command<T: AsyncWrite+Send+Sync+'static>(&self, command: Command, target: T) {
-        let command_future = match command {
+    pub fn command<T: AsyncWrite+Send+Sync+'static>(&self, command: Command, target: T)
+        -> impl Future<Item=T, Error=failure::Error> {
+        match command {
             Command::Commit { message } =>
                 Box::new(self.commit_handler(message, target))
-                    as Box<dyn Future<Item=(), Error=failure::Error>+Send>,
+                    as Box<dyn Future<Item=T, Error=failure::Error>+Send>,
 
             Command::Log { start_commit } =>
                 Box::new(self.handle_log_stream(start_commit, target))
-                             as Box<dyn Future<Item=(), Error=failure::Error>+Send>
-        };
-
-        crate::tokio_runtime::get().executor().spawn(command_future
-            .map_err(|e| {
-                error!("Unable to handle command: {}", e);
-                ()
-            }));
+                             as Box<dyn Future<Item=T, Error=failure::Error>+Send>
+        }
     }
 
     fn handle_log_stream<T>(&self, start_commit: Option<CacheRef>, target: T)
-        -> impl Future<Item=(), Error=failure::Error>+Send
+        -> impl Future<Item=T, Error=failure::Error>+Send
         where T: AsyncWrite+Send+Sync+'static {
         static NO_LOG_STRING: &[u8] = b"(empty log)";
 
@@ -108,14 +107,10 @@ impl<W: for<'a> WorkspaceController<'a>+'static> CommandExecutor<W> {
             Err(e) => Either::B(failed(
                 format_err!("Unable to get start commit for log listing: {}", e)))
         }
-        .and_then(|target|
-            tokio::io::shutdown(target)
-                .map(|_| ())
-                .map_err(failure::Error::from))
     }
 
     fn commit_handler<T>(&self, message: String, target: T)
-        -> impl Future<Item=(), Error=failure::Error>+Send
+        -> impl Future<Item=T, Error=failure::Error>+Send
         where T: AsyncWrite+Send+Sync+'static {
         let message = match self.controller.write().unwrap().commit(message.as_str()) {
             Ok(cache_ref) => format!("Successfully committed, HEAD at {}", cache_ref),
@@ -123,19 +118,93 @@ impl<W: for<'a> WorkspaceController<'a>+'static> CommandExecutor<W> {
         };
 
         tokio::io::write_all(target, message)
-            .map(|_| ())
+            .map(|(target, _)| target)
             .map_err(failure::Error::from)
     }
 }
 
-pub fn parse_command<S: AsyncRead>(source: S) -> impl Future<Item=(S, Command), Error=failure::Error> {
-    let buffer = Vec::with_capacity(256);
-    tokio::io::read_to_end(source, buffer)
-        .map_err(failure::Error::from)
-        .and_then(|(source, buffer)| {
-            serde_json::from_slice(buffer.as_slice())
-                .map(move |c| (source, c))
-                .map_err(failure::Error::from)
+struct JsonDictDecoder<T: for<'de> de::Deserialize<'de>>(PhantomData<T>);
+
+impl<T: for<'de> de::Deserialize<'de>> Default for JsonDictDecoder<T> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: for<'de> de::Deserialize<'de>> Decoder for JsonDictDecoder<T> {
+    type Item = T;
+    type Error = failure::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let start_index = src.iter().enumerate()
+            .find_map(|(index, &character)|
+                if character == b'{' {
+                    Some(index)
+                } else {
+                    None
+                });
+
+        match start_index {
+            Some(start_index) => {
+                let mut level = 0usize;
+                let end_index = src[start_index..].iter().enumerate()
+                    .find_map(|(index, &character)|
+                        if character == b'{' {
+                            level += 1;
+                            None
+                        } else if character == b'}' {
+                            if level == 1 {
+                                Some(index + start_index + 1)
+                            } else {
+                                level -= 1;
+                                None
+                            }
+                        } else {
+                            None
+                        });
+                match end_index {
+                    Some(end_index) => {
+                        let json_buf = src.split_to(end_index);
+                        serde_json::from_slice(&json_buf[start_index..])
+                            .map(Some)
+                            .map_err(Self::Error::from)
+                    }
+
+                    None => Ok(None)
+                }
+            }
+
+            None => Ok(None)
+        }
+    }
+
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.decode(buf)
+    }
+}
+
+pub fn execute_commands<W, C>(channel: C, executor: CommandExecutor<W>)
+    -> impl Future<Item=(), Error=failure::Error> where W: for<'a> WorkspaceController<'a>+'static,
+                                                        C: AsyncRead+AsyncWrite+Send+'static {
+    let (input, output) = channel.split();
+    // We need to clone here since the closure of for_each
+    // needs command_executor to be preserved in its state so
+    // that it can be used on the next iteration again.
+    let command_reader =
+        FramedRead::new(input, JsonDictDecoder::default());
+    command_reader.fold(output,
+                        move |output, command|
+                            executor.command(command, output))
+        .and_then(|target|
+            tokio::io::shutdown(target)
+                .map(|_| ())
+                .map_err(failure::Error::from))
+        .then(|result| match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!("Error during command processing: {}", e);
+                Ok(())
+            }
         })
 }
 
@@ -150,13 +219,32 @@ pub fn create_command_socket<P, W>(path: P, command_executor: CommandExecutor<W>
 
     listener.incoming()
         .map_err(failure::Error::from)
-        .for_each(move |connection| {
-            // We need to clone here since the closure of for_each
-            // needs command_executor to be preserved in its state so
-            // that it can be used on the next iteration again.
-            let command_executor = command_executor.clone();
-            parse_command(connection)
-                .map(move |(connection, command)|
-                    command_executor.command(command, connection))
-        })
+        .for_each(move |connection|
+            execute_commands(connection, command_executor.clone()))
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Read;
+    use crate::commandstream::JsonDictDecoder;
+    use futures::prelude::*;
+
+    #[test]
+    fn test_framed_decoding() {
+        let data = br#"{"test": "hallo", "data": { "more": "yes" } }
+        {"command": {"start_commit": "r43985083403"} }"#;
+
+        let framed = tokio::codec::FramedRead::new(&data[..],
+                                                   JsonDictDecoder::<::serde_json::Value>::default());
+        let mut wait = framed.wait();
+        let first: ::serde_json::Value = wait.next()
+            .expect("First item couldn't be extracted")
+            .expect("Error during JSON decoding");
+        assert_eq!(first["test"], "hallo");
+        let second = wait.next()
+            .expect("Second item couldn't be extracted")
+            .expect("Error during JSON decoding");
+        assert_eq!(second["command"]["start_commit"], "r43985083403");
+        assert!(wait.next().is_none());
+    }
 }
