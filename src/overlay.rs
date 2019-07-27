@@ -14,12 +14,11 @@ use std::cmp::max;
 use std::borrow::Cow;
 use std::vec;
 use std::ops::{Deref, DerefMut};
-use std::mem::replace;
 
 use chrono::{Utc, Offset};
 use either::Either;
 use futures::{
-    Async, IntoFuture, Future, stream
+    Async, Future, Stream
 };
 
 use crate::{
@@ -173,7 +172,7 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
 
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog+'a;
-    type LogStream: stream::Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
+    type LogStream: Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
     type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
@@ -269,7 +268,7 @@ pub type BoxedDirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
 pub type BoxedRepository = Box<dyn for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
-    LogStream=Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>+Send>,
+    LogStream=Box<dyn Stream<Item=ReferencedCommit, Error=Error>+Send>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
     File=BoxedOverlayFile,
     DirIter=BoxedDirIter>
@@ -325,7 +324,7 @@ impl<T> WorkspaceLog for Box<T> where T: WorkspaceLog+?Sized {}
 
 impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b>+Debug {
     type Log = Box<dyn WorkspaceLog+'a>;
-    type LogStream = Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>+Send>;
+    type LogStream = Box<dyn Stream<Item=ReferencedCommit, Error=Error>+Send>;
     type StatusIter = Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
@@ -937,61 +936,62 @@ impl<C: CacheLayer, T: Deref<Target=C>> Iterator for CacheLayerLog<C, T> {
 
 pub struct CacheLayerLogStream<C> where C: CacheLayer {
     cache: Arc<C>,
-    current_poll: (CacheRef, <<C as CacheLayer>::GetFuture as IntoFuture>::Future)
+    current_poll: Option<(CacheRef, <C as CacheLayer>::GetFuture)>
 }
 
 impl<C> Debug for CacheLayerLogStream<C> where C: CacheLayer {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("CacheLayerLogStream")
             .field("cache", &self.cache)
-            .field("current_poll", &self.current_poll.0)
+            .field("current_poll",
+                   &self.current_poll.as_ref().map(|(cache_ref, _)| cache_ref))
             .finish()
     }
 }
 
 impl<C> CacheLayerLogStream<C> where C: CacheLayer {
     fn new(start_commit: CacheRef, cache: Arc<C>) -> Self {
-        let curr_poll = cache.get_poll(&start_commit).into_future();
+        let curr_poll = cache.get_poll(&start_commit);
         Self {
             cache,
-            current_poll: (start_commit, curr_poll)
+            current_poll: Some((start_commit, curr_poll))
         }
     }
 }
 
-impl<C> stream::Stream for CacheLayerLogStream<C> where C: CacheLayer {
+impl<C> Stream for CacheLayerLogStream<C> where C: CacheLayer {
     type Item = ReferencedCommit;
     type Error = Error;
 
     fn poll(&mut self) -> Result<Async<Option<Self::Item>>> {
-        let (ref mut cur_ref, ref mut cur_poll) = self.current_poll;
+        match self.current_poll.take() {
+            Some((cur_ref, mut cur_poll)) =>
+                match cur_poll.poll() {
+                    Ok(Async::Ready(obj)) => {
+                        let commit = obj.into_commit()?;
 
-        if *cur_ref == CacheRef::null() {
-            Ok(Async::Ready(None))
-        } else {
-            match cur_poll.poll() {
-                Ok(Async::Ready(obj)) => {
-                    let commit = obj.into_commit()?;
+                        if !commit.parents.is_empty() {
+                            if commit.parents.len() > 1 {
+                                warn!("Non-linear history not supported yet!");
+                            }
 
-                    let cache_ref = if !commit.parents.is_empty() {
-                        if commit.parents.len() > 1 {
-                            warn!("Non-linear history not supported yet!");
+                            let new_poll =
+                                self.cache.get_poll(&commit.parents[0]);
+                            self.current_poll = Some((commit.parents[0], new_poll));
                         }
 
-                        *cur_poll = self.cache.get_poll(&commit.parents[0]).into_future();
-                        replace(cur_ref, commit.parents[0])
-                    } else {
-                        *cur_ref = CacheRef::null();
-                        CacheRef::null()
-                    };
+                        Ok(Async::Ready(Some(ReferencedCommit(cur_ref, commit))))
+                    }
 
-                    Ok(Async::Ready(Some(ReferencedCommit(cache_ref, commit))))
-                }
+                    Ok(Async::NotReady) => {
+                        self.current_poll = Some((cur_ref, cur_poll));
+                        Ok(Async::NotReady)
+                    }
 
-                Ok(Async::NotReady) => Ok(Async::NotReady),
+                    Err(e) => Err(Error::from(e))
+                },
 
-                Err(e) => Err(Error::from(e))
-            }
+            None => Ok(Async::Ready(None))
         }
     }
 }
