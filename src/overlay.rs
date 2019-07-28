@@ -555,7 +555,7 @@ pub struct FilesystemOverlay<C> where C: CacheLayer {
     submodules: PathDispatcher<BoxedRepository>
 }
 
-impl<C: CacheLayer> FilesystemOverlay<C> {
+impl<C: CacheLayer+Debug+Send+Sync+'static> FilesystemOverlay<C> {
     fn file_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("files")
     }
@@ -939,7 +939,7 @@ pub struct CacheLayerLogStream<C> where C: CacheLayer {
     current_poll: Option<(CacheRef, <C as CacheLayer>::GetFuture)>
 }
 
-impl<C> Debug for CacheLayerLogStream<C> where C: CacheLayer {
+impl<C> Debug for CacheLayerLogStream<C> where C: CacheLayer+Debug {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("CacheLayerLogStream")
             .field("cache", &self.cache)
@@ -997,7 +997,7 @@ impl<C> Stream for CacheLayerLogStream<C> where C: CacheLayer {
 }
 
 impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
-    where C: CacheLayer {
+    where C: CacheLayer+Debug+Send+Sync+'static {
     type Log = CacheLayerLog<C, &'a C>;
     type LogStream = CacheLayerLogStream<C>;
     type StatusIter = iter::Chain<FSStatusIter<'a, C>, BoxedRepoDispatcherIter<'a, C>>;
@@ -1131,9 +1131,9 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
 }
 
 pub struct BoxedRepoDispatcherIter<'a, C>(dispatch::Iter<'a, BoxedRepository>, &'a FilesystemOverlay<C>)
-    where C: CacheLayer+'a;
+    where C: CacheLayer+Debug+Send+Sync+'static;
 
-impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+'a {
+impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+Debug+Send+Sync+'static {
     fn new(overlay: &'a FilesystemOverlay<C>) -> Result<Self> {
         let iter = overlay.submodules.iter();
         Ok(BoxedRepoDispatcherIter(iter, overlay))
@@ -1141,7 +1141,7 @@ impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+'a {
 }
 
 impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
-    where C: CacheLayer+'static {
+    where C: CacheLayer+Debug+Send+Sync+'static {
     type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1206,7 +1206,7 @@ impl<'a, C: CacheLayer> FSStatusIter<'a, C> {
     }
 }
 
-impl<'a, C: CacheLayer+'static> Iterator for FSStatusIter<'a, C> {
+impl<'a, C: CacheLayer+Debug+Send+Sync+'static> Iterator for FSStatusIter<'a, C> {
     type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1285,7 +1285,7 @@ type AddResultFn<T> = fn(T) -> Result<T>;
 type MapAddResultToHashSetIter<T> = iter::Map<hash_set::IntoIter<T>, AddResultFn<T>>;
 type HashOrBoxedDirIter = Either<MapAddResultToHashSetIter<OverlayDirEntry>, BoxedDirIter>;
 
-impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
+impl<C: CacheLayer+Debug+Send+Sync+'static> Overlay for FilesystemOverlay<C> {
     type File = FSOverlayFile<C>;
     type DirIter = HashOrBoxedDirIter;
 
@@ -2216,7 +2216,7 @@ mod test {
                 .expect("Unable to reopen second test file");
 
         // 3. Alter the other file directly in the cache
-        let cache = overlay.get_cache_mut();
+        let cache = overlay.get_cache();
         let commit = cache.get(&commit_ref)
             .and_then(CacheObject::into_commit)
             .expect("Unable to retrieve first commit object");
@@ -2251,7 +2251,8 @@ mod test {
         let newcommit_ref =
             cache.add_commit(new_commit)
                 .expect("Unable to add commit that alters a file");
-        cache.inner_mut().set_reference("master", &newcommit_ref).unwrap();
+        cache.inner().set_reference("master", &newcommit_ref).unwrap();
+        drop(cache);
 
         // 4. Commit the other file
         overlay.commit("Altered first test file")

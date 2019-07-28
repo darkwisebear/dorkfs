@@ -249,8 +249,8 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
     where R: Read,
           P: AsRef<Path>,
           Q: AsRef<Path>,
-          C: CacheLayer+Send+Sync+'static,
-          <<C as CacheLayer>::GetFuture as futures::IntoFuture>::Future: Send {
+          C: CacheLayer+Debug+Send+Sync+'static,
+          <C as CacheLayer>::GetFuture: Send {
     let head_commit = match fs.get_current_head_ref()? {
         Some(head_commit) => {
             let cache = fs.get_cache();

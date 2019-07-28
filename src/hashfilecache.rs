@@ -437,8 +437,8 @@ impl<C> HashFileCache<C>  where C: CacheLayer+Debug,
     }
 
     #[cfg(test)]
-    pub fn inner_mut(&mut self) -> &mut C {
-        &mut self.cache
+    pub fn inner(&self) -> &C {
+        &self.cache
     }
 
     fn identify_object_type<R: Read>(object_file: &mut R) -> Result<CacheFileType> {

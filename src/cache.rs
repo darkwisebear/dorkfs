@@ -367,7 +367,7 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     }
 }
 
-pub trait CacheLayer: Debug+Send+Sync+'static {
+pub trait CacheLayer {
     type File: ReadonlyFile+Debug;
     type Directory: Directory+Debug;
     type GetFuture: Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send;
