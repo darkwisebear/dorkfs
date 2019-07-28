@@ -288,6 +288,30 @@ pub fn collect_strings<T, E, S>(stream: S) -> (SharedBufferReader, impl Future<I
     (reader, folding)
 }
 
+pub struct CommitRange<'a> {
+    pub start: Option<&'a str>,
+    pub end: Option<&'a str>
+}
+
+impl<'a> CommitRange<'a> {
+    pub fn from_str(range: &'a str) -> Fallible<Self> {
+        let mut split = range.split("..");
+        let start: &str = split.next()
+            .ok_or(format_err!("No range start in range expression\"{}\"", range))?;
+        let end: &str = split.next()
+            .ok_or(format_err!("No range start in range expression\"{}\"", range))?;
+
+        if split.next().is_some() {
+            bail!("Too many range separators in expression");
+        }
+
+        Ok(Self {
+            start: if start.is_empty() { None } else { Some(start) },
+            end: if start.is_empty() { None } else { Some(end) }
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::RepoUrl;

@@ -787,7 +787,7 @@ impl<C: CacheLayer+Debug+Send+Sync+'static> FilesystemOverlay<C> {
             |e|
                 self.dir_entry_to_directory_entry(&e, overlay_path.clone()))?.into_iter();
 
-        self.cache.add_directory(&mut directory as &mut Iterator<Item=DirectoryEntry>)
+        self.cache.add_directory(&mut directory as &mut dyn Iterator<Item=DirectoryEntry>)
             .map_err(Into::into)
     }
 

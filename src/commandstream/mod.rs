@@ -1,7 +1,8 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    marker::PhantomData
+    marker::PhantomData,
+    io
 };
 
 use crate::{
@@ -9,7 +10,7 @@ use crate::{
     overlay::WorkspaceController
 };
 
-use futures::{failed, Future, Stream, future::Either};
+use futures::{failed, Future, Stream, IntoFuture, future::Either};
 use tokio::{
     self,
     prelude::{AsyncRead, AsyncWrite},
@@ -20,7 +21,7 @@ use failure;
 use serde_json;
 use serde::de;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Command {
     Commit {
@@ -223,9 +224,64 @@ pub fn create_command_socket<P, W>(path: P, command_executor: CommandExecutor<W>
             execute_commands(connection, command_executor.clone()))
 }
 
+#[cfg(target_os = "linux")]
+fn find_command_stream() -> impl Future<Item=tokio_uds::UnixStream, Error=io::Error> {
+    fn find_stream_path() -> io::Result<PathBuf> {
+        let cwd = std::env::current_dir()?;
+
+        let mut dork_root = cwd.as_path();
+        if dork_root.ends_with(".dork") {
+            dork_root = dork_root.parent().unwrap();
+        }
+
+        loop {
+            debug!("Looking for command socket in {}", dork_root.display());
+
+            let command_socket_path = dork_root.join(".dork/cmd");
+            if command_socket_path.exists() {
+                info!("Using {} as command socket path", command_socket_path.display());
+                break Ok(command_socket_path);
+            }
+
+            match dork_root.parent() {
+                Some(parent) => dork_root = parent,
+                None => break Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        format!("Unable to find a mounted dork file system at {}",
+                                cwd.display())))
+            }
+        }
+    }
+
+    find_stream_path().into_future()
+        .and_then(|command_socket_path|
+            tokio_uds::UnixStream::connect(command_socket_path))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_command_stream() -> impl Future<Item=tokio::fs::File, Error=io::Error> {
+    futures::failed(io::Error::new(
+        io::ErrorKind::Other,
+        "dorkfs only supports Linux. Bummer."))
+}
+
+pub fn send_command(command: Command) {
+    let command_string = serde_json::to_string(&command).unwrap();
+    let task = find_command_stream()
+        .and_then(move |stream| tokio::io::write_all(stream, command_string))
+        .and_then(|(stream, _)| tokio::io::copy(stream, tokio::io::stdout()))
+        .and_then(|(_, stream, _)| tokio::io::shutdown(stream))
+        .map(|_| ())
+        .map_err(|e| {
+            error!("Unable to communicate with daemon: {}", e);
+            ()
+        });
+
+    ::tokio::runtime::run(task);
+}
+
 #[cfg(test)]
 mod test {
-    use std::io::Read;
     use crate::commandstream::JsonDictDecoder;
     use futures::prelude::*;
 

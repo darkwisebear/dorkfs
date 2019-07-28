@@ -114,7 +114,7 @@ use crate::{
     overlay::{WorkspaceController, FilesystemOverlay, BoxedRepository, RepositoryWrapper, Overlay},
     cache::{CacheLayer, CacheRef},
     control::ControlDir,
-    utility::RepoUrl,
+    utility::{RepoUrl, CommitRange},
     types::RepoRef
 };
 
@@ -221,8 +221,16 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .short("b")
             .help("Remote branch that shall be tracked instead of the default branch"));
 
+    let log = App::new("log")
+        .arg(Arg::with_name("commit_range")
+            .default_value("..")
+            .help("Specify the commit range that is being displayed. Currently, only the \
+            full range or a start commit can be specified. The full range looks like this: \"..\". \
+            With a start commit, the range looks like this: \"<start_commit>..\""));
+
     let dorkfs = App::new("dorkfs")
-        .subcommand(mount);
+        .subcommand(mount)
+        .subcommand(log);
 
     dorkfs.get_matches()
 }
@@ -426,12 +434,35 @@ fn mount(args: &ArgMatches) {
     }
 }
 
+fn log(args: &ArgMatches) {
+    let range = CommitRange::from_str(args.value_of("commit_range")
+        .unwrap())
+        .expect("Unparsable commit range");
+
+    let start = match range {
+        CommitRange {
+            start,
+            end: None
+        } => start,
+
+        _ => unimplemented!("Only unbounded and ranges with only a start supported")
+    };
+
+    let start_commit = start
+        .map(|s| cache::CacheRef::from_str(s)
+            .expect("Unable to parse start ref in range"));
+
+    let log_command = commandstream::Command::Log { start_commit };
+    commandstream::send_command(log_command);
+}
+
 fn main() {
     init_logging();
 
     let args = parse_arguments();
     match args.subcommand() {
         ("mount", Some(subargs)) => mount(subargs),
+        ("log", Some(subargs)) => log(subargs),
         _ => print!("{}", args.usage())
     }
 }
