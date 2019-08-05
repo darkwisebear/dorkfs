@@ -2,7 +2,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     marker::PhantomData,
-    io
+    io,
+    net::Shutdown
 };
 
 use crate::{
@@ -269,7 +270,11 @@ pub fn send_command(command: Command) {
     let command_string = serde_json::to_string(&command).unwrap();
     let task = find_command_stream()
         .and_then(move |stream| tokio::io::write_all(stream, command_string))
-        .and_then(|(stream, _)| tokio::io::copy(stream, tokio::io::stdout()))
+        .and_then(|(stream, _)| {
+            let result = stream.shutdown(Shutdown::Write);
+            result.map(move |_| stream)
+        })
+        .and_then(|stream| tokio::io::copy(stream, tokio::io::stdout()))
         .and_then(|(_, stream, _)| tokio::io::shutdown(stream))
         .map(|_| ())
         .map_err(|e| {
