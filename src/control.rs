@@ -17,7 +17,7 @@ use crate::{
     types::{Metadata, ObjectType, RepoRef},
     utility::SharedBufferReader,
     overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
-              WorkspaceFileStatus, FileState, OverlayDirEntry, WorkspaceLog, Repository},
+              WorkspaceFileStatus, OverlayDirEntry, WorkspaceLog, Repository},
     cache::{CacheRef, ReferencedCommit},
     tempfile::TempDir
 };
@@ -416,15 +416,7 @@ impl WorkspaceStatusFileOps {
         let mut status = String::new();
 
         for file_status in overlay.get_status()? {
-            let WorkspaceFileStatus(path, state) = file_status?;
-            let state_string = match state {
-                FileState::New => "N ",
-                FileState::Modified => "M ",
-                FileState::Deleted => "D ",
-                FileState::SubmoduleUpdated => "S ",
-            };
-            status.push_str(state_string);
-            status.push_str(path.display().to_string().as_str());
+            status.push_str(&file_status?.to_string());
             status.push('\n');
         }
 

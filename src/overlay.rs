@@ -170,6 +170,25 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
     }
 }
 
+impl WorkspaceFileStatus {
+    pub fn as_path(&self) -> &Path {
+        self.0.as_path()
+    }
+}
+
+impl Display for WorkspaceFileStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let WorkspaceFileStatus(path, state) = self;
+        let state = match state {
+            FileState::New => 'N',
+            FileState::Modified => 'M',
+            FileState::Deleted => 'D',
+            FileState::SubmoduleUpdated => 'S',
+        };
+        write!(f, "{} {}", state, path.display())
+    }
+}
+
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog+'a;
     type LogStream: Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
@@ -178,6 +197,7 @@ pub trait WorkspaceController<'a>: Debug {
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
     fn get_current_branch(&self) -> Result<Option<Cow<str>>>;
+    // TODO: Check why branch is optional
     fn switch_branch(&mut self, branch: Option<&str>) -> Result<()>;
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
