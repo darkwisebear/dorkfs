@@ -3,7 +3,7 @@ mod gitconfig;
 
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex, Condvar};
 use std::borrow::{Cow, Borrow};
 use std::io::{self, Read, Seek, Write, SeekFrom};
@@ -165,10 +165,6 @@ pub struct SharedBuffer {
 }
 
 impl SharedBuffer {
-    pub fn build_reader(&self) -> SharedBufferReader {
-        SharedBufferReader { buffer: Arc::clone(&self.buffer), pos: 0 }
-    }
-
     fn finish(&mut self) {
         self.buffer.0.lock().unwrap().finished = true;
         self.buffer.1.notify_all();
@@ -204,12 +200,6 @@ impl AsyncWrite for SharedBuffer {
 pub struct SharedBufferReader {
     buffer: Arc<SyncedBuffer>,
     pos: usize
-}
-
-impl SharedBufferReader {
-    pub fn len(&self) -> usize {
-        self.buffer.0.lock().unwrap().buf.len()
-    }
 }
 
 impl Read for SharedBufferReader {
@@ -270,22 +260,6 @@ impl Seek for SharedBufferReader {
                     .ok_or(io::ErrorKind::InvalidInput.into())
         }
     }
-}
-
-pub fn collect_strings<T, E, S>(stream: S) -> (SharedBufferReader, impl Future<Item=(), Error=()>)
-    where T: ToString,
-          E: From<io::Error>+Display+Send+'static,
-          S: Stream<Item=T, Error=E>+Send+'static {
-    let writer = SharedBuffer::default();
-    let reader = writer.build_reader();
-
-    let folding = stream.fold(writer, |writer, item|
-        tokio::io::write_all(writer, item.to_string().into_bytes())
-            .map(|(writer, _)| writer))
-        .map(|mut w| w.finish())
-        .map_err(|e| warn!("Unable to completely render log file to buffer: {}", e));
-
-    (reader, folding)
 }
 
 pub struct CommitRange<'a> {

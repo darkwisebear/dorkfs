@@ -56,13 +56,6 @@ pub enum Error {
     Generic(failure::Error)
 }
 
-impl Error {
-    pub fn from_fail<E: failure::Fail>(e: E) -> Self {
-        Error::Generic(failure::Error::from(e))
-    }
-
-}
-
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::IoError(e)
