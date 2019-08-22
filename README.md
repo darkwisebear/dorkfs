@@ -35,65 +35,34 @@ Mounting the file system
 ------------------------
 
 DorkFS sets up a local storage and mounts its contents to the given
-mount point. Currently, mounting supports the following options:
+mount point. This is done by calling the dorkfs binary with the "mount"
+subcommand. This command takes three main arguments: A mount point, a cache
+directory that contains cached data and intermediate files like the changed
+files of the workspace, and a URL that points to the git repository that shall
+be mounted to the mount point. An example call could look like this:
+
 ```
-dorkfs
-
-USAGE:
-    dorkfs [OPTIONS] <cachedir> <mountpoint> <rootrepo>
-
-FLAGS:
-    -h, --help       Prints help information
-    -V, --version    Prints version information
-
-OPTIONS:
-    -b, --branch <branch>    Remote branch that shall be tracked instead
-of the default branch
-        --gid <gid>          GID to be used for the files. Defaults to
-the effective GID of the process.
-        --uid <uid>          UID to be used for the files. Defaults to
-the effective UID of the process.
-        --umask <umask>       [default: 022]
-
-ARGS:
-    <cachedir>      Directory where the cached contents shall be stored
-    <mountpoint>    Mountpoint that shows the checked out contents
-    <rootrepo>      Connection specification to the root repository. For
-GitHub this string has the following form:
-github+<GitHub API URL>/<org>/<repo>
+$ dorkfs mount /var/run/dorkcache/dorkfs /mnt/dorkfs \
+github+https://github.com/darkwisebear/dorkfs 
 ```
+
+See below for a more complete example.
 
 Managing the workspace
 ----------------------
 
-DorkFS sets up a special directory called .dork below the given mount
-point. The files in this directory are used to interact with the file
-system driver. Currently, this directory provides the following special
-files:
-* commit: This is a write-only file. Writing a descriptive message to
-  this file commits the local changes and uses the message as the commit
-  message of the newly created commit.
-* log: This file is read-only. It provides the commit log of the
-  currently mounted workspace.
-* HEAD: This file shows the current base commit used to display
-  contents. Echoing 'latest' to this file will update the repository to
-  the latest commit of the tracked branch. If the workspace is unclean,
-  the update is refused.
-* current_branch: This file displays the currently tracked remote
-  branch. Echoing a branch name to this file will switch the tracked
-  branch. It will, however, _not_ change the current commit used as the
-  base for the mounted fs. Use HEAD to update to the latest commit of
-  the tracked branch.
-* create_branch: This is a write-only file. Creates a branch with the
-  written string as its name and sets it to the current commit HEAD
-  points to.
-* revert: This is a write-only file. Reverts the file or directory
-  given. The string has to be a path relative to the mount point.
-* status: This is a read-only file. Displays the status of the
-  workspace. The first column shows the status of the file or directory:
-  'D' denotes a deleted file or dir, 'A' denotes added files,
-  and 'M' marks modified files. The second column shows the path to the
-  file or directory as a relative path to the mount point.
+DorkFS sets up a special directory called .dork below the given mount point.
+Inside this directory there is a link to a socket the daemon process listens 
+to. The socket accepts incoming JSON objects and responds with an UTF-8 string
+that is a status most of the time but it can also be a lot more data, for
+example in case of the log command.
+
+The data format of the JSON object is subject to change. However, it is kept
+backwards compatible, so older (minor) versions of dorkfs may talk to newer
+versions of a daemon process.
+
+Using this interface is done by calling dorkfs with any command except mount.
+Please check the command line help for a list of available commands.
 
 Examples
 ========
@@ -110,9 +79,8 @@ $ cd /mnt/dorkfs
 $ mkdir testdir
 $ cd testdir
 $ echo "Hello, world!" > hello_world.txt
-$ cd ../.dork
-$ echo "This is a VCS hello world example" > commit
-$ cat log
+$ dorkfs commit -m "This is a VCS hello world example"
+$ dorkfs log | less
 ```
 
 will give (example):
