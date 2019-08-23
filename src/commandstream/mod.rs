@@ -3,22 +3,60 @@ use std::{
     sync::{Arc, RwLock},
     io,
     net::Shutdown,
-    borrow::Cow
+    borrow::Cow,
+    fmt::Display
 };
 
 use crate::{
-    cache::CacheRef,
+    cache::{CacheRef, ReferencedCommit},
     overlay::{self, Overlay, WorkspaceController}
 };
 
-use futures::{failed, Future, Stream, IntoFuture, future::Either, stream};
+use futures::{prelude::*, future::Either, stream};
 use tokio::{
     self,
-    prelude::{AsyncRead, AsyncWrite}
+    io::{AsyncRead, AsyncWrite}
 };
 use failure::{self, Fallible};
 use serde_json;
 use glob::Pattern as GlobPattern;
+
+struct LogStreamEmitter<S> {
+    stream: S,
+    error_encountered: bool
+}
+
+impl<S> LogStreamEmitter<S> {
+    fn new(stream:S ) -> Self {
+        Self {
+            stream,
+            error_encountered: false
+        }
+    }
+}
+
+impl<S> Stream for LogStreamEmitter<S>
+    where S: Stream<Item=ReferencedCommit, Error=overlay::Error> {
+    type Item = String;
+    type Error = (); // Actually this should be '!'
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        if !self.error_encountered {
+            match self.stream.poll() {
+                Ok(Async::Ready(commit)) =>
+                    Ok(Async::Ready(commit.as_ref().map(ReferencedCommit::to_string))),
+                Err(err) => {
+                    self.error_encountered = true;
+                    warn!("Error during log streaming: {}", err);
+                    Ok(Async::Ready(Some(format!("ERROR: Unable to retrieve log entry: {}", err))))
+                }
+                Ok(Async::NotReady) => Ok(Async::NotReady)
+            }
+        } else {
+            Ok(Async::Ready(None))
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -97,10 +135,9 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             } => {
                 let create_result =
                     self.repo.write().unwrap().create_branch(name.as_str(), None)
-                        .map_err(failure::Error::from)
-                        .into_future()
-                        .map(|_| target);
-                Box::new(create_result) as Box<_>
+                        .map(|_| format!("Successfully created branch {}", name.as_str()));
+                Box::new(Self::send_result_string(
+                    target, create_result, "Failed to create branch")) as Box<_>
             }
 
             Command::Revert {
@@ -146,10 +183,12 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
         branch_status
             .into_future()
-            .and_then(|(branch_name, cache_ref)| {
-                let status_string = format!("{} checked out at {}", branch_name, cache_ref);
-                Self::send_string(target, status_string)
-            })
+            .then(|branch_status|
+                Self::send_result_string(
+                    target,
+                    branch_status.map(|(branch_name, cache_ref)|
+                        format!("{} checked out at {}", branch_name, cache_ref)),
+                    "Unable to retrieve workspace status"))
     }
 
     fn handle_revert<T>(&self, target: T, path_glob: String, dry_run: bool)
@@ -188,21 +227,44 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             });
 
         revert_result.into_future()
-            .and_then(|matching_paths|
-                stream::iter_ok::<_, failure::Error>(matching_paths)
-                    .fold(target, |target, matching_path| {
-                        let message = format!("Reverting {}\n", matching_path.display());
-                        tokio::io::write_all(target, message)
-                            .map(|(target, _)| target)
-                    })
-                    .map_err(failure::Error::from))
+            .then(|matching_paths| match matching_paths {
+                Ok(matching_paths) =>
+                    Either::A(stream::iter_ok::<_, failure::Error>(matching_paths)
+                        .fold(target, |target, matching_path| {
+                            let message = format!("Reverting {}\n", matching_path.display());
+                            tokio::io::write_all(target, message)
+                                .map(|(target, _)| target)
+                        })
+                        .map_err(failure::Error::from)),
+                Err(e) => {
+                    warn!("Revert failed: {}", e);
+                    Either::B(Self::send_string(
+                        target, format!("ERROR: Unable to execute revert operation: {}", e)))
+                }
+            })
     }
 
     fn send_string<T, E>(target: T, string: String)
-        -> impl Future<Item=T, Error=E> where T: AsyncWrite+Send+Sync+'static, E: From<io::Error> {
+        -> impl Future<Item=T, Error=E> where T: AsyncWrite+Send+Sync+'static,
+                                              E: From<io::Error> {
         tokio::io::write_all(target, string.into_bytes())
             .map(|(target, _)| target)
             .map_err(E::from)
+    }
+
+    fn send_result_string<T, S, E, F>(target: T, string: Result<S, F>, error_prefix: &str)
+        -> impl Future<Item=T, Error=E> where T: AsyncWrite+Send+Sync+'static,
+                                              S: Display,
+                                              E: From<io::Error>,
+                                              F: Display {
+        let message = match string {
+            Ok(string) => string.to_string(),
+            Err(err) => {
+                warn!("Command operation failed: {}: {}", error_prefix, err);
+                format!("ERROR: {}: {}", error_prefix, err)
+            }
+        };
+        Self::send_string(target, message)
     }
 
     fn handle_status<T: AsyncWrite+Send+Sync+'static>(&self, target: T)
@@ -220,8 +282,11 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
         status_string
             .into_future()
-            .and_then(move |status_string|
-                Self::send_string(target, status_string))
+            .then(move |status_string|
+                Self::send_result_string(
+                    target,
+                    status_string,
+                    "Failed to retrieve status"))
     }
 
     fn handle_log_stream<T>(&self, start_commit: Option<CacheRef>, target: T)
@@ -241,13 +306,12 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             Ok(start_commit) => {
                 let ok_future = match start_commit {
                     Some(start_commit) => {
-                        let log_stream = repo.get_log_stream(start_commit)
-                                            .map_err(failure::Error::from);
+                        let log_stream = LogStreamEmitter::new(repo.get_log_stream(start_commit));
                         Either::A(log_stream
-                            .fold(target, |target, commit| {
-                                let mut commit_string = commit.to_string();
-                                commit_string.push('\n');
-                                tokio::io::write_all(target, commit_string)
+                            .map_err(|_| unreachable!()) // LogStreamEmitter don't error!
+                            .fold(target, |target, mut message| {
+                                message.push('\n');
+                                tokio::io::write_all(target, message)
                                     .map(|(target, _)| target)
                                     .map_err(failure::Error::from)
                             }))
@@ -261,22 +325,25 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                 Either::A(ok_future)
             }
 
-            Err(e) => Either::B(failed(
-                format_err!("Unable to get start commit for log listing: {}", e)))
+            Err(e) => {
+                warn!("Unable to get start commit for log listing: {}", e);
+                Either::B(Self::send_string(
+                    target,
+                    format!("ERROR: Unable to get start commit for log listing: {}", e)))
+            }
         }
     }
 
     fn commit_handler<T>(&self, message: String, target: T)
         -> impl Future<Item=T, Error=failure::Error>
         where T: AsyncWrite+Send+Sync+'static {
-        let message = match self.repo.write().unwrap().commit(message.as_str()) {
-            Ok(cache_ref) => format!("Successfully committed, HEAD at {}", cache_ref),
-            Err(e) => format!("Failed to commit: {}", e)
-        };
-
-        tokio::io::write_all(target, message)
-            .map(|(target, _)| target)
-            .map_err(failure::Error::from)
+        let commit_result = self.repo.write().unwrap()
+            .commit(message.as_str());
+        Self::send_result_string(
+            target,
+            commit_result.map(|cache_ref|
+                format!("Successfully committed, HEAD at {}", cache_ref)),
+            "Failed to commit")
     }
 }
 
