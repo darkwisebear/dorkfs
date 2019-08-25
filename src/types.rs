@@ -38,9 +38,9 @@ impl ObjectType {
     pub fn from_cache_object_type(obj_type: cache::ObjectType) -> Result<ObjectType, Error> {
         match obj_type {
             cache::ObjectType::File => Ok(ObjectType::File),
-            cache::ObjectType::Directory => Ok(ObjectType::Directory),
+            cache::ObjectType::Directory |
+            cache::ObjectType::Commit => Ok(ObjectType::Directory),
             cache::ObjectType::Symlink => Ok(ObjectType::Symlink),
-            _ => Err(format_err!("Unmappable object type from cache!"))
         }
     }
 }

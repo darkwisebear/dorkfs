@@ -17,6 +17,7 @@ use failure::{Fail, Error};
 use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
 use serde::de::Visitor;
 use chrono::{DateTime, FixedOffset};
+use futures::Future;
 
 pub trait LayerError: Fail {}
 
@@ -314,7 +315,7 @@ pub struct ReferencedCommit(pub CacheRef, pub Commit);
 
 impl Display for ReferencedCommit {
     fn fmt(&self, f: &mut Formatter) -> result::Result<(), fmt::Error> {
-        write!(f, "\nCommit:    {}\n\n{}", self.0, self.1)
+        write!(f, "Commit:    {}\n\n{}\n", self.0, self.1)
     }
 }
 
@@ -369,23 +370,29 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     }
 }
 
-pub trait CacheLayer: Debug {
+pub trait CacheLayer: Debug+Send+Sync+'static {
     type File: ReadonlyFile+Debug;
     type Directory: Directory+Debug;
+    type GetFuture: Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
-    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef>;
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef>;
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef>;
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef>;
     fn add_commit(&self, commit: Commit) -> Result<CacheRef>;
 
-    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>>;
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef>;
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()>;
+    fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>>;
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef>;
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<()>;
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture;
 }
 
-pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
-    -> result::Result<Option<CacheRef>, Error> where C: CacheLayer,
-                                                              P: AsRef<Path> {
+pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P)
+    -> result::Result<Option<CacheRef>, Error>
+    where C: CacheLayer+?Sized,
+          T: ::std::ops::Deref<Target=C>,
+          P: AsRef<Path> {
+    let cache = cache.deref();
     let mut objs = vec![commit.tree];
     let path = path.as_ref();
 
@@ -419,105 +426,6 @@ pub fn resolve_object_ref<C, P>(cache: &C, commit: &Commit, path: P)
     Ok(objs.last().cloned())
 }
 
-impl ReadonlyFile for Box<ReadonlyFile+Send+Sync> {}
-
-type DirectoryWrapper = DirectoryImpl;
-
-pub type BoxedCacheLayer =
-    Box<CacheLayer<File=Box<ReadonlyFile+Send+Sync+'static>,
-        Directory=DirectoryWrapper>+Send+Sync>;
-
-#[derive(Debug)]
-struct CacheLayerWrapper<C: CacheLayer+Send+Sync> {
-    inner: C
-}
-
-impl<C: CacheLayer+Send+Sync> CacheLayerWrapper<C> {
-    fn new(inner: C) -> Self {
-        Self { inner }
-    }
-}
-
-pub fn boxed<C>(inner: C) -> BoxedCacheLayer where C: CacheLayer+Send+Sync+'static,
-                                                   C::File: Send+Sync {
-    Box::new(CacheLayerWrapper::new(inner)) as BoxedCacheLayer
-}
-
-impl<C> CacheLayer for CacheLayerWrapper<C> where C: CacheLayer+Send+Sync,
-                                                  C::File: Send+Sync+'static {
-    type File = Box<ReadonlyFile+Send+Sync>;
-    type Directory = DirectoryWrapper;
-
-    fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
-        let obj = match self.inner.get(cache_ref)? {
-            CacheObject::File(file) =>
-                CacheObject::File(Box::new(file) as Box<ReadonlyFile+Send+Sync>),
-            CacheObject::Directory(dir) => CacheObject::Directory(Self::Directory::from_iter(dir)),
-            CacheObject::Commit(commit) => CacheObject::Commit(commit),
-            CacheObject::Symlink(symlink) => CacheObject::Symlink(symlink)
-        };
-        Ok(obj)
-    }
-
-    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
-        self.inner.add_file_by_path(source_path)
-    }
-
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
-        self.inner.add_directory(items)
-    }
-
-    fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
-        self.inner.add_commit(commit)
-    }
-
-    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
-        self.inner.get_head_commit(branch)
-    }
-
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
-        self.inner.merge_commit(branch, cache_ref)
-    }
-
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
-        self.inner.create_branch(branch, cache_ref)
-    }
-}
-
-impl<C, F, D> CacheLayer for Box<C> where C: CacheLayer<File=F, Directory=D>+?Sized,
-                                          F: ReadonlyFile+Send+Sync,
-                                          D: Directory+Debug {
-    type File = F;
-    type Directory = D;
-
-    fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
-        (**self).get(cache_ref)
-    }
-
-    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef> {
-        (**self).add_file_by_path(source_path)
-    }
-
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>) -> Result<CacheRef> {
-        (**self).add_directory(items)
-    }
-
-    fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
-        (**self).add_commit(commit)
-    }
-
-    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>> {
-        (**self).get_head_commit(branch)
-    }
-
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef> {
-        (**self).merge_commit(branch, cache_ref)
-    }
-
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<()> {
-        (**self).create_branch(branch, cache_ref)
-    }
-}
 #[cfg(test)]
 mod test {
     #[test]
@@ -528,18 +436,5 @@ mod test {
         let iter = HexCharIterator::new("123456789abcdef");
         let bytes: Result<Vec<u8>, Error> = iter.collect();
         assert_eq!(vec![0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf], bytes.unwrap());
-    }
-
-    #[test]
-    fn check_thread_safety() {
-        use crate::nullcache::NullCache;
-        use super::{boxed, CacheLayer};
-
-        fn bounds_test<F: FnOnce()+Send+Sync+'static>(f: F) {
-            f()
-        }
-
-        let test_cache_layer = boxed(NullCache::default());
-        bounds_test(move || assert!(test_cache_layer.get_head_commit("(unused)").is_ok()));
     }
 }

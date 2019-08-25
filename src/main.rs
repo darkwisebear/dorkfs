@@ -21,6 +21,9 @@ extern crate futures;
 extern crate tokio;
 extern crate base64;
 extern crate bytes;
+extern crate regex;
+extern crate owning_ref;
+extern crate either;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;
@@ -30,6 +33,7 @@ mod fuse;
 #[cfg(feature = "gitcache")]
 mod gitcache;
 mod cache;
+mod dispatch;
 mod overlay;
 mod types;
 mod utility;
@@ -39,19 +43,78 @@ mod github;
 #[cfg(test)]
 mod nullcache;
 
+mod tokio_runtime {
+    use std::{
+        sync::{
+            mpsc::channel,
+            Mutex,
+            Weak,
+            Arc
+        },
+        time::Duration
+    };
+
+    use tokio::{
+        prelude::*,
+        runtime::Runtime,
+        timer::timeout::Error as TimeoutError
+    };
+
+    lazy_static! {
+        static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
+    }
+
+    pub fn get() -> Arc<Runtime> {
+        let mut runtime = TOKIO_RUNTIME.lock().unwrap();
+        match runtime.upgrade() {
+            Some(tokio) => tokio,
+            None => {
+                let new_runtime = Runtime::new().expect("Unable to instantiate tokio runtime");
+                let new_runtime = Arc::new(new_runtime);
+                *runtime = Arc::downgrade(&new_runtime);
+                new_runtime
+            }
+        }
+    }
+
+    pub fn execute<T, E, I, F>(tokio: &Runtime, request_future: I, timeout: Duration)
+        -> Result<T, TimeoutError<E>>
+        where T: Send+'static,
+              E: Send+'static,
+              I: IntoFuture<Future=F, Item=T, Error=E>+Send+'static,
+              F: Future<Item=T, Error=E>+Send+'static {
+        let (send, recv) = channel();
+
+        let finalizing_future = request_future
+            .into_future()
+            .timeout(timeout)
+            .then(move |r| send.send(r)
+                .map_err(|_| unreachable!("Unexpected send error during GitHub request")));
+
+        tokio.executor().spawn(finalizing_future);
+        recv.recv().expect("Unexpected receive error during GitHub request")
+    }
+}
+
 use std::path::Path;
 use std::str::FromStr;
 use std::fmt::Debug;
 use std::borrow::Cow;
 use std::ffi::CString;
+use std::io::Read;
 
 use failure::Fallible;
+use futures::IntoFuture;
 use clap::ArgMatches;
 
-use crate::hashfilecache::HashFileCache;
-use crate::overlay::{WorkspaceController, FilesystemOverlay};
-use crate::cache::CacheLayer;
-use crate::utility::RootrepoUrl;
+use crate::{
+    hashfilecache::HashFileCache,
+    overlay::{WorkspaceController, FilesystemOverlay, BoxedRepository, RepositoryWrapper, Overlay},
+    cache::{CacheLayer, CacheRef},
+    control::ControlDir,
+    utility::RepoUrl,
+    types::RepoRef
+};
 
 fn is_octal_number(s: &str) -> bool {
     s.chars().all(|c| c >= '0' && c <='7')
@@ -163,56 +226,123 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_fuse<C>(
+fn mount_fuse<O>(
     mountpoint: &str,
-    overlay: overlay::FilesystemOverlay<C>,
+    root_overlay: O,
     uid: u32,
     gid: u32,
     umask: u16)
-    where C: CacheLayer+Debug+'static+Send+Sync,
-          <C as CacheLayer>::File: 'static+Send+Sync {
-    let dorkfs = fuse::DorkFS::with_overlay(overlay, uid, gid, umask).unwrap();
-    dorkfs.mount(mountpoint).unwrap();
+    where O: Overlay+Debug+Send+Sync+'static,
+          <O as Overlay>::File: Debug+Send+Sync+'static {
+    fuse::DorkFS::with_overlay(root_overlay, uid, gid, umask)
+        .and_then(|dorkfs| dorkfs.mount(mountpoint))
+        .expect("Unable to mount filesystem");
 }
 
-fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: &Option<B>)
-    -> Fallible<FilesystemOverlay<cache::BoxedCacheLayer>>
-    where P: AsRef<Path>,
-          U: AsRef<str>,
-          B: AsRef<str> {
-    let overlaydir = workspace.as_ref().join("overlay");
-    let cachedir = workspace.as_ref().join("cache");
+fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
+                                gitmodules: R,
+                                cachedir: P,
+                                workspace_dir: Q,
+                                fs: &mut FilesystemOverlay<C>) -> Fallible<()>
+    where R: Read,
+          P: AsRef<Path>,
+          Q: AsRef<Path>,
+          C: CacheLayer+Send+Sync+'static,
+          <<C as CacheLayer>::GetFuture as futures::IntoFuture>::Future: Send {
+    let head_commit = match fs.get_current_head_ref()? {
+        Some(head_commit) => {
+            let cache = fs.get_cache();
+            get_commit(&*cache, &head_commit)?
+        }
+        None => return Ok(()),
+    };
 
-    let baseurl = rooturl.as_ref();
-    let rootrepo_url = RootrepoUrl::from_str(baseurl)?;
+    match rootrepo_url {
+        RepoUrl::GithubHttps {
+            apiurl, org, ..
+        } => match github::initialize_github_submodules(
+            gitmodules, apiurl.as_ref(), org.as_ref()) {
+            Ok(submodules) => {
+                for (submodule_path, submodule_url) in submodules.into_iter() {
+                    let cache = fs.get_cache();
+                    let gitlink_ref =
+                        cache::resolve_object_ref(cache, &head_commit, &submodule_path)
+                            .map_err(failure::Error::from)
+                            .and_then(|cache_ref|
+                                cache_ref.ok_or(
+                                    format_err!("Unable to find gitlink for submodule in path {}",
+                                                    submodule_path.display())));
+                    match gitlink_ref {
+                        Ok(gitlink_ref) =>
+                            new_overlay(workspace_dir.as_ref().join(&submodule_path),
+                                        cachedir.as_ref(),
+                                        &submodule_url,
+                                        Some(&RepoRef::CacheRef(gitlink_ref)))
+                                .and_then(|submodule|
+                                    fs.add_submodule(submodule_path, submodule)
+                                        .map_err(Into::into))?,
+
+                        Err(err) =>
+                            error!("Unable to initialize submodule at {}: {}. Skipping.",
+                                   submodule_path.display(), err)
+                    }
+                }
+            }
+
+            Err(err) => warn!("Unable to initialize submodules: {}", err)
+        }
+    }
+
+    Ok(())
+}
+
+fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch: Option<&RepoRef>)
+    -> Fallible<BoxedRepository>
+    where P: AsRef<Path>,
+          Q: AsRef<Path> {
+    let mut default_branch;
+    let overlaydir = overlaydir.as_ref();
+
     let (rootrepo, branch) = match rootrepo_url {
-        RootrepoUrl::GithubHttps { apiurl, org, repo } => {
-            let mut baseurl = String::from("https://");
-            baseurl.push_str(apiurl);
+        RepoUrl::GithubHttps { apiurl, org, repo } => {
+            let baseurl = format!("https://{}", apiurl);
             let token = ::std::env::var("GITHUB_TOKEN")
                 .expect("GITHUB_TOKEN needed in order to authenticate against GitHub");
             debug!("Connecting to GitHub at {} org {} repo {}", &baseurl, org, repo);
             let github = github::Github::new(
                 baseurl.as_str(),
-                org,
-                repo,
+                &org,
+                &repo,
                 token.as_str())?;
 
-            let branch = branch.as_ref().map(|s| Cow::Borrowed(s.as_ref()))
-                .unwrap_or_else(|| Cow::Owned(github.get_default_branch().unwrap()));
+            let branch = match branch {
+                Some(&RepoRef::Branch(branch)) => RepoRef::Branch(branch),
+                Some(&RepoRef::CacheRef(cache_ref)) => RepoRef::CacheRef(cache_ref),
+                None => {
+                    default_branch = github.get_default_branch()?;
+                    RepoRef::Branch(default_branch.as_str())
+                }
+            };
 
             let cached_github =
-                cache::boxed(HashFileCache::new(github, cachedir)?);
+                HashFileCache::new(github, &cachedir)?;
 
             (cached_github, branch)
         }
     };
 
-    FilesystemOverlay::new(rootrepo, overlaydir, branch.as_ref())
+    FilesystemOverlay::new(rootrepo,
+                           Cow::Owned(overlaydir.join("root")),
+                           branch)
         .and_then(|mut overlay|
             match overlay.update_head() {
                 Err(overlay::Error::UncleanWorkspace) => {
-                    println!("Not updating current workspace since it is unclean.");
+                    info!("Not updating current workspace since it is unclean.");
+                    Ok(overlay)
+                }
+
+                Err(overlay::Error::DetachedHead) => {
+                    info!("Not updating workspace since HEAD is detached.");
                     Ok(overlay)
                 }
 
@@ -227,7 +357,32 @@ fn new_overlay<P, U, B>(workspace: P, rooturl: U, branch: &Option<B>)
                 }
             }
         )
+        .and_then(|mut fs| {
+            match fs.open_file(Path::new(".gitmodules"), false) {
+                Ok(file) => {
+                    let submodule_dir = overlaydir.join("submodules");
+                    mount_submodules(rootrepo_url,
+                                     file,
+                                     cachedir.as_ref(),
+                                     submodule_dir,
+                                     &mut fs)?;
+                }
+
+                Err(overlay::Error::FileNotFound) => debug!("No .gitmodules found, skipping submodule scan"),
+                Err(err) => warn!("Unable to open .gitmodules: {}", err)
+            }
+
+            Ok(fs)
+        })
+        .map(|overlay|
+            Box::new(RepositoryWrapper::new(ControlDir::new(overlay))) as BoxedRepository)
         .map_err(Into::into)
+}
+
+fn get_commit<C: CacheLayer>(cache: &C, commit_ref: &CacheRef) -> Fallible<cache::Commit> {
+    cache.get(commit_ref)
+        .and_then(|obj| obj.into_commit())
+        .map_err(failure::Error::from)
 }
 
 pub fn init_logging() {
@@ -236,11 +391,18 @@ pub fn init_logging() {
 }
 
 fn mount(args: &ArgMatches) {
-    let cachedir = args.value_of("cachedir").expect("cachedir arg not set!");
+    let cachedir_base = Path::new(args.value_of("cachedir")
+        .expect("cachedir arg not set!"));
     let rootrepo = args.value_of("rootrepo").expect("No root URL given");
-    let branch = args.value_of("branch");
+    let branch = args.value_of("branch").map(RepoRef::Branch);
 
-    let fs = new_overlay(cachedir, rootrepo, &branch)
+    let rootrepo_url = RepoUrl::from_str(rootrepo).expect("Unable to parse root URL");
+    let cachedir = cachedir_base.join("cache");
+
+    let fs = new_overlay(cachedir_base.join("overlay"),
+                         &cachedir,
+                         &rootrepo_url,
+                         branch.as_ref())
         .expect("Unable to create workspace");
 
     #[cfg(target_os = "linux")]

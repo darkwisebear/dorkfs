@@ -52,6 +52,10 @@ pub struct PageInfo {
 }
 
 const FILE_MODE_SYMLINK: u32 = 0o120_000;
+const FILE_MODE_EXECUTABLE: u32 = 0o100_755;
+const FILE_MODE_BLOB: u32 = 0o100_644;
+const FILE_MODE_DIRECTORY: u32 = 0o040_000;
+const FILE_MODE_COMMIT: u32 = 0o160_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TreeEntry {
@@ -59,24 +63,24 @@ pub struct TreeEntry {
     pub mode: u32,
     #[serde(flatten)]
     pub oid: GitObjectId,
-    pub object: GitObject
+    #[serde(default)]
+    pub object: Option<GitObject>
 }
 
 impl TreeEntry {
-    pub fn get_entry_type(&self) -> ObjectType {
-        match self.object {
-            GitObject::Commit { .. } => ObjectType::Commit,
-            GitObject::Tree { .. } => ObjectType::Directory,
-            GitObject::Blob { .. } => if self.mode == FILE_MODE_SYMLINK {
-                ObjectType::Symlink
-            } else {
-                ObjectType::File
-            }
+    pub fn get_entry_type(&self) -> Fallible<ObjectType> {
+        match self.mode {
+            FILE_MODE_EXECUTABLE |
+            FILE_MODE_BLOB => Ok(ObjectType::File),
+            FILE_MODE_DIRECTORY |
+            FILE_MODE_COMMIT => Ok(ObjectType::Directory),
+            FILE_MODE_SYMLINK => Ok(ObjectType::Symlink),
+            _ => bail!("Unknown file mode in GitHub directory entry")
         }
     }
 
     pub fn get_entry_size(&self) -> u64 {
-        if let GitObject::Blob { byte_size, .. } = self.object {
+        if let Some(GitObject::Blob { byte_size, .. }) = self.object {
             byte_size as u64
         } else {
             0u64
@@ -207,7 +211,7 @@ impl Iterator for GitObjIter {
 
             GitObjIter::TreeEntries(cache_ref, entries) => {
                 let dir: Fallible<Vec<DirectoryEntry>> = entries.map(|entry| {
-                    let object_type = entry.get_entry_type();
+                    let object_type = entry.get_entry_type()?;
                     let size = entry.get_entry_size();
 
                     let cache_ref = entry.oid.try_into_cache_ref()?;

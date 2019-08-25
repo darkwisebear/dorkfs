@@ -12,10 +12,8 @@ use chrono::{DateTime, TimeZone, Timelike};
 use fuse_mt::*;
 use libc;
 
-use crate::control::*;
 use crate::overlay::{self, *};
 use crate::types;
-use crate::cache::CacheLayer;
 use crate::utility::OpenHandleSet;
 
 lazy_static! {
@@ -39,26 +37,28 @@ fn to_timespec<Tz: TimeZone>(time: &DateTime<Tz>) -> Timespec {
 }
 
 #[derive(Debug)]
-enum OpenObject<C> where C: CacheLayer+Debug+'static {
-    File(ControlFile<FilesystemOverlay<C>>),
+enum OpenObject<O> where O: Overlay+'static, <O as Overlay>::File: Debug {
+    File(<O as Overlay>::File),
     Directory(Vec<OverlayDirEntry>),
 }
 
-struct FsState<C> where C: CacheLayer+Debug+'static {
-    overlay: ControlDir<FilesystemOverlay<C>>,
-    open_handles: OpenHandleSet<OpenObject<C>>
+#[derive(Debug)]
+struct FsState<O> where O: Overlay+Debug+'static, <O as Overlay>::File: Debug {
+    overlay: O,
+    open_handles: OpenHandleSet<OpenObject<O>>
 }
 
-pub struct DorkFS<C> where C: CacheLayer+Debug+'static {
-    state: RwLock<FsState<C>>,
+#[derive(Debug)]
+pub struct DorkFS<O> where O: Overlay+Debug+'static, <O as Overlay>::File: Debug {
+    state: RwLock<FsState<O>>,
     uid: u32,
     gid: u32,
     umask: u16
 }
 
-impl<C> FilesystemMT for DorkFS<C> where
-    C: CacheLayer+Debug+Send+Sync,
-    <C as CacheLayer>::File: Send+Sync+'static {
+impl<O> FilesystemMT for DorkFS<O> where
+    O: Overlay+Debug+Send+Sync,
+    <O as Overlay>::File: Debug+Send+Sync+'static {
     fn init(&self, _req: RequestInfo) -> ResultEmpty {
         Ok(())
     }
@@ -108,7 +108,9 @@ impl<C> FilesystemMT for DorkFS<C> where
         let path = path.strip_prefix("/").expect("Expect absolute path");
         let mut state = self.state.write().unwrap();
 
-        match state.overlay.list_directory(path) {
+        match state.overlay.list_directory(path)
+            .and_then(|dir_iter|
+                dir_iter.collect::<Result<Vec<_>, _>>()) {
             Ok(dir) => {
                 let dir_handle = state.open_handles.push(OpenObject::Directory(dir),
                                                          Cow::Borrowed(path.as_os_str()));
@@ -267,7 +269,7 @@ impl<C> FilesystemMT for DorkFS<C> where
 
         info!("Creating overlay directory {}", path.to_string_lossy());
 
-        let ensure_result = state.overlay.get_overlay().ensure_directory(&path);
+        let ensure_result = state.overlay.ensure_directory(&path);
         match ensure_result {
             Ok(()) => {
                 let current_time = get_time();
@@ -375,9 +377,9 @@ impl<C> FilesystemMT for DorkFS<C> where
 }
 
 
-impl<C> DorkFS<C> where
-    C: CacheLayer+Debug+Send+Sync+'static,
-    <C as CacheLayer>::File: Send+Sync+'static {
+impl<O> DorkFS<O> where
+    O: Overlay+Debug+Send+Sync+'static,
+    <O as Overlay>::File: Debug+Send+Sync+'static {
     fn is_writable(flags: u32) -> bool {
         ((flags as libc::c_int & libc::O_RDWR) != 0) ||
             ((flags as libc::c_int & libc::O_WRONLY) != 0)
@@ -391,21 +393,14 @@ impl<C> DorkFS<C> where
         Self::octal_to_val(u, g, o) & (!self.umask)
     }
 
-    pub fn with_overlay(overlay: FilesystemOverlay<C>,
-                        uid: u32,
-                        gid: u32,
-                        umask: u16) -> Result<Self, Error> {
-        let state = FsState {
-            overlay: ControlDir::new(overlay),
-            open_handles: OpenHandleSet::new()
-        };
-        let fs = DorkFS {
-            state: RwLock::new(state),
-            uid,
-            gid,
-            umask
-        };
-        Ok(fs)
+    pub fn with_overlay(overlay: O, uid: u32, gid: u32, umask: u16) -> Result<Self, Error> {
+        Ok(DorkFS {
+            state: RwLock::new(FsState {
+                overlay,
+                open_handles: OpenHandleSet::new()
+            }),
+            uid, gid, umask
+        })
     }
 
     pub fn mount<P: AsRef<Path>>(self, mountpoint: P) -> Result<(), Error> {
@@ -437,6 +432,6 @@ impl<C> DorkFS<C> where
             .expect("Expect absolute path")
             .join(name);
         let state = self.state.read().unwrap();
-        state.overlay.delete_file(path)
+        state.overlay.delete_file(&path)
     }
 }

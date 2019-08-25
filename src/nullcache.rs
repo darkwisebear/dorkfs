@@ -6,7 +6,8 @@ use std::{
     fs::File,
     collections::HashMap,
     borrow::Borrow,
-    ffi::OsStr
+    ffi::OsStr,
+    sync::Mutex
 };
 
 use tiny_keccak::Keccak;
@@ -85,18 +86,19 @@ pub type NullDirectory = Vec<DirectoryEntry>;
 
 #[derive(Debug, Default)]
 pub struct NullCache {
-    branches: HashMap<String, CacheRef>
+    branches: Mutex<HashMap<String, CacheRef>>
 }
 
 impl CacheLayer for NullCache {
     type File = NullFile;
     type Directory = NullDirectory;
+    type GetFuture = ::futures::future::FutureResult<CacheObject<NullFile, NullDirectory>, cache::CacheError>;
 
     fn get(&self, cache_ref: &CacheRef) -> cache::Result<CacheObject<Self::File, Self::Directory>> {
         Err(CacheError::ObjectNotFound(cache_ref.clone()))
     }
 
-    fn add_file_by_path(&self, source_path: &Path) -> Result<CacheRef, CacheError> {
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef, CacheError> {
         let mut keccak = HashWriter::new();
 
         let mut file = File::open(source_path)?;
@@ -106,11 +108,11 @@ impl CacheLayer for NullCache {
         Ok(CacheRef(keccak.into()))
     }
 
-    fn add_directory(&self, items: &mut Iterator<Item=DirectoryEntry>)
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I)
         -> Result<CacheRef, CacheError> {
         let mut keccak = HashWriter::new();
 
-        items.fold(Ok(0), |result, entry|
+        items.into_iter().fold(Ok(0), |result, entry|
             // TODO: Add object type
             result.and_then(|_| keccak.write(entry.name.as_bytes()))
                 .and_then(|_| keccak.write(entry.cache_ref.0.as_ref())))?;
@@ -129,16 +131,20 @@ impl CacheLayer for NullCache {
         Ok(CacheRef(keccak.into()))
     }
 
-    fn get_head_commit(&self, branch: &str) -> Result<Option<CacheRef>, CacheError> {
-        Ok(self.branches.get(branch).cloned())
+    fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>, CacheError> {
+        Ok(self.branches.lock().unwrap().get(branch.as_ref()).cloned())
     }
 
-    fn merge_commit(&mut self, branch: &str, cache_ref: CacheRef) -> Result<CacheRef, CacheError> {
-        self.branches.insert(branch.to_string(), cache_ref);
-        Ok(cache_ref)
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef, CacheError> {
+        self.branches.lock().unwrap().insert(branch.as_ref().to_string(), *cache_ref);
+        Ok(*cache_ref)
     }
 
-    fn create_branch(&mut self, branch: &str, cache_ref: CacheRef) -> Result<(), CacheError> {
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<(), CacheError> {
         self.merge_commit(branch, cache_ref).map(|_| ())
+    }
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
+        self.get(cache_ref).into()
     }
 }

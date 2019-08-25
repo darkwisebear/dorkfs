@@ -31,6 +31,9 @@ futures = "0.1"
 tokio = "0.1"
 base64 = "0.9"
 bytes = "0.4"
+regex = "1.1"
+owning_ref = "0.4"
+either = "1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse_mt = "0.4"
