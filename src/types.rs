@@ -10,6 +10,7 @@ pub enum ObjectType {
     File,
     Directory,
     Symlink,
+    #[allow(dead_code)]
     Pipe
 }
 

@@ -3,11 +3,10 @@ mod gitconfig;
 
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
-use std::sync::{Arc, Mutex, MutexGuard, atomic::AtomicUsize, Condvar};
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex, Condvar};
 use std::borrow::{Cow, Borrow};
-use std::io::{self, Read, Seek, Write, BufRead, SeekFrom, Cursor};
-use std::error;
+use std::io::{self, Read, Seek, Write, SeekFrom};
 
 use futures::{task::{self, Task}, prelude::*};
 use failure::Fallible;
@@ -160,46 +159,12 @@ impl SyncedBufferContent {
 #[derive(Debug, Default)]
 pub struct SyncedBuffer(Mutex<SyncedBufferContent>, Condvar);
 
-impl SyncedBuffer {
-    fn new(content: SyncedBufferContent) -> Self {
-        Self(Mutex::new(content), Condvar::new())
-    }
-}
-
-impl SyncedBuffer {
-}
-
 #[derive(Default, Debug)]
 pub struct SharedBuffer {
     buffer: Arc<SyncedBuffer>
 }
 
 impl SharedBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_content(content: Box<[u8]>) -> Self {
-        let inner = SyncedBufferContent {
-            buf: Vec::from(content),
-            finished: true,
-            ..SyncedBufferContent::default()
-        };
-        let buffer = SyncedBuffer::new(inner);
-
-        Self {
-            buffer: Arc::new(buffer)
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.buffer.0.lock().unwrap().buf.len()
-    }
-
-    pub fn build_reader(&self) -> SharedBufferReader {
-        SharedBufferReader { buffer: Arc::clone(&self.buffer), pos: 0 }
-    }
-
     fn finish(&mut self) {
         self.buffer.0.lock().unwrap().finished = true;
         self.buffer.1.notify_all();
@@ -235,12 +200,6 @@ impl AsyncWrite for SharedBuffer {
 pub struct SharedBufferReader {
     buffer: Arc<SyncedBuffer>,
     pos: usize
-}
-
-impl SharedBufferReader {
-    pub fn len(&self) -> usize {
-        self.buffer.0.lock().unwrap().buf.len()
-    }
 }
 
 impl Read for SharedBufferReader {
@@ -303,20 +262,28 @@ impl Seek for SharedBufferReader {
     }
 }
 
-pub fn collect_strings<T, E, S>(stream: S) -> (SharedBufferReader, impl Future<Item=(), Error=()>)
-    where T: ToString,
-          E: From<io::Error>+Display+Send+'static,
-          S: Stream<Item=T, Error=E>+Send+'static {
-    let mut writer = SharedBuffer::default();
-    let reader = writer.build_reader();
+pub struct CommitRange<'a> {
+    pub start: Option<&'a str>,
+    pub end: Option<&'a str>
+}
 
-    let folding = stream.fold(writer, |writer, item|
-        tokio::io::write_all(writer, item.to_string().into_bytes())
-            .map(|(writer, _)| writer))
-        .map(|mut w| w.finish())
-        .map_err(|e| warn!("Unable to completely render log file to buffer: {}", e));
+impl<'a> CommitRange<'a> {
+    pub fn from_str(range: &'a str) -> Fallible<Self> {
+        let mut split = range.split("..");
+        let start: &str = split.next()
+            .ok_or(format_err!("No range start in range expression\"{}\"", range))?;
+        let end: &str = split.next()
+            .ok_or(format_err!("No range start in range expression\"{}\"", range))?;
 
-    (reader, folding)
+        if split.next().is_some() {
+            bail!("Too many range separators in expression");
+        }
+
+        Ok(Self {
+            start: if start.is_empty() { None } else { Some(start) },
+            end: if start.is_empty() { None } else { Some(end) }
+        })
+    }
 }
 
 #[cfg(test)]

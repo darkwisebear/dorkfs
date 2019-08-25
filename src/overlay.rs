@@ -6,7 +6,7 @@ use std::collections::hash_set;
 use std::iter::{self, FromIterator};
 use std::hash::{Hash, Hasher};
 use std::fmt::{self, Formatter, Display, Debug};
-use std::sync::{self, Arc, Weak, Mutex, RwLock};
+use std::sync::{Arc, Weak, Mutex};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
@@ -14,12 +14,11 @@ use std::cmp::max;
 use std::borrow::Cow;
 use std::vec;
 use std::ops::{Deref, DerefMut};
-use std::mem::replace;
 
 use chrono::{Utc, Offset};
 use either::Either;
 use futures::{
-    Async, IntoFuture, Future, stream
+    Async, Future, Stream
 };
 
 use crate::{
@@ -55,13 +54,6 @@ pub enum Error {
 
     #[fail(display = "{}", _0)]
     Generic(failure::Error)
-}
-
-impl Error {
-    pub fn from_fail<E: failure::Fail>(e: E) -> Self {
-        Error::Generic(failure::Error::from(e))
-    }
-
 }
 
 impl From<io::Error> for Error {
@@ -171,14 +163,34 @@ impl<P: AsRef<Path>> From<(P, FileState)> for WorkspaceFileStatus {
     }
 }
 
+impl WorkspaceFileStatus {
+    pub fn as_path(&self) -> &Path {
+        self.0.as_path()
+    }
+}
+
+impl Display for WorkspaceFileStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let WorkspaceFileStatus(path, state) = self;
+        let state = match state {
+            FileState::New => 'N',
+            FileState::Modified => 'M',
+            FileState::Deleted => 'D',
+            FileState::SubmoduleUpdated => 'S',
+        };
+        write!(f, "{} {}", state, path.display())
+    }
+}
+
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog+'a;
-    type LogStream: stream::Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
+    type LogStream: Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
     type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
     fn get_current_branch(&self) -> Result<Option<Cow<str>>>;
+    // TODO: Check why branch is optional
     fn switch_branch(&mut self, branch: Option<&str>) -> Result<()>;
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
@@ -269,7 +281,7 @@ pub type BoxedDirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
 pub type BoxedRepository = Box<dyn for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
-    LogStream=Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>+Send>,
+    LogStream=Box<dyn Stream<Item=ReferencedCommit, Error=Error>+Send>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
     File=BoxedOverlayFile,
     DirIter=BoxedDirIter>
@@ -325,7 +337,7 @@ impl<T> WorkspaceLog for Box<T> where T: WorkspaceLog+?Sized {}
 
 impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b>+Debug {
     type Log = Box<dyn WorkspaceLog+'a>;
-    type LogStream = Box<dyn stream::Stream<Item=ReferencedCommit, Error=Error>+Send>;
+    type LogStream = Box<dyn Stream<Item=ReferencedCommit, Error=Error>+Send>;
     type StatusIter = Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
@@ -438,6 +450,7 @@ impl OverlayPath {
         self.rel_overlay_path.as_path()
     }
 
+    #[cfg(test)]
     pub fn rel_fs_path(&self) -> &Path {
         self.abs_fs_path.strip_prefix(&self.base_path).unwrap()
     }
@@ -555,7 +568,7 @@ pub struct FilesystemOverlay<C> where C: CacheLayer {
     submodules: PathDispatcher<BoxedRepository>
 }
 
-impl<C: CacheLayer+'static> FilesystemOverlay<C> {
+impl<C: CacheLayer+Debug+Send+Sync+'static> FilesystemOverlay<C> {
     fn file_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("files")
     }
@@ -787,7 +800,7 @@ impl<C: CacheLayer+'static> FilesystemOverlay<C> {
             |e|
                 self.dir_entry_to_directory_entry(&e, overlay_path.clone()))?.into_iter();
 
-        self.cache.add_directory(&mut directory as &mut Iterator<Item=DirectoryEntry>)
+        self.cache.add_directory(&mut directory as &mut dyn Iterator<Item=DirectoryEntry>)
             .map_err(Into::into)
     }
 
@@ -936,67 +949,68 @@ impl<C: CacheLayer, T: Deref<Target=C>> Iterator for CacheLayerLog<C, T> {
 
 pub struct CacheLayerLogStream<C> where C: CacheLayer {
     cache: Arc<C>,
-    current_poll: (CacheRef, <<C as CacheLayer>::GetFuture as IntoFuture>::Future)
+    current_poll: Option<(CacheRef, <C as CacheLayer>::GetFuture)>
 }
 
-impl<C> Debug for CacheLayerLogStream<C> where C: CacheLayer {
+impl<C> Debug for CacheLayerLogStream<C> where C: CacheLayer+Debug {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("CacheLayerLogStream")
             .field("cache", &self.cache)
-            .field("current_poll", &self.current_poll.0)
+            .field("current_poll",
+                   &self.current_poll.as_ref().map(|(cache_ref, _)| cache_ref))
             .finish()
     }
 }
 
 impl<C> CacheLayerLogStream<C> where C: CacheLayer {
     fn new(start_commit: CacheRef, cache: Arc<C>) -> Self {
-        let curr_poll = cache.get_poll(&start_commit).into_future();
+        let curr_poll = cache.get_poll(&start_commit);
         Self {
             cache,
-            current_poll: (start_commit, curr_poll)
+            current_poll: Some((start_commit, curr_poll))
         }
     }
 }
 
-impl<C> stream::Stream for CacheLayerLogStream<C> where C: CacheLayer {
+impl<C> Stream for CacheLayerLogStream<C> where C: CacheLayer {
     type Item = ReferencedCommit;
     type Error = Error;
 
     fn poll(&mut self) -> Result<Async<Option<Self::Item>>> {
-        let (ref mut cur_ref, ref mut cur_poll) = self.current_poll;
+        match self.current_poll.take() {
+            Some((cur_ref, mut cur_poll)) =>
+                match cur_poll.poll() {
+                    Ok(Async::Ready(obj)) => {
+                        let commit = obj.into_commit()?;
 
-        if *cur_ref == CacheRef::null() {
-            Ok(Async::Ready(None))
-        } else {
-            match cur_poll.poll() {
-                Ok(Async::Ready(obj)) => {
-                    let commit = obj.into_commit()?;
+                        if !commit.parents.is_empty() {
+                            if commit.parents.len() > 1 {
+                                warn!("Non-linear history not supported yet!");
+                            }
 
-                    let cache_ref = if !commit.parents.is_empty() {
-                        if commit.parents.len() > 1 {
-                            warn!("Non-linear history not supported yet!");
+                            let new_poll =
+                                self.cache.get_poll(&commit.parents[0]);
+                            self.current_poll = Some((commit.parents[0], new_poll));
                         }
 
-                        *cur_poll = self.cache.get_poll(&commit.parents[0]).into_future();
-                        replace(cur_ref, commit.parents[0])
-                    } else {
-                        *cur_ref = CacheRef::null();
-                        CacheRef::null()
-                    };
+                        Ok(Async::Ready(Some(ReferencedCommit(cur_ref, commit))))
+                    }
 
-                    Ok(Async::Ready(Some(ReferencedCommit(cache_ref, commit))))
-                }
+                    Ok(Async::NotReady) => {
+                        self.current_poll = Some((cur_ref, cur_poll));
+                        Ok(Async::NotReady)
+                    }
 
-                Ok(Async::NotReady) => Ok(Async::NotReady),
+                    Err(e) => Err(Error::from(e))
+                },
 
-                Err(e) => Err(Error::from(e))
-            }
+            None => Ok(Async::Ready(None))
         }
     }
 }
 
 impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
-    where C: CacheLayer {
+    where C: CacheLayer+Debug+Send+Sync+'static {
     type Log = CacheLayerLog<C, &'a C>;
     type LogStream = CacheLayerLogStream<C>;
     type StatusIter = iter::Chain<FSStatusIter<'a, C>, BoxedRepoDispatcherIter<'a, C>>;
@@ -1130,9 +1144,9 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
 }
 
 pub struct BoxedRepoDispatcherIter<'a, C>(dispatch::Iter<'a, BoxedRepository>, &'a FilesystemOverlay<C>)
-    where C: CacheLayer+'a;
+    where C: CacheLayer+Debug+Send+Sync+'static;
 
-impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+'a {
+impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+Debug+Send+Sync+'static {
     fn new(overlay: &'a FilesystemOverlay<C>) -> Result<Self> {
         let iter = overlay.submodules.iter();
         Ok(BoxedRepoDispatcherIter(iter, overlay))
@@ -1140,7 +1154,7 @@ impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+'a {
 }
 
 impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
-    where C: CacheLayer+'static {
+    where C: CacheLayer+Debug+Send+Sync+'static {
     type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1205,7 +1219,7 @@ impl<'a, C: CacheLayer> FSStatusIter<'a, C> {
     }
 }
 
-impl<'a, C: CacheLayer+'static> Iterator for FSStatusIter<'a, C> {
+impl<'a, C: CacheLayer+Debug+Send+Sync+'static> Iterator for FSStatusIter<'a, C> {
     type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1284,7 +1298,7 @@ type AddResultFn<T> = fn(T) -> Result<T>;
 type MapAddResultToHashSetIter<T> = iter::Map<hash_set::IntoIter<T>, AddResultFn<T>>;
 type HashOrBoxedDirIter = Either<MapAddResultToHashSetIter<OverlayDirEntry>, BoxedDirIter>;
 
-impl<C: CacheLayer+Debug+'static> Overlay for FilesystemOverlay<C> {
+impl<C: CacheLayer+Debug+Send+Sync+'static> Overlay for FilesystemOverlay<C> {
     type File = FSOverlayFile<C>;
     type DirIter = HashOrBoxedDirIter;
 
@@ -2215,7 +2229,7 @@ mod test {
                 .expect("Unable to reopen second test file");
 
         // 3. Alter the other file directly in the cache
-        let cache = overlay.get_cache_mut();
+        let cache = overlay.get_cache();
         let commit = cache.get(&commit_ref)
             .and_then(CacheObject::into_commit)
             .expect("Unable to retrieve first commit object");
@@ -2250,7 +2264,8 @@ mod test {
         let newcommit_ref =
             cache.add_commit(new_commit)
                 .expect("Unable to add commit that alters a file");
-        cache.inner_mut().set_reference("master", &newcommit_ref).unwrap();
+        cache.inner().set_reference("master", &newcommit_ref).unwrap();
+        drop(cache);
 
         // 4. Commit the other file
         overlay.commit("Altered first test file")
@@ -2277,7 +2292,8 @@ mod test {
 
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let fs_overlay = open_working_copy(tempdir.path());
-        let control_overlay = ControlDir::new(fs_overlay);
+        let control_overlay =
+            ControlDir::new(fs_overlay, tempdir);
         let boxed_overlay = Box::new(RepositoryWrapper::new(control_overlay))
             as BoxedRepository;
         bounds_test(boxed_overlay);

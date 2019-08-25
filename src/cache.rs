@@ -44,9 +44,6 @@ pub enum CacheError {
     #[fail(display = "Runtime error {}: {}", _0, _1)]
     Custom(&'static str, Error),
 
-    #[fail(display = "Runtime error {}", _0)]
-    RuntimeError(Error),
-
     #[fail(display = "Layer error: {}", _0)]
     LayerError(Error)
 }
@@ -370,7 +367,7 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
     }
 }
 
-pub trait CacheLayer: Debug+Send+Sync+'static {
+pub trait CacheLayer {
     type File: ReadonlyFile+Debug;
     type Directory: Directory+Debug;
     type GetFuture: Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send;

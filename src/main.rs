@@ -1,6 +1,6 @@
 #![allow(clippy::unneeded_field_pattern, clippy::new_ret_no_self)]
 
-extern crate clap;
+#[macro_use] extern crate clap;
 #[macro_use] extern crate failure;
 #[macro_use] extern crate failure_derive;
 extern crate libc;
@@ -24,9 +24,12 @@ extern crate bytes;
 extern crate regex;
 extern crate owning_ref;
 extern crate either;
+extern crate glob;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;
+#[cfg(target_os = "linux")]
+extern crate tokio_uds;
 
 #[cfg(target_os = "linux")]
 mod fuse;
@@ -42,6 +45,7 @@ mod hashfilecache;
 mod github;
 #[cfg(test)]
 mod nullcache;
+mod commandstream;
 
 mod tokio_runtime {
     use std::{
@@ -104,7 +108,6 @@ use std::ffi::CString;
 use std::io::Read;
 
 use failure::Fallible;
-use futures::IntoFuture;
 use clap::ArgMatches;
 
 use crate::{
@@ -112,7 +115,7 @@ use crate::{
     overlay::{WorkspaceController, FilesystemOverlay, BoxedRepository, RepositoryWrapper, Overlay},
     cache::{CacheLayer, CacheRef},
     control::ControlDir,
-    utility::RepoUrl,
+    utility::{RepoUrl, CommitRange},
     types::RepoRef
 };
 
@@ -184,9 +187,11 @@ fn resolve_gid(gid: Option<&str>) -> Fallible<u32> {
 }
 
 fn parse_arguments() -> clap::ArgMatches<'static> {
-    use clap::{App, Arg};
+    use clap::{App, Arg, SubCommand};
 
-    let mount = App::new("mount")
+    let mount = SubCommand::with_name("mount")
+        .about("Mounts the given repository at the given directory using the given temporary file \
+        path for internal metadata and state")
         .arg(Arg::with_name("cachedir")
             .takes_value(true)
             .required(true)
@@ -219,8 +224,65 @@ fn parse_arguments() -> clap::ArgMatches<'static> {
             .short("b")
             .help("Remote branch that shall be tracked instead of the default branch"));
 
+    let log = SubCommand::with_name("log")
+        .about("Prints the commit log history of the repository that is mounted at the current \
+        working directory")
+        .arg(Arg::with_name("commit_range")
+            .default_value("..")
+            .help("Specify the commit range that is being displayed. Currently, only the \
+            full range or a start commit can be specified. The full range looks like this: \"..\". \
+            With a start commit, the range looks like this: \"<start_commit>..\""));
+
+    let switch = SubCommand::with_name("switch")
+        .about("Switch to the given target branch")
+        .arg(Arg::with_name("target_branch")
+            .required(true)
+            .help("Switch to the given branch. All overlay files will stay as-is."));
+
+    let branch = SubCommand::with_name("branch")
+        .about("Print the current branch or create a new branch at the current HEAD of the current \
+        branch")
+        .arg(Arg::with_name("new_branch")
+            .help("When given, create a branch with this name that starts at HEAD of the \
+            current branch"));
+
+    let revert = SubCommand::with_name("revert")
+        .about("Revert the set of files that match a given glob expression")
+        .arg(Arg::with_name("revert_glob")
+                 .default_value("*")
+                 .help("Specify a glob that tells which files shall be reverted"))
+        .arg(Arg::with_name("dry_run")
+                 .long("dry-run"));
+
+    let status = SubCommand::with_name("status")
+        .about("Displays the current workspace status which is a list of files that have been \
+        added/deleted/modified");
+
+    let update = SubCommand::with_name("update")
+        .about("Update the working area to the HEAD revision of the server. Equivalent to \
+        calling \"branch\" without arguments");
+
+    let commit = SubCommand::with_name("commit")
+        .about("Create a new commit with all changes that have been done inside the mounted \
+        repository")
+        .arg(Arg::with_name("message")
+             .short("m")
+             .help("Use the given message as the message for the newly created commit")
+             .takes_value(true)
+             .required(true));
+
     let dorkfs = App::new("dorkfs")
-        .subcommand(mount);
+        .version(crate_version!())
+        .about("Mount git repositories and work with them just as you would with an ordinary disk \
+        drive")
+        .subcommand(mount)
+        .subcommand(log)
+        .subcommand(switch)
+        .subcommand(branch)
+        .subcommand(revert)
+        .subcommand(status)
+        .subcommand(commit)
+        .subcommand(update);
 
     dorkfs.get_matches()
 }
@@ -247,8 +309,8 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
     where R: Read,
           P: AsRef<Path>,
           Q: AsRef<Path>,
-          C: CacheLayer+Send+Sync+'static,
-          <<C as CacheLayer>::GetFuture as futures::IntoFuture>::Future: Send {
+          C: CacheLayer+Debug+Send+Sync+'static,
+          <C as CacheLayer>::GetFuture: Send {
     let head_commit = match fs.get_current_head_ref()? {
         Some(head_commit) => {
             let cache = fs.get_cache();
@@ -331,6 +393,8 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
         }
     };
 
+    let tempdir = tempfile::tempdir()?;
+
     FilesystemOverlay::new(rootrepo,
                            Cow::Owned(overlaydir.join("root")),
                            branch)
@@ -374,8 +438,10 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
 
             Ok(fs)
         })
-        .map(|overlay|
-            Box::new(RepositoryWrapper::new(ControlDir::new(overlay))) as BoxedRepository)
+        .map(move |overlay| {
+            let control_dir = ControlDir::new(overlay, tempdir);
+            Box::new(RepositoryWrapper::new(control_dir)) as BoxedRepository
+        })
         .map_err(Into::into)
 }
 
@@ -420,12 +486,76 @@ fn mount(args: &ArgMatches) {
     }
 }
 
+fn log(args: &ArgMatches) {
+    let range = CommitRange::from_str(args.value_of("commit_range")
+        .unwrap())
+        .expect("Unparsable commit range");
+
+    let start = match range {
+        CommitRange {
+            start,
+            end: None
+        } => start,
+
+        _ => unimplemented!("Only unbounded and ranges with only a start supported")
+    };
+
+    let start_commit = start
+        .map(|s| cache::CacheRef::from_str(s)
+            .expect("Unable to parse start ref in range"));
+
+    let log_command = commandstream::Command::Log { start_commit };
+    commandstream::send_command(log_command);
+}
+
 fn main() {
     init_logging();
 
     let args = parse_arguments();
     match args.subcommand() {
         ("mount", Some(subargs)) => mount(subargs),
-        _ => print!("{}", args.usage())
+        ("log", Some(subargs)) => log(subargs),
+        ("status", Some(_)) =>
+            commandstream::send_command(commandstream::Command::Status),
+        ("branch", Some(subargs)) => {
+            let command = match subargs.value_of("new_branch") {
+                Some(target_branch_name) => commandstream::Command::CreateBranch {
+                    name: target_branch_name.to_string()
+                },
+
+                None => commandstream::Command::CurrentBranch {
+                    target_branch: None
+                }
+            };
+
+            commandstream::send_command(command)
+        }
+        ("switch", Some(subargs)) => {
+            let target_branch = subargs.value_of("target_branch").unwrap();
+            commandstream::send_command(
+                commandstream::Command::CurrentBranch {
+                    target_branch: Some(target_branch.to_string())
+                })
+        }
+        ("revert", Some(subargs)) => {
+            let path_glob = subargs.value_of("revert_glob").unwrap().to_string();
+            let dry_run = subargs.is_present("dry_run");
+            let command = commandstream::Command::Revert {
+                path_glob, dry_run
+            };
+
+            commandstream::send_command(command)
+        }
+        ("update", Some(_)) => {
+            commandstream::send_command(commandstream::Command::CurrentBranch {
+                target_branch: None
+            })
+        }
+        ("commit", Some(subargs)) => {
+            commandstream::send_command(commandstream::Command::Commit {
+                message: subargs.value_of("message").unwrap().to_string()
+            })
+        }
+        _ => unreachable!()
     }
 }

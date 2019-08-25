@@ -3,15 +3,19 @@ use std::{
     io::Write,
     path::Path,
     fmt::{self, Debug, Formatter},
-    result
+    result,
+    sync::Mutex
 };
 
 use git2;
 use tempfile;
+use futures::future::FutureResult;
+use failure;
 
 use crate::cache::*;
 
 type GitResult<T> = result::Result<T, git2::Error>;
+type GitGetFuture<T> = FutureResult<T, CacheError>;
 
 #[derive(Debug, Fail)]
 enum GitLayerError {
@@ -22,7 +26,10 @@ enum GitLayerError {
     BadObjectType(git2::ObjectType),
 
     #[fail(display = "Unknown object type")]
-    UnknownObjectType
+    UnknownObjectType,
+
+    #[fail(display = "Git operation failed")]
+    RuntimeError(failure::Error)
 }
 
 impl LayerError for GitLayerError {}
@@ -34,7 +41,7 @@ impl From<git2::Error> for GitLayerError {
 }
 
 pub struct GitCache {
-    repo: git2::Repository
+    repo: Mutex<git2::Repository>
 }
 
 impl Debug for GitCache {
@@ -46,13 +53,13 @@ impl Debug for GitCache {
 impl GitCache {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(GitCache {
-            repo: git2::Repository::init(path).map_err(GitLayerError::from)?
+            repo: Mutex::new(git2::Repository::init(path).map_err(GitLayerError::from)?)
         })
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(GitCache {
-            repo: git2::Repository::open(path).map_err(GitLayerError::from)?
+            repo: Mutex::new(git2::Repository::open(path).map_err(GitLayerError::from)?)
         })
     }
 
@@ -92,12 +99,13 @@ impl GitCache {
 
     fn do_commit(&self, commit: Commit) -> GitResult<git2::Oid> {
         let sig = git2::Signature::now("John Doe", "john.doe@example.com")?;
+        let repo = self.repo.lock().unwrap();
         let parents = commit.parents.into_iter().map(|parent|
-            self.repo.find_commit(Self::cache_ref_to_oid(&parent)))
+            repo.find_commit(Self::cache_ref_to_oid(&parent)))
             .collect::<GitResult<Vec<_>>>()?;
         let parents_ref = parents.iter().collect::<Vec<_>>();
-        let tree = self.repo.find_tree(Self::cache_ref_to_oid(&commit.tree))?;
-        self.repo.commit(None, &sig, &sig,
+        let tree = repo.find_tree(Self::cache_ref_to_oid(&commit.tree))?;
+        repo.commit(None, &sig, &sig,
                     commit.message.as_str(), &tree, parents_ref.as_slice())
     }
 
@@ -107,19 +115,19 @@ impl GitCache {
             name: String::from_utf8_lossy(tree_entry.name_bytes()).into_owned(),
             cache_ref: Self::oid_to_cache_ref(tree_entry.id()),
             object_type: Self::git_type_to_object_type(tree_entry.kind())?,
-            size: self.repo.find_blob(tree_entry.id())
+            size: self.repo.lock().unwrap().find_blob(tree_entry.id())
                 .map(|blob| blob.content().len())
                 .unwrap_or(0) as u64
         })
     }
 
     fn get_branch_oid<S: AsRef<str>>(&self, branch: S) -> GitResult<git2::Oid> {
-        self.repo.refname_to_id(Self::branch_to_ref(branch).as_str())
+        self.repo.lock().unwrap().refname_to_id(Self::branch_to_ref(branch).as_str())
     }
 
     #[cfg(test)]
     pub fn set_reference(&self, branch: &str, cache_ref: &CacheRef) -> Result<()> {
-        self.repo.find_reference(Self::branch_to_ref(branch).as_str())
+        self.repo.lock().unwrap().find_reference(Self::branch_to_ref(branch).as_str())
             .and_then(|mut reference|
                 reference.set_target(Self::cache_ref_to_oid(cache_ref),
                                      format!("Set {} to {}", branch, cache_ref).as_str()))
@@ -131,11 +139,12 @@ impl GitCache {
 impl CacheLayer for GitCache {
     type File = File;
     type Directory = Vec<DirectoryEntry>;
-    type GetFuture = Result<CacheObject<File, Vec<DirectoryEntry>>>;
+    type GetFuture = GitGetFuture<CacheObject<File, Vec<DirectoryEntry>>>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
+        let repo = self.repo.lock().unwrap();
         let gitobj =
-            self.repo.find_object(Self::cache_ref_to_oid(cache_ref), None)
+            repo.find_object(Self::cache_ref_to_oid(cache_ref), None)
                 .map_err(GitLayerError::from)?;
         match gitobj.kind() {
             Some(git2::ObjectType::Blob) => {
@@ -161,7 +170,7 @@ impl CacheLayer for GitCache {
                     use chrono::{TimeZone, FixedOffset, DateTime};
                     let time = commit.time();
                     let offset = FixedOffset::east_opt(time.offset_minutes())
-                        .ok_or(CacheError::RuntimeError(format_err!("Bad time offset")))?;
+                        .ok_or(GitLayerError::RuntimeError(format_err!("Bad time offset").into()))?;
                     offset.timestamp(time.seconds(), 0)
                 };
                 let commit = Commit {
@@ -180,13 +189,13 @@ impl CacheLayer for GitCache {
     }
 
     fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef> {
-        self.repo.blob_path(source_path.as_ref())
+        self.repo.lock().unwrap().blob_path(source_path.as_ref())
             .map(Self::oid_to_cache_ref)
             .map_err(|e| GitLayerError::GitError(e).into())
     }
 
     fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef> {
-        self.repo.treebuilder(None)
+        self.repo.lock().unwrap().treebuilder(None)
             .and_then(|mut builder| {
                 for entry in items {
                     let filemode = Self::filemode_from_direntry(&entry);
@@ -218,8 +227,9 @@ impl CacheLayer for GitCache {
 
     fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
         let reference = self.get_branch_oid(branch.as_ref());
+        let repo = self.repo.lock().unwrap();
         match reference {
-            Ok(reference) => self.repo.find_commit(reference),
+            Ok(reference) => repo.find_commit(reference),
             Err(git_err) => match git_err.code() {
                 git2::ErrorCode::NotFound => return self.create_branch(branch.as_ref(), cache_ref)
                     .map(|_| *cache_ref),
@@ -227,23 +237,23 @@ impl CacheLayer for GitCache {
             }
         }
         .and_then(|commit1| {
-            let commit2 = self.repo.find_commit(Self::cache_ref_to_oid(&cache_ref))?;
+            let commit2 = repo.find_commit(Self::cache_ref_to_oid(&cache_ref))?;
             let mut merge_opts = git2::MergeOptions::new();
 
             merge_opts.fail_on_conflict(true);
-            let tree_id = self.repo.merge_commits(&commit1, &commit2,
+            let tree_id = repo.merge_commits(&commit1, &commit2,
                                                   Some(&merge_opts))
                 .and_then(|mut index| {
-                    self.repo.set_index(&mut index);
+                    repo.set_index(&mut index);
                     index.write_tree()
                 })?;
 
             let sig = git2::Signature::now("John Doe", "john.doe@example.com")?;
             let commits = [&commit1, &commit2];
-            let tree = self.repo.find_tree(tree_id)?;
+            let tree = repo.find_tree(tree_id)?;
             let commit_msg =
                 format!("Merge {} into {} on branch {}", cache_ref, commit1.id(), branch.as_ref());
-            self.repo.commit(Some(Self::branch_to_ref(branch).as_str()),
+            repo.commit(Some(Self::branch_to_ref(branch).as_str()),
                              &sig, &sig, commit_msg.as_str(), &tree,
                              &commits[..])
 
@@ -253,7 +263,7 @@ impl CacheLayer for GitCache {
     }
 
     fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<()> {
-        self.repo.reference(Self::branch_to_ref(branch.as_ref()).as_str(),
+        self.repo.lock().unwrap().reference(Self::branch_to_ref(branch.as_ref()).as_str(),
                             Self::cache_ref_to_oid(cache_ref), false,
                             format!("Create reference {}", branch.as_ref()).as_str())
             .map_err(|e| GitLayerError::GitError(e).into())
@@ -261,6 +271,6 @@ impl CacheLayer for GitCache {
     }
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
-        self.get(cache_ref)
+        FutureResult::from(self.get(cache_ref))
     }
 }

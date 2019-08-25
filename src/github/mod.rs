@@ -4,7 +4,7 @@ mod graphql;
 use std::path::{PathBuf, Path};
 use std::io::{self, Read, Seek, SeekFrom, Cursor};
 use std::fs;
-use std::sync::{Arc, Weak, Mutex, mpsc::channel};
+use std::sync::{Arc, Mutex};
 use std::str::{self, FromStr};
 use std::collections::HashMap;
 use std::default::Default;
@@ -14,8 +14,8 @@ use std::time::Duration;
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
 use hyper_tls::{self, HttpsConnector};
-use futures::{self, Stream, Future, future, IntoFuture};
-use tokio::{prelude::FutureExt, runtime::Runtime, self};
+use futures::{self, Stream, Future, future};
+use tokio::{runtime::Runtime, self};
 use serde_json::de::from_slice as from_json_slice;
 use serde_json::ser::to_string as to_json_string;
 use failure;
@@ -25,7 +25,6 @@ use bytes::Bytes;
 use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
                    CacheLayer, LayerError, Commit};
 use crate::utility::{RepoUrl, gitmodules::GitModules};
-use crate::overlay::FSOverlayFile::CacheFile;
 use crate::tokio_runtime;
 
 pub fn initialize_github_submodules<R: Read>(file: R,
