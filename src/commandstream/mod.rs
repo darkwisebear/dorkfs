@@ -482,7 +482,7 @@ mod test {
     }
 
     #[test]
-    fn commit_via_file() {
+    fn commit() {
         crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
