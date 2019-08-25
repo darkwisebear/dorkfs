@@ -348,7 +348,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 }
 
 pub fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
-    -> impl Future<Item=(), Error=failure::Error> where R: Overlay+for<'a> WorkspaceController<'a>+'static,
+    -> impl Future<Item=(), Error=()> where R: Overlay+for<'a> WorkspaceController<'a>+'static,
                                                         C: AsyncRead+AsyncWrite+Send+'static {
     let (input, output) = channel.split();
     tokio::io::read_to_end(input, Vec::new())
@@ -375,17 +375,20 @@ pub fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
 
 #[cfg(target_os = "linux")]
 pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>)
-    -> impl Future<Item=(), Error=failure::Error> where P: AsRef<Path>,
-                                                        R: Overlay+for<'a> WorkspaceController<'a> {
+    -> impl Future<Item=(), Error=()> where P: AsRef<Path>,
+                                            R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
     debug!("Creating command socket at {}", path.as_ref().display());
 
     let listener = tokio_uds::UnixListener::bind(&path)
         .expect(format!("Unable to bind UDS listener {}", path.as_ref().display()).as_str());
 
     listener.incoming()
-        .map_err(failure::Error::from)
+        .map_err(|e| {
+            error!("Error during command socket processing: {}", e);
+            ()
+        })
         .for_each(move |connection|
-            execute_commands(connection, command_executor.clone()))
+            tokio::spawn(execute_commands(connection, command_executor.clone())))
 }
 
 #[cfg(target_os = "linux")]

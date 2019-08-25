@@ -11,7 +11,6 @@ use std::vec;
 
 use chrono;
 use owning_ref::{RwLockReadGuardRef, OwningHandle};
-use futures::Future;
 
 use crate::{
     types::{Metadata, ObjectType, RepoRef},
@@ -272,11 +271,7 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
                 crate::commandstream::CommandExecutor::new(Arc::clone(&overlay));
             let command_socket_future =
                 crate::commandstream::create_command_socket(dorkcmd_path, command_executor);
-            crate::tokio_runtime::get().executor().spawn(command_socket_future
-                .map_err(|e| {
-                    error!("Error during command socket processing: {}", e);
-                    ()
-                }));
+            crate::tokio_runtime::get().executor().spawn(command_socket_future);
         }
 
         ControlDir {
