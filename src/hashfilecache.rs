@@ -1,8 +1,8 @@
 use std::fs::{self, File};
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fmt::Debug;
+use std::io::{self, Read, Write, Seek, SeekFrom, BufReader};
 use std::error::Error;
 use std::iter::FromIterator;
 
@@ -432,14 +432,14 @@ impl<C> HashFileCache<C>  where C: CacheLayer+Debug,
             }
 
             CacheFileType::Directory => {
-                let hash_dir = serde_json::from_reader(file)?;
+                let hash_dir = serde_json::from_reader(BufReader::new(file))?;
                 Ok(CacheObject::Directory(hash_dir))
             }
 
             CacheFileType::Commit => {
                 // If the returned error indicates that data is missing we force the upper layer to
                 // retrieve the object from upstream again.
-                match serde_json::from_reader(file) {
+                match serde_json::from_reader(BufReader::with_capacity(1024, file)) {
                     Ok(commit) => Ok(CacheObject::Commit(commit)),
                     Err(e) => if e.is_data() {
                         self.cache_path.invalidate(cache_ref);
@@ -451,7 +451,7 @@ impl<C> HashFileCache<C>  where C: CacheLayer+Debug,
             }
 
             CacheFileType::Symlink => {
-                let linkdata: LinkData = serde_json::from_reader(file)?;
+                let linkdata: LinkData = serde_json::from_reader(BufReader::with_capacity(256, file))?;
                 Ok(CacheObject::Symlink(linkdata.target))
             }
         }
