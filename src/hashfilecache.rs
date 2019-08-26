@@ -1,13 +1,14 @@
 use std::fs::{self, File};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
-use std::fmt::Debug;
 use std::io::{self, Read, Write, Seek, SeekFrom, BufReader};
+use std::fmt::{self, Formatter, Debug};
 use std::error::Error;
 use std::iter::FromIterator;
 
 use rand::{prelude::*, distributions::Alphanumeric};
 use serde_json;
+use lru::LruCache;
 use serde::Serialize;
 use tokio::{
     prelude::*,
@@ -227,14 +228,40 @@ impl FileCachePath {
     }
 }
 
-#[derive(Debug)]
-pub struct HashFileCache<C> where C: CacheLayer+Debug {
+#[derive(Clone, Debug)]
+enum LruCacheObject {
+    Commit(Commit),
+    Symlink(String),
+    Directory(HashDirectory)
+}
+
+impl Into<CacheObject<HashFile, HashDirectory>> for LruCacheObject {
+    fn into(self) -> CacheObject<HashFile, HashDirectory> {
+        match self {
+            LruCacheObject::Commit(commit) => CacheObject::Commit(commit),
+            LruCacheObject::Symlink(symlink) => CacheObject::Symlink(symlink),
+            LruCacheObject::Directory(dir) => CacheObject::Directory(dir)
+        }
+    }
+}
+
+pub struct HashFileCache<C> where C: CacheLayer {
     cache_path: FileCachePath,
     tokio: Arc<Runtime>,
+    obj_cache: Mutex<LruCache<CacheRef, LruCacheObject>>,
     cache: C
 }
 
-impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer+Debug,
+impl<C: CacheLayer+Debug> Debug for HashFileCache<C> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        fmt.debug_struct("HashFileCache")
+            .field("cache_path", &self.cache_path)
+            .field("cache", &self.cache)
+            .finish()
+    }
+}
+
+impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                                                C::GetFuture: Send+'static,
                                                <C::GetFuture as IntoFuture>::Future: Send+'static,
                                                C::File: Send,
@@ -244,43 +271,65 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer+Debug,
     type GetFuture = Box<Future<Item=CacheObject<HashFile, HashDirectory>, Error=CacheError>+Send>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
-        match self.cache_path.open_object_file(cache_ref)
-            .and_then(|f| self.load_cache_object(cache_ref, f)) {
-            Ok(object) => Ok(object),
+        let mut obj_cache = self.obj_cache.lock().unwrap();
+        if let Some(cached) = obj_cache.get(cache_ref).cloned() {
+            Ok(cached.into())
+        } else {
+            let result = match self.cache_path.open_object_file(cache_ref)
+                .and_then(|f| self.load_cache_object(cache_ref, f)) {
+                Ok(object) => Ok(object),
 
-            Err(CacheError::ObjectNotFound(_)) => {
-                let mut upstream_object =
-                    self.cache.get(cache_ref)?;
-                match upstream_object {
-                    CacheObject::File(ref mut file) => {
-                        self.cache_path.store_file(cache_ref, file)
-                            .and_then(|mut file|
-                                file.seek(SeekFrom::Start(1))
-                                    .map_err(Into::into)
-                                    .map(|_| CacheObject::File(HashFile { file })))
-                    }
+                Err(CacheError::ObjectNotFound(_)) => {
+                    let mut upstream_object =
+                        self.cache.get(cache_ref)?;
+                    match upstream_object {
+                        CacheObject::File(ref mut file) => {
+                            self.cache_path.store_file(cache_ref, file)
+                                .and_then(|mut file|
+                                    file.seek(SeekFrom::Start(1))
+                                        .map_err(Into::into)
+                                        .map(|_| CacheObject::File(HashFile { file })))
+                        }
 
-                    CacheObject::Directory(ref dir) => {
-                        let hash_dir = HashDirectory::from_iter(dir.clone());
-                        self.cache_path.store_json(cache_ref, &hash_dir, CacheFileType::Directory)
-                            .map(|_| CacheObject::Directory(hash_dir))
-                    }
+                        CacheObject::Directory(ref dir) => {
+                            let hash_dir = HashDirectory::from_iter(dir.clone());
+                            self.cache_path.store_json(cache_ref, &hash_dir, CacheFileType::Directory)
+                                .map(|_| CacheObject::Directory(hash_dir))
+                        }
 
-                    CacheObject::Commit(ref commit) =>
-                        self.cache_path.store_json(cache_ref, commit, CacheFileType::Commit)
-                            .map(|_| CacheObject::Commit(commit.clone())),
+                        CacheObject::Commit(ref commit) => {
+                            self.cache_path.store_json(cache_ref, commit, CacheFileType::Commit)
+                                .map(|_| CacheObject::Commit(commit.clone()))
+                        }
 
-                    CacheObject::Symlink(ref symlink) => {
-                        let linkdata = LinkData {
-                            target: symlink.clone()
-                        };
-                        self.cache_path.store_json(cache_ref, &linkdata, CacheFileType::Symlink)
-                            .map(|_| CacheObject::Symlink(symlink.clone()))
+                        CacheObject::Symlink(ref symlink) => {
+                            let linkdata = LinkData {
+                                target: symlink.clone()
+                            };
+                            self.cache_path.store_json(cache_ref, &linkdata, CacheFileType::Symlink)
+                                .map(|_| CacheObject::Symlink(symlink.clone()))
+                        }
                     }
                 }
+
+                Err(e) => Err(e)
+            };
+
+            match result {
+                Ok(CacheObject::Directory(ref dir)) => {
+                        obj_cache.put(*cache_ref, LruCacheObject::Directory(dir.clone()));
+                }
+                Ok(CacheObject::Commit(ref commit)) => {
+                        obj_cache.put(*cache_ref, LruCacheObject::Commit(commit.clone()));
+                }
+                Ok(CacheObject::Symlink(ref symlink)) => {
+                        obj_cache.put(*cache_ref, LruCacheObject::Symlink(symlink.clone()));
+                }
+                Ok(CacheObject::File(..)) => (),
+                Err(_) => ()
             }
 
-            Err(e) => Err(e)
+            result
         }
     }
 
@@ -319,6 +368,8 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer+Debug,
     }
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
+        // TODO: Use LRU object cache here as well
+
         let result = match self.cache_path.open_object_file(cache_ref)
             .and_then(|file| self.load_cache_object(cache_ref, file)) {
             Ok(object) => future::Either::A(future::ok(object)),
@@ -384,7 +435,7 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer+Debug,
     }
 }
 
-impl<C> HashFileCache<C>  where C: CacheLayer+Debug,
+impl<C> HashFileCache<C>  where C: CacheLayer,
                                 C::GetFuture: Send+'static,
                                 <C::GetFuture as IntoFuture>::Future: Send+'static,
                                 C::File: Send,
@@ -402,6 +453,7 @@ impl<C> HashFileCache<C>  where C: CacheLayer+Debug,
         let cache = HashFileCache {
             cache_path,
             tokio: tokio_runtime::get(),
+            obj_cache: Mutex::new(lru::LruCache::new(64)),
             cache
         };
 

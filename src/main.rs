@@ -25,6 +25,7 @@ extern crate regex;
 extern crate owning_ref;
 extern crate either;
 extern crate glob;
+extern crate lru;
 
 #[cfg(target_os = "linux")]
 extern crate fuse_mt;

@@ -6,10 +6,9 @@ use std::io::{self, Read, Seek, SeekFrom, Cursor};
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::str::{self, FromStr};
-use std::collections::HashMap;
-use std::default::Default;
 use std::borrow::Cow;
 use std::time::Duration;
+use std::fmt::{Debug, Formatter, self};
 
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
@@ -21,6 +20,7 @@ use serde_json::ser::to_string as to_json_string;
 use failure;
 use base64;
 use bytes::Bytes;
+use lru::LruCache;
 
 use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
                    CacheLayer, LayerError, Commit};
@@ -567,11 +567,19 @@ query {{ \
     }
 }
 
-#[derive(Debug)]
 pub struct Github {
     request_builder: GithubRequestBuilder,
     tokio: Arc<Runtime>,
-    object_cache: Arc<Mutex<HashMap<CacheRef, CacheObject<GithubBlob, GithubTree>>>>
+    object_cache: Arc<Mutex<LruCache<CacheRef, CacheObject<GithubBlob, GithubTree>>>>
+}
+
+impl Debug for Github {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        fmt.debug_struct("Github")
+            .field("request_builder", &self.request_builder)
+            // TODO: List cached objects
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -679,7 +687,7 @@ impl Github {
         Ok(Github {
             tokio: tokio_runtime::get(),
             request_builder: GithubRequestBuilder(Arc::new(request_builder)),
-            object_cache: Default::default()
+            object_cache: Arc::new(Mutex::new(LruCache::new(8)))
         })
     }
 
@@ -692,8 +700,8 @@ impl Github {
 
     fn query_object(&self, cache_ref: CacheRef, get_blob_contents: bool)
         -> impl Future<Item=CacheObject<GithubBlob, GithubTree>, Error=CacheError> {
-        if let Some(obj) = self.object_cache.lock().unwrap().get(&cache_ref) {
-            future::Either::A(future::ok(obj.clone()))
+        if let Some(obj) = self.object_cache.lock().unwrap().get(&cache_ref).cloned() {
+            future::Either::A(future::ok(obj))
         } else {
             let base_obj = self.request_builder.fetch_remote_object(cache_ref, get_blob_contents);
 
@@ -727,7 +735,7 @@ impl Github {
                             result = Ok(cache_obj.clone());
                         }
                         debug!("Add {} to github cache", obj_cache_ref);
-                        cache.insert(obj_cache_ref, cache_obj);
+                        cache.put(obj_cache_ref, cache_obj);
                     }
 
                     result
