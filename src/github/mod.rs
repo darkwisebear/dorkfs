@@ -201,10 +201,9 @@ impl GithubRequestBuilder {
     fn issue_request(&self, request_builder: request::Builder, body: Body)
         -> impl Future<Item=Response<Bytes>, Error=Error> {
         let request_future = self.build_request(request_builder, body);
-        let response = request_future.inspect(
+        request_future.inspect(
             |response|
-                debug!("Raw response: {}", String::from_utf8_lossy(response.body().as_ref())));
-        response
+                debug!("Raw response: {}", String::from_utf8_lossy(response.body().as_ref())))
     }
 
     fn execute_graphql_query(&self, query: String)
@@ -240,7 +239,7 @@ impl GithubRequestBuilder {
                         .map_err(|e|
                             Error::Custom(format_err!("Base64 decodong failed: {}", e)))
                 } else {
-                    Err(Error::UnsupportedBlobEncoding.into())
+                    Err(Error::UnsupportedBlobEncoding)
                 }
             })
     }
@@ -398,11 +397,11 @@ query {{ \
                             graphql::GitObject::Tree { entries: Some(_), oid: _ } => Ok(object), // We're cool
                             graphql::GitObject::Tree { entries: None, oid: _ } =>
                                 Err(Error::UnexpectedGraphQlResponse(
-                                    "No entries received in tree").into()),
+                                    "No entries received in tree")),
                             _ => {
                                 error!("Unexpected object {:?}", object);
                                 Err(Error::UnexpectedGraphQlResponse(
-                                    "Unexpectedly not receiving a tree object").into())
+                                    "Unexpectedly not receiving a tree object"))
                             }
                         }
                     })
@@ -696,7 +695,7 @@ impl Github {
         if let Some(obj) = self.object_cache.lock().unwrap().get(&cache_ref) {
             future::Either::A(future::ok(obj.clone()))
         } else {
-            let base_obj = self.request_builder.fetch_remote_object(cache_ref.clone(), get_blob_contents);
+            let base_obj = self.request_builder.fetch_remote_object(cache_ref, get_blob_contents);
 
             let request_builder = self.request_builder.clone();
             let obj_with_contents = base_obj
@@ -707,7 +706,7 @@ impl Github {
                 .and_then(move |obj|
                     if get_blob_contents {
                         let blob_with_contents =
-                            request_builder.ensure_git_object_data(cache_ref.clone(), obj)
+                            request_builder.ensure_git_object_data(cache_ref, obj)
                                 .map_err(Into::into);
                         future::Either::A(blob_with_contents)
                     } else {

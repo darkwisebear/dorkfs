@@ -205,7 +205,7 @@ pub struct SharedBufferReader {
 impl Read for SharedBufferReader {
     fn read(&mut self, dest_buf: &mut [u8]) -> io::Result<usize> {
         let mut inner = self.buffer.0.lock().unwrap();
-        let result = loop {
+        loop {
             let buffer = inner.buf.as_slice();
 
             let old_pos = self.pos;
@@ -223,19 +223,15 @@ impl Read for SharedBufferReader {
                 inner.set_max_read_pos(new_pos);
 
                 break Ok(count);
+            } else if inner.finished {
+                break Ok(0);
             } else {
-                if inner.finished {
-                    break Ok(0);
-                } else {
-                    if let Some(task) = inner.task.take() {
-                        task.notify();
-                    }
-                    inner = self.buffer.1.wait(inner).unwrap();
+                if let Some(task) = inner.task.take() {
+                    task.notify();
                 }
+                inner = self.buffer.1.wait(inner).unwrap();
             }
-        };
-
-        result
+        }
     }
 }
 
@@ -252,12 +248,12 @@ impl Seek for SharedBufferReader {
                     self.pos.checked_add(offset as usize)
                 } else {
                     self.pos.checked_sub((-offset) as usize)
-                }.map(|val| val as u64).ok_or(io::ErrorKind::InvalidInput.into()),
+                }.map(|val| val as u64).ok_or_else(|| io::ErrorKind::InvalidInput.into()),
 
             SeekFrom::End(offset) =>
                 self.pos.checked_sub(offset as usize)
                     .map(|val| val as u64)
-                    .ok_or(io::ErrorKind::InvalidInput.into())
+                    .ok_or_else(|| io::ErrorKind::InvalidInput.into())
         }
     }
 }
@@ -271,9 +267,9 @@ impl<'a> CommitRange<'a> {
     pub fn from_str(range: &'a str) -> Fallible<Self> {
         let mut split = range.split("..");
         let start: &str = split.next()
-            .ok_or(format_err!("No range start in range expression\"{}\"", range))?;
+            .ok_or_else(|| format_err!("No range start in range expression\"{}\"", range))?;
         let end: &str = split.next()
-            .ok_or(format_err!("No range start in range expression\"{}\"", range))?;
+            .ok_or_else(|| format_err!("No range start in range expression\"{}\"", range))?;
 
         if split.next().is_some() {
             bail!("Too many range separators in expression");

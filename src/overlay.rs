@@ -1172,7 +1172,7 @@ impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
                 cache::resolve_object_ref(cache, &head_commit, submodule_path)
                     .map_err(Error::Generic)
                     .and_then(|cache_ref|
-                        cache_ref.ok_or(Error::Generic(
+                        cache_ref.ok_or_else(|| Error::Generic(
                             format_err!("Unable to find gitlink for submodule in path {}",
                                         submodule_path.display())))) {
                 Ok(gitlink) => gitlink,
@@ -1181,7 +1181,7 @@ impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
 
             let head_ref = match overlay.get_current_head_ref()
                 .and_then(|r|
-                    r.ok_or(Error::MissingHeadRef(format!("No head ref for submodule {}",
+                    r.ok_or_else(|| Error::MissingHeadRef(format!("No head ref for submodule {}",
                                                               submodule_path.display())))) {
                 Ok(head) => head,
                 Err(e) => return Some(Err(e))

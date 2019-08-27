@@ -353,7 +353,7 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer+Debug,
 
             Err(CacheError::ObjectNotFound(_)) => {
                 let cache_path = self.cache_path.clone();
-                let cache_ref = cache_ref.clone();
+                let cache_ref = *cache_ref;
                 let upstream_object_future =
                     self.cache.get_poll(&cache_ref)
                         .into_future()

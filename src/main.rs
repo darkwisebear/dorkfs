@@ -331,7 +331,7 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
                         cache::resolve_object_ref(cache, &head_commit, &submodule_path)
                             .map_err(failure::Error::from)
                             .and_then(|cache_ref|
-                                cache_ref.ok_or(
+                                cache_ref.ok_or_else(||
                                     format_err!("Unable to find gitlink for submodule in path {}",
                                                     submodule_path.display())));
                     match gitlink_ref {

@@ -172,7 +172,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                         repo.get_current_head_ref()
                             .map(|cache_ref| {
                                 let cache_ref = cache_ref
-                                    .unwrap_or_else(|| CacheRef::null());
+                                    .unwrap_or_else(CacheRef::null);
                                 (Cow::Borrowed(&"(detached)"[..]), cache_ref)
                             })
                             .map_err(failure::Error::from),
@@ -385,7 +385,6 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
     listener.incoming()
         .map_err(|e| {
             error!("Error during command socket processing: {}", e);
-            ()
         })
         .for_each(move |connection|
             tokio::spawn(execute_commands(connection, command_executor.clone())))
@@ -421,8 +420,7 @@ fn find_command_stream() -> impl Future<Item=tokio_uds::UnixStream, Error=io::Er
     }
 
     find_stream_path().into_future()
-        .and_then(|command_socket_path|
-            tokio_uds::UnixStream::connect(command_socket_path))
+        .and_then(tokio_uds::UnixStream::connect)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -450,7 +448,6 @@ pub fn send_command(command: Command) {
         .map(|_| ())
         .map_err(|e| {
             error!("Unable to communicate with daemon: {}", e);
-            ()
         });
 
     tokio::runtime::run(task);

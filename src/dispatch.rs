@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::mem::replace;
 use std::iter;
 use std::slice;
+use std::default::Default;
 
 use failure::Fallible;
 
@@ -18,13 +19,13 @@ pub struct PathDispatcher<O: Debug> {
     root: Option<O>
 }
 
+type SubPathIter<'a, O> = iter::Map<slice::Iter<'a, DispatcherEntry<O>>,
+    fn(&DispatcherEntry<O>) -> (&O, &Path)>;
+type RootRepoIter<'a, O> = iter::FilterMap<iter::Once<&'a Option<O>>,
+    fn(&Option<O>) -> Option<(&O, &Path)>>;
+
 #[derive(Debug)]
-pub struct Iter<'a, O: Debug>(
-iter::Chain<
-    iter::Map<slice::Iter<'a, DispatcherEntry<O>>,
-        fn(&DispatcherEntry<O>) -> (&O, &Path)>,
-    iter::FilterMap<iter::Once<&'a Option<O>>,
-        fn(&Option<O>) -> Option<(&O, &Path)>>>);
+pub struct Iter<'a, O: Debug>(iter::Chain<SubPathIter<'a, O>, RootRepoIter<'a, O>>);
 
 impl<'a, O: Debug> Iterator for Iter<'a, O> {
     type Item = (&'a O, &'a Path);
@@ -34,12 +35,18 @@ impl<'a, O: Debug> Iterator for Iter<'a, O> {
     }
 }
 
-impl<O: Debug> PathDispatcher<O> {
-    pub fn new() -> Self {
+impl<O: Debug> Default for PathDispatcher<O> {
+    fn default() -> Self {
         PathDispatcher {
             entries: Vec::new(),
             root: None
         }
+    }
+}
+
+impl<O: Debug> PathDispatcher<O> {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     #[cfg(test)]
