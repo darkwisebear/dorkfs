@@ -235,8 +235,8 @@ enum LruCacheObject {
     Directory(HashDirectory)
 }
 
-impl Into<CacheObject<HashFile, HashDirectory>> for LruCacheObject {
-    fn into(self) -> CacheObject<HashFile, HashDirectory> {
+impl<F: ReadonlyFile> Into<CacheObject<F, HashDirectory>> for LruCacheObject {
+    fn into(self) -> CacheObject<F, HashDirectory> {
         match self {
             LruCacheObject::Commit(commit) => CacheObject::Commit(commit),
             LruCacheObject::Symlink(symlink) => CacheObject::Symlink(symlink),
@@ -245,10 +245,41 @@ impl Into<CacheObject<HashFile, HashDirectory>> for LruCacheObject {
     }
 }
 
+struct ObjectCache {
+    cache: LruCache<CacheRef, LruCacheObject>
+}
+
+impl ObjectCache {
+    fn new(cache_size: usize) -> Self {
+        Self {
+            cache: LruCache::new(cache_size)
+        }
+    }
+
+    fn put(&mut self, cache_ref: &CacheRef, obj: &CacheObject<HashFile, HashDirectory>) {
+        match obj {
+            CacheObject::Directory(ref dir) => {
+                   self.cache.put(*cache_ref, LruCacheObject::Directory(dir.clone()));
+            }
+            CacheObject::Commit(ref commit) => {
+                    self.cache.put(*cache_ref, LruCacheObject::Commit(commit.clone()));
+            }
+            CacheObject::Symlink(ref symlink) => {
+                    self.cache.put(*cache_ref, LruCacheObject::Symlink(symlink.clone()));
+            }
+            CacheObject::File(..) => (),
+        }
+    }
+
+    fn get(&mut self, cache_ref: &CacheRef) -> Option<CacheObject<HashFile, HashDirectory>> {
+        self.cache.get(cache_ref).map(|obj| obj.clone().into())
+    }
+}
+
 pub struct HashFileCache<C> where C: CacheLayer {
     cache_path: FileCachePath,
     tokio: Arc<Runtime>,
-    obj_cache: Mutex<LruCache<CacheRef, LruCacheObject>>,
+    obj_cache: Arc<Mutex<ObjectCache>>,
     cache: C
 }
 
@@ -272,8 +303,8 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let mut obj_cache = self.obj_cache.lock().unwrap();
-        if let Some(cached) = obj_cache.get(cache_ref).cloned() {
-            Ok(cached.into())
+        if let Some(cached) = obj_cache.get(cache_ref) {
+            Ok(cached)
         } else {
             let result = match self.cache_path.open_object_file(cache_ref)
                 .and_then(|f| self.load_cache_object(cache_ref, f)) {
@@ -316,16 +347,7 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
             };
 
             match result {
-                Ok(CacheObject::Directory(ref dir)) => {
-                        obj_cache.put(*cache_ref, LruCacheObject::Directory(dir.clone()));
-                }
-                Ok(CacheObject::Commit(ref commit)) => {
-                        obj_cache.put(*cache_ref, LruCacheObject::Commit(commit.clone()));
-                }
-                Ok(CacheObject::Symlink(ref symlink)) => {
-                        obj_cache.put(*cache_ref, LruCacheObject::Symlink(symlink.clone()));
-                }
-                Ok(CacheObject::File(..)) => (),
+                Ok(ref obj) => obj_cache.put(cache_ref, obj),
                 Err(_) => ()
             }
 
@@ -368,20 +390,28 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
     }
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
-        // TODO: Use LRU object cache here as well
-
-        let result = match self.cache_path.open_object_file(cache_ref)
-            .and_then(|file| self.load_cache_object(cache_ref, file)) {
+        let cached_obj = self.obj_cache.lock().unwrap().get(cache_ref);
+        let file_cached = cached_obj.map(Ok)
+            .unwrap_or_else(|| {
+                let file_cached = self.cache_path.open_object_file(cache_ref)
+                    .and_then(|file| self.load_cache_object(cache_ref, file));
+                if let Ok(ref cached_obj) = file_cached {
+                    self.obj_cache.lock().unwrap().put(cache_ref, cached_obj);
+                }
+                file_cached
+            });
+        let result = match file_cached {
             Ok(object) => future::Either::A(future::ok(object)),
 
             Err(CacheError::ObjectNotFound(_)) => {
                 let cache_path = self.cache_path.clone();
                 let cache_ref = *cache_ref;
+                let obj_cache = Arc::clone(&self.obj_cache);
                 let upstream_object_future =
                     self.cache.get_poll(&cache_ref)
                         .into_future()
                         .and_then(move |mut upstream_object| {
-                            match upstream_object {
+                            let result = match upstream_object {
                                 CacheObject::File(ref mut file) => {
                                     cache_path.store_file(&cache_ref, file)
                                         .and_then(|mut file|
@@ -407,7 +437,13 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                                     cache_path.store_json(&cache_ref, &linkdata, CacheFileType::Symlink)
                                         .map(|_| CacheObject::Symlink(symlink.clone()))
                                 }
+                            };
+
+                            if let Ok(ref obj) = result {
+                                obj_cache.lock().unwrap().put(&cache_ref, obj);
                             }
+
+                            result
                         });
 
                 future::Either::B(upstream_object_future)
@@ -453,7 +489,7 @@ impl<C> HashFileCache<C>  where C: CacheLayer,
         let cache = HashFileCache {
             cache_path,
             tokio: tokio_runtime::get(),
-            obj_cache: Mutex::new(lru::LruCache::new(64)),
+            obj_cache: Arc::new(Mutex::new(ObjectCache::new(64))),
             cache
         };
 
