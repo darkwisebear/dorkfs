@@ -11,8 +11,9 @@ use std::time::Duration;
 use std::fmt::{Debug, Formatter, self};
 
 use http::{uri::InvalidUri, request};
-use hyper::{self, Uri, Body, Request, Response, Client, StatusCode, client:: HttpConnector};
+use hyper::{self, Uri, Body, Request, Response, Client, StatusCode};
 use hyper_tls::{self, HttpsConnector};
+use native_tls::TlsConnector;
 use futures::{self, Stream, Future, future};
 use tokio::{runtime::Runtime, self};
 use serde_json::de::from_slice as from_json_slice;
@@ -160,6 +161,8 @@ impl Seek for GithubBlob {
 impl ReadonlyFile for GithubBlob {}
 
 type GithubTree = Vec<DirectoryEntry>;
+type GaiResolver = hyper::client::connect::dns::TokioThreadpoolGaiResolver;
+type HttpConnector = hyper::client::HttpConnector<GaiResolver>;
 
 #[derive(Debug)]
 struct GithubRequestBuilderImpl {
@@ -654,8 +657,11 @@ impl CacheLayer for Github {
 impl Github {
     pub fn new(base_url: &str, org: &str, repo: &str, token: &str)
                -> Result<Self, Error> {
-        let http_client =
-            Client::builder().build(HttpsConnector::new(4)?);
+        let tls_connector = TlsConnector::new()?;
+        let mut http = HttpConnector::new_with_tokio_threadpool_resolver();
+        http.enforce_http(false);
+        let https = HttpsConnector::from((http, tls_connector));
+        let http_client = Client::builder().build(https);
 
         // Here we will also parse the given str. Therefore we can unwrap the parses later as we
         // already verified that the URL is fine.
