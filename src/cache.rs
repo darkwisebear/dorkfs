@@ -14,8 +14,7 @@ use std::fs;
 
 use serde_json;
 use failure::{Fail, Error};
-use serde::{Serialize, Deserialize, Serializer, Deserializer, self};
-use serde::de::Visitor;
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use chrono::{DateTime, FixedOffset};
 use futures::Future;
 
@@ -151,7 +150,7 @@ impl<'a> Iterator for HexCharIterator<'a> {
 
 struct StringVisitor;
 
-impl<'de> Visitor<'de> for StringVisitor {
+impl<'de> serde::de::Visitor<'de> for StringVisitor {
     type Value = CacheRef;
 
     fn expecting(&self, fmt: &mut Formatter) -> fmt::Result {
@@ -174,7 +173,7 @@ pub trait ReadonlyFile: io::Read+io::Seek+Debug {}
 
 impl ReadonlyFile for fs::File {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum ObjectType {
     File,
     Directory,
@@ -226,19 +225,29 @@ impl Hash for DirectoryEntry {
     }
 }
 
+impl Into<(OsString, DirectoryEntry)> for DirectoryEntry {
+    fn into(self) -> (OsString, DirectoryEntry) {
+        let name = OsString::from(&self.name);
+        (name, self)
+    }
+}
+
 pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+FromIterator<DirectoryEntry>+Clone {
-    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry>;
+    fn find_entry<S: Borrow<OsStr>+?Sized>(&self, name: &S) -> Option<&DirectoryEntry>;
 }
 
 impl Directory for Vec<DirectoryEntry> {
-    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
+    fn find_entry<S: Borrow<OsStr>+?Sized>(&self, name: &S) -> Option<&DirectoryEntry> {
         self.iter().find(|entry|
             <String as AsRef<OsStr>>::as_ref(&entry.name) == name.borrow())
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DirectoryImpl(HashMap<OsString, DirectoryEntry>);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryImpl {
+    #[serde(with = "serde_dir_impl")]
+    entries: HashMap<OsString, DirectoryEntry>
+}
 
 type HashMapDirEntryIter = hash_map::IntoIter<OsString, DirectoryEntry>;
 type HashMapEntryToDirectoryEntry = fn((OsString, DirectoryEntry)) -> DirectoryEntry;
@@ -254,23 +263,73 @@ impl IntoIterator for DirectoryImpl {
             e.1
         }
 
-        self.0.into_iter().map(map_entry)
+        self.entries.into_iter().map(map_entry)
     }
 }
 
 impl FromIterator<DirectoryEntry> for DirectoryImpl {
     fn from_iter<T: IntoIterator<Item=DirectoryEntry>>(iter: T) -> Self {
-        let hash_map = iter.into_iter().map(|entry| {
-            let name = OsString::from(&entry.name);
-            (name, entry)
-        }).collect();
-        DirectoryImpl(hash_map)
+        let entries = iter.into_iter().map(Into::into).collect();
+        DirectoryImpl { entries }
     }
 }
 
 impl Directory for DirectoryImpl {
-    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
-        self.0.get(name.borrow())
+    fn find_entry<S: Borrow<OsStr>+?Sized>(&self, name: &S) -> Option<&DirectoryEntry> {
+        self.entries.get(name.borrow())
+    }
+}
+
+mod serde_dir_impl {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::fmt::{self, Formatter};
+
+    use serde::{Serializer, Deserializer, ser::SerializeSeq, de::{Visitor, SeqAccess}};
+
+    use crate::cache::DirectoryEntry;
+    use super::DirectoryImpl;
+
+    pub fn serialize<S>(value: &HashMap<OsString, DirectoryEntry>, serializer: S) -> Result<S::Ok, S::Error>
+        where S: Serializer {
+        let mut seq_serializer = serializer.serialize_seq(Some(value.len()))?;
+        for entry in value.values() {
+            seq_serializer.serialize_element(entry)?;
+        }
+        seq_serializer.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<OsString, DirectoryEntry>, D::Error>
+        where D: Deserializer<'de> {
+
+        struct DirVisitor;
+
+        impl<'de> Visitor<'de> for DirVisitor {
+            type Value = HashMap<OsString, DirectoryEntry>;
+
+            fn expecting(&self, formatter: &mut Formatter) -> fmt::Result {
+                formatter.write_str("a sequence of type \"DirectoryEntry\"")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where A: SeqAccess<'de> {
+                let mut dir = seq.size_hint()
+                    .map(HashMap::with_capacity)
+                    .unwrap_or_default();
+                loop {
+                    match seq.next_element() {
+                        Ok(Some(entry)) => {
+                            let (name, entry) = DirectoryEntry::into(entry);
+                            dir.insert(name, entry);
+                        }
+                        Ok(None) => break Ok(dir),
+                        Err(e) => break Err(e)
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(DirVisitor)
     }
 }
 
@@ -425,6 +484,15 @@ pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P)
 
 #[cfg(test)]
 mod test {
+    use std::str::FromStr;
+    use std::ffi::OsString;
+    use std::iter::FromIterator;
+    use std::collections::HashMap;
+
+    use crate::cache::{DirectoryImpl, Directory, ObjectType, CacheRef, DirectoryEntry};
+
+    use serde_json;
+
     #[test]
     fn hex_char_iterator() {
         use super::HexCharIterator;
@@ -433,5 +501,42 @@ mod test {
         let iter = HexCharIterator::new("123456789abcdef");
         let bytes: Result<Vec<u8>, Error> = iter.collect();
         assert_eq!(vec![0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf], bytes.unwrap());
+    }
+
+    #[test]
+    fn deserialize_directory() {
+        let source = r#"{"entries": [
+            {"name": "test.txt",
+             "size": 1234,
+             "cache_ref": "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+             "object_type": "File"
+            }
+        ]}"#;
+
+        let entries = serde_json::from_str::<DirectoryImpl>(source).unwrap();
+        let entry = entries.find_entry(&OsString::from("test.txt")).unwrap();
+        assert_eq!(entry.name, "test.txt");
+        assert_eq!(entry.size, 1234);
+        assert_eq!(entry.object_type, ObjectType::File);
+        assert_eq!(entry.cache_ref, CacheRef::from_str("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF").unwrap());
+    }
+
+    #[test]
+    fn serialize_directory() {
+        let source = DirectoryImpl {
+            entries: HashMap::from_iter(vec![(OsString::from("test.txt"), DirectoryEntry {
+                name: String::from("test.txt"),
+                size: 1234,
+                object_type: ObjectType::File,
+                cache_ref: CacheRef::from_str("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF").unwrap()
+            })].into_iter())
+        };
+
+        let value = serde_json::to_value(source).unwrap();
+        let first_entry = &value["entries"][0];
+        assert_eq!(first_entry["name"], "test.txt");
+        assert_eq!(first_entry["size"].as_u64().unwrap(), 1234);
+        assert_eq!(first_entry["object_type"], "File");
+        assert_eq!(first_entry["cache_ref"], "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     }
 }

@@ -1,13 +1,10 @@
-use std::fs;
-use std::vec;
+use std::fs::{self, File};
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fmt::Debug;
 use std::error::Error;
 use std::iter::FromIterator;
-use std::borrow::Borrow;
-use std::ffi::OsStr;
 
 use rand::{prelude::*, distributions::Alphanumeric};
 use serde_json;
@@ -19,12 +16,11 @@ use tokio::{
 
 use crate::{
     cache::{
-        Result, CacheError, ReadonlyFile, DirectoryEntry, Directory, CacheLayer, CacheRef,
-        CacheObject, ObjectType, CacheObjectMetadata, Commit
+        Result, CacheError, ReadonlyFile, DirectoryEntry, DirectoryImpl, CacheLayer,
+        CacheRef, CacheObject, ObjectType, CacheObjectMetadata, Commit
     },
     tokio_runtime
 };
-use std::fs::File;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FileMetadata {
@@ -104,31 +100,7 @@ impl Seek for HashFile {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct HashDirectory {
-    entries: Vec<DirectoryEntry>
-}
-
-impl FromIterator<DirectoryEntry> for HashDirectory {
-    fn from_iter<I: IntoIterator<Item=DirectoryEntry>>(iter: I) -> Self {
-        HashDirectory { entries: Vec::from_iter(iter) }
-    }
-}
-
-impl Directory for HashDirectory {
-    fn find_entry<S: Borrow<OsStr>>(&self, name: &S) -> Option<&DirectoryEntry> {
-        self.entries.find_entry(name)
-    }
-}
-
-impl IntoIterator for HashDirectory {
-    type Item = DirectoryEntry;
-    type IntoIter = vec::IntoIter<DirectoryEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.into_iter()
-    }
-}
+pub type HashDirectory = DirectoryImpl;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct LinkData {
