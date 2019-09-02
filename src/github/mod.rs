@@ -773,7 +773,7 @@ impl Github {
 
     #[cfg(test)]
     pub fn get_cached(&self, cache_ref: &CacheRef) -> Option<CacheObject<GithubBlob, GithubTree>> {
-        let cache = self.object_cache.lock().unwrap();
+        let mut cache = self.object_cache.lock().unwrap();
         cache.get(cache_ref).cloned()
     }
 }
@@ -786,6 +786,7 @@ mod test {
     use std::env;
     use std::fmt::Debug;
     use std::io::Write;
+    use std::collections::HashMap;
     use tempfile::NamedTempFile;
     use rand::{prelude::*, distributions::Alphanumeric};
     use chrono::{Local, FixedOffset};

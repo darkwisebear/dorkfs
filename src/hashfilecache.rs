@@ -249,6 +249,12 @@ struct ObjectCache {
     cache: LruCache<CacheRef, LruCacheObject>
 }
 
+impl Debug for ObjectCache {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_list().entries(self.cache.iter()).finish()
+    }
+}
+
 impl ObjectCache {
     fn new(cache_size: usize) -> Self {
         Self {
@@ -287,6 +293,7 @@ impl<C: CacheLayer+Debug> Debug for HashFileCache<C> {
     fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         fmt.debug_struct("HashFileCache")
             .field("cache_path", &self.cache_path)
+            .field("obj_cache", &self.obj_cache)
             .field("cache", &self.cache)
             .finish()
     }
