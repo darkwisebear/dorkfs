@@ -333,6 +333,7 @@ impl<O> FilesystemMT for DorkFS<O> where
             })
         })
     }
+
     fn unlink(&self, _req: RequestInfo, parent: &Path, name: &OsStr) -> ResultEmpty {
         self.delete_file(parent, name)
             .map_err(|e| {
@@ -375,7 +376,6 @@ impl<O> FilesystemMT for DorkFS<O> where
             })
     }
 }
-
 
 impl<O> DorkFS<O> where
     O: Overlay+Debug+Send+Sync+'static,

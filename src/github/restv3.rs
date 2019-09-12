@@ -1,5 +1,7 @@
 use crate::cache::{DirectoryEntry, ObjectType, Commit};
 
+use serde::{Serialize, Deserialize};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitBlob {
     pub content: String,

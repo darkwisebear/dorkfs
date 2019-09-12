@@ -18,6 +18,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite}
 };
 use failure::{self, Fallible};
+use serde::{Serialize, Deserialize};
 use serde_json;
 use glob::Pattern as GlobPattern;
 

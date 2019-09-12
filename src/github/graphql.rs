@@ -6,7 +6,7 @@ use std::vec;
 use std::iter::FromIterator;
 
 use failure::{Fallible, Error};
-use serde::{Deserializer, de::Visitor};
+use serde::{Deserialize, Deserializer, de::Visitor};
 use chrono::{DateTime, FixedOffset};
 
 use crate::{

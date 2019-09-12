@@ -9,18 +9,14 @@ use std::iter::FromIterator;
 use rand::{prelude::*, distributions::Alphanumeric};
 use serde_json;
 use lru::LruCache;
-use serde::Serialize;
-use tokio::{
-    prelude::*,
-    runtime::Runtime
-};
+use futures::{future, prelude::*};
+use serde::{Serialize, Deserialize};
 
 use crate::{
     cache::{
         Result, CacheError, ReadonlyFile, DirectoryEntry, DirectoryImpl, CacheLayer,
         CacheRef, CacheObject, ObjectType, CacheObjectMetadata, Commit
-    },
-    tokio_runtime
+    }
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -284,7 +280,6 @@ impl ObjectCache {
 
 pub struct HashFileCache<C> where C: CacheLayer {
     cache_path: FileCachePath,
-    tokio: Arc<Runtime>,
     obj_cache: Arc<Mutex<ObjectCache>>,
     cache: C
 }
@@ -460,21 +455,6 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
         };
 
         Box::new(result) as Self::GetFuture
-
-        /*let file =
-            .into_future()
-            .then(|object| match object {
-                Ok(object) => future::ok(object),
-
-                Err(CacheError::ObjectNotFound(_)) => {
-                    let upstream_object_future =
-                        self.cache.get_poll(cache_ref);
-                    let mut upstream_object = crate::tokio_runtime::execute(self.tokio.as_ref(), upstream_object_future, ::std::time::Duration::from_secs(10))?;
-                }
-
-                Err(e) => Err(e)
-            });
-        file*/
     }
 }
 
@@ -495,7 +475,6 @@ impl<C> HashFileCache<C>  where C: CacheLayer,
 
         let cache = HashFileCache {
             cache_path,
-            tokio: tokio_runtime::get(),
             obj_cache: Arc::new(Mutex::new(ObjectCache::new(64))),
             cache
         };

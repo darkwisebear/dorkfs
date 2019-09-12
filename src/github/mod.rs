@@ -16,8 +16,11 @@ use hyper_tls::{self, HttpsConnector};
 use native_tls::TlsConnector;
 use futures::{self, Stream, Future, future};
 use tokio::{runtime::Runtime, self};
-use serde_json::de::from_slice as from_json_slice;
-use serde_json::ser::to_string as to_json_string;
+use serde::Deserialize;
+use serde_json::{
+    de::from_slice as from_json_slice,
+    ser::to_string as to_json_string
+};
 use failure;
 use base64;
 use bytes::Bytes;
