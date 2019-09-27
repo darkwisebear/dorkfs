@@ -11,6 +11,7 @@ use std::borrow::Borrow;
 use std::iter::{self, FromIterator};
 use std::vec;
 use std::fs;
+use std::mem;
 
 use serde_json;
 use failure::{Fail, Error};
@@ -90,16 +91,19 @@ impl FromStr for CacheRef {
 
     fn from_str(v: &str) -> result::Result<Self, Self::Err> {
         let mut last_index = 0;
-        let mut result: [u8; 32] = unsafe { ::std::mem::uninitialized() };
+        let mut result = mem::MaybeUninit::<[u8; 32]>::uninit();
 
-        for (index, byte_result ) in HexCharIterator::new(v).enumerate() {
+        let ref_bytes = result.as_mut_ptr() as *mut u8;
+        for (index, byte_result) in HexCharIterator::new(v).enumerate() {
             ensure!(index < 32, "Given hex string {} too large", v.to_string());
-            result[index] = byte_result?;
+            unsafe {
+                *ref_bytes.add(index) = byte_result?;
+            }
             last_index = index;
         }
 
         ensure!(last_index == 31, "Given hex string {} too small", v.to_string());
-        Ok(CacheRef(result))
+        Ok(CacheRef(unsafe { result.assume_init() }))
     }
 }
 
