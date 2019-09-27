@@ -594,7 +594,7 @@ impl CacheLayer for Github {
     type File = GithubBlob;
     type Directory = GithubTree;
     // Replace with existential type once https://github.com/rust-lang/rfcs/pull/2515 lands.
-    type GetFuture = Box<Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send+'static>;
+    type GetFuture = Box<dyn Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send+'static>;
 
     fn get(&self, cache_ref: &CacheRef)
            -> cache::Result<CacheObject<Self::File, Self::Directory>> {

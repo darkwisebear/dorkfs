@@ -363,7 +363,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
     -> Fallible<BoxedRepository>
     where P: AsRef<Path>,
           Q: AsRef<Path> {
-    let mut default_branch;
+    let default_branch;
     let overlaydir = overlaydir.as_ref();
 
     let (rootrepo, branch) = match rootrepo_url {
@@ -453,7 +453,7 @@ fn get_commit<C: CacheLayer>(cache: &C, commit_ref: &CacheRef) -> Fallible<cache
 }
 
 pub fn init_logging() {
-    static INIT_LOGGING: std::sync::Once = std::sync::ONCE_INIT;
+    static INIT_LOGGING: std::sync::Once = std::sync::Once::new();
     INIT_LOGGING.call_once(env_logger::init);
 }
 

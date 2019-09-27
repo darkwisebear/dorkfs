@@ -288,7 +288,6 @@ mod serde_dir_impl {
     use serde::{Serializer, Deserializer, ser::SerializeSeq, de::{Visitor, SeqAccess}};
 
     use crate::cache::DirectoryEntry;
-    use super::DirectoryImpl;
 
     pub fn serialize<S>(value: &HashMap<OsString, DirectoryEntry>, serializer: S) -> Result<S::Ok, S::Error>
         where S: Serializer {

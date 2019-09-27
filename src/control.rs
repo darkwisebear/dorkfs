@@ -224,7 +224,7 @@ impl<O> SpecialFile<O> for ConstantFileFactory where for<'a> O: Overlay+Workspac
 }
 
 #[derive(Debug)]
-struct SpecialFileRegistry<O>(HashMap<&'static str, Box<SpecialFile<O>>>)
+struct SpecialFileRegistry<O>(HashMap<&'static str, Box<dyn SpecialFile<O>>>)
     where for<'a> O: Overlay+WorkspaceController<'a>;
 
 impl<O> SpecialFileRegistry<O> where for<'a> O: Overlay+WorkspaceController<'a>+Send+Sync+'static {

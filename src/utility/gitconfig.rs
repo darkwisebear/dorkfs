@@ -62,7 +62,7 @@ impl<'a> Borrow<dyn SectionDescriptor + 'a> for SectionKey {
     }
 }
 
-impl<'a> PartialEq for (SectionDescriptor + 'a) {
+impl<'a> PartialEq for (dyn SectionDescriptor + 'a) {
     fn eq(&self, other: &dyn SectionDescriptor) -> bool {
         let lhs = self.to_descriptor();
         let rhs = other.to_descriptor();
@@ -70,9 +70,9 @@ impl<'a> PartialEq for (SectionDescriptor + 'a) {
     }
 }
 
-impl<'a> Eq for (SectionDescriptor + 'a) {}
+impl<'a> Eq for (dyn SectionDescriptor + 'a) {}
 
-impl<'a> Hash for (SectionDescriptor + 'a) {
+impl<'a> Hash for (dyn SectionDescriptor + 'a) {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.to_descriptor().hash(state);
     }

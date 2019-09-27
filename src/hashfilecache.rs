@@ -306,7 +306,7 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                                                C::Directory: Send {
     type File = HashFile;
     type Directory = HashDirectory;
-    type GetFuture = Box<Future<Item=CacheObject<HashFile, HashDirectory>, Error=CacheError>+Send>;
+    type GetFuture = Box<dyn Future<Item=CacheObject<HashFile, HashDirectory>, Error=CacheError>+Send>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let mut obj_cache = self.obj_cache.lock().unwrap();
