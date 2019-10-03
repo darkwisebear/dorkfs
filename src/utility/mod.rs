@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex, Condvar};
 use std::borrow::{Cow, Borrow};
 use std::io::{self, Read, Seek, Write, SeekFrom};
+use std::str::FromStr;
 
 use futures::{task::{self, Task}, prelude::*};
 use failure::Fallible;
@@ -98,8 +99,30 @@ pub enum RepoUrl<'a> {
     }
 }
 
+impl FromStr for RepoUrl<'static> {
+    type Err = failure::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let borrowed_repo_url = RepoUrl::from_borrowed_str(s)?;
+        match borrowed_repo_url {
+            RepoUrl::GithubHttps {
+                apiurl, org, repo
+            } => {
+                let apiurl = apiurl.into_owned();
+                let org = org.into_owned();
+                let repo = repo.into_owned();
+                Ok(RepoUrl::GithubHttps {
+                    apiurl: Cow::Owned(apiurl),
+                    org: Cow::Owned(org),
+                    repo: Cow::Owned(repo)
+                })
+            }
+        }
+    }
+}
+
 impl<'a> RepoUrl<'a> {
-    pub fn from_str(repo: &'a str) -> Fallible<Self> {
+    pub fn from_borrowed_str(repo: &'a str) -> Fallible<Self> {
         let (scheme, remainder) = Self::split_scheme(repo)?;
         match scheme {
             "github+https" => {
@@ -258,30 +281,6 @@ impl Seek for SharedBufferReader {
     }
 }
 
-pub struct CommitRange<'a> {
-    pub start: Option<&'a str>,
-    pub end: Option<&'a str>
-}
-
-impl<'a> CommitRange<'a> {
-    pub fn from_str(range: &'a str) -> Fallible<Self> {
-        let mut split = range.split("..");
-        let start: &str = split.next()
-            .ok_or_else(|| format_err!("No range start in range expression\"{}\"", range))?;
-        let end: &str = split.next()
-            .ok_or_else(|| format_err!("No range start in range expression\"{}\"", range))?;
-
-        if split.next().is_some() {
-            bail!("Too many range separators in expression");
-        }
-
-        Ok(Self {
-            start: if start.is_empty() { None } else { Some(start) },
-            end: if start.is_empty() { None } else { Some(end) }
-        })
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::RepoUrl;
@@ -289,7 +288,7 @@ mod test {
     #[test]
     fn parse_github_url() {
         let repo_parts =
-            RepoUrl::from_str("github+https://api.github.com/darkwisebear/dorkfs")
+            RepoUrl::from_borrowed_str("github+https://api.github.com/darkwisebear/dorkfs")
                 .expect("Unable to parse repo URL");
         match repo_parts {
             RepoUrl::GithubHttps { apiurl, org, repo } => {
@@ -303,7 +302,7 @@ mod test {
     #[test]
     fn parse_on_premises_url() {
         let repo_parts =
-            RepoUrl::from_str("github+https://github.example.com/api/darkwisebear/dorkfs")
+            RepoUrl::from_borrowed_str("github+https://github.example.com/api/darkwisebear/dorkfs")
                 .expect("Unable to parse repo URL");
         match repo_parts {
             RepoUrl::GithubHttps { apiurl, org, repo } => {

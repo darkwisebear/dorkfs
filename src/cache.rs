@@ -14,7 +14,7 @@ use std::fs;
 use std::mem;
 
 use serde_json;
-use failure::{Fail, Error};
+use failure::{Fail, Error, Fallible};
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use chrono::{DateTime, FixedOffset};
 use futures::Future;
@@ -116,6 +116,32 @@ impl Serialize for CacheRef {
 impl CacheRef {
     pub fn null() -> Self {
         CacheRef([0u8; 32])
+    }
+}
+
+pub struct CommitRange {
+    pub start: Option<CacheRef>,
+    pub end: Option<CacheRef>
+}
+
+impl FromStr for CommitRange {
+    type Err = Error;
+
+    fn from_str(range: &str) -> Fallible<Self> {
+        let mut split = range.split("..");
+        let start: &str = split.next()
+            .ok_or_else(|| format_err!("No range start in range expression\"{}\"", range))?;
+        let end: &str = split.next()
+            .ok_or_else(|| format_err!("No range start in range expression\"{}\"", range))?;
+
+        if split.next().is_some() {
+            bail!("Too many range separators in expression");
+        }
+
+        Ok(Self {
+            start: if start.is_empty() { None } else { Some(CacheRef::from_str(start)?) },
+            end: if start.is_empty() { None } else { Some(CacheRef::from_str(end)?) }
+        })
     }
 }
 

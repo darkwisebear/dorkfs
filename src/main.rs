@@ -1,6 +1,5 @@
 #![allow(clippy::unneeded_field_pattern, clippy::new_ret_no_self)]
 
-#[macro_use] extern crate clap;
 #[macro_use] extern crate failure;
 #[macro_use] extern crate failure_derive;
 extern crate libc;
@@ -100,204 +99,258 @@ mod tokio_runtime {
     }
 }
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::fmt::Debug;
 use std::borrow::Cow;
-use std::ffi::CString;
 use std::io::Read;
 
 use failure::Fallible;
-use clap::ArgMatches;
+use structopt::StructOpt;
 
 use crate::{
     hashfilecache::HashFileCache,
     overlay::{WorkspaceController, FilesystemOverlay, BoxedRepository, RepositoryWrapper, Overlay},
-    cache::{CacheLayer, CacheRef},
+    cache::{CacheLayer, CacheRef, CommitRange},
     control::ControlDir,
-    utility::{RepoUrl, CommitRange},
+    utility::RepoUrl,
     types::RepoRef
 };
 
-fn is_octal_number(s: &str) -> bool {
-    s.chars().all(|c| c >= '0' && c <='7')
-}
+#[cfg(not(target_os="linux"))]
+mod uidgid {
+    use std::str::FromStr;
+    use std::num::ParseIntError;
 
-fn validate_umask<S: AsRef<str>>(s: S) -> Result<(), String> {
-    let s = s.as_ref();
-    if is_octal_number(s) && s.len() == 3 {
-        Ok(())
-    } else {
-        Err("Parameter must be a valid octal umask".to_string())
-    }
-}
+    #[derive(Default)]
+    pub struct Uid(u32);
 
-fn parse_umask(s: &str) -> u16 {
-    s.chars().fold(0u16, |v, c| {
-        (v << 3u16) + c.to_digit(8).expect("Number is not an octal!") as u16
-    })
-}
-
-#[cfg(target_os="linux")]
-fn resolve_uid(uid: Option<&str>) -> Fallible<u32> {
-    match uid {
-        Some(uid) => match u32::from_str(uid) {
-            Ok(uid) => Ok(uid),
-            Err(_) => {
-                let name = CString::new(uid).unwrap();
-                unsafe {
-                    let passwd = libc::getpwnam(name.as_ptr());
-                    if let Some(passwd) = passwd.as_ref() {
-                        Ok(passwd.pw_uid)
-                    } else {
-                        bail!("Unable to resolve the uid");
-                    }
-                }
-            }
+    impl Uid {
+        pub fn get(&self) -> u32 {
+            self.0
         }
+    }
 
-        None => unsafe {
-            Ok(libc::geteuid())
+    impl FromStr for Uid {
+        type Err = ParseIntError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            u32::from_str(s).map(Uid)
+        }
+    }
+
+    #[derive(Default)]
+    pub struct Gid(u32);
+
+    impl Gid {
+        pub fn get(&self) -> u32 {
+            self.0
+        }
+    }
+
+    impl FromStr for Gid {
+        type Err = ParseIntError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            u32::from_str(s).map(Gid)
         }
     }
 }
 
 #[cfg(target_os="linux")]
-fn resolve_gid(gid: Option<&str>) -> Fallible<u32> {
-    match gid {
-        Some(gid) => match u32::from_str(gid) {
-            Ok(gid) => Ok(gid),
-            Err(_) => {
-                let name = CString::new(gid).unwrap();
-                unsafe {
-                    let group = libc::getgrnam(name.as_ptr());
-                    if let Some(group) = group.as_ref() {
-                        Ok(group.gr_gid)
-                    } else {
-                        bail!("Unable to resolve the gid");
+mod uidgid {
+    use std::str::FromStr;
+    use std::ffi::CString;
+
+    use failure;
+    use libc;
+
+    pub struct Uid(u32);
+
+    impl Uid {
+        pub fn get(&self) -> u32 {
+            self.0
+        }
+    }
+
+    impl FromStr for Uid {
+        type Err = failure::Error;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match u32::from_str(s) {
+                Ok(uid) => Ok(Uid(uid)),
+                Err(_) => {
+                    let name = CString::new(s).unwrap();
+                    unsafe {
+                        let passwd = libc::getpwnam(name.as_ptr());
+                        if let Some(passwd) = passwd.as_ref() {
+                            Ok(Uid(passwd.pw_uid))
+                        } else {
+                            bail!("Unable to resolve uid {}", s);
+                        }
                     }
                 }
             }
         }
+    }
 
-        None => unsafe {
-            Ok(libc::getegid())
+    impl Default for Uid {
+        fn default() -> Self {
+            unsafe {
+                Self(libc::geteuid())
+            }
+        }
+    }
+
+    pub struct Gid(u32);
+
+    impl Gid {
+        pub fn get(&self) -> u32 {
+            self.0
+        }
+    }
+
+    impl FromStr for Gid {
+        type Err = failure::Error;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match u32::from_str(s) {
+                Ok(gid) => Ok(Gid(gid)),
+                Err(_) => {
+                    let name = CString::new(s).unwrap();
+                    unsafe {
+                        let group = libc::getgrnam(name.as_ptr());
+                        if let Some(group) = group.as_ref() {
+                            Ok(Gid(group.gr_gid))
+                        } else {
+                            bail!("Unable to resolve gid {}", s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl Default for Gid {
+        fn default() -> Self {
+            unsafe {
+                Self(libc::getegid())
+            }
         }
     }
 }
 
-fn parse_arguments() -> clap::ArgMatches<'static> {
-    use clap::{App, Arg, SubCommand};
+use uidgid::{Uid, Gid};
 
-    let mount = SubCommand::with_name("mount")
-        .about("Mounts the given repository at the given directory using the given temporary file \
-        path for internal metadata and state")
-        .arg(Arg::with_name("cachedir")
-            .takes_value(true)
-            .required(true)
-            .help("Directory where the cached contents shall be stored"))
-        .arg(Arg::with_name("mountpoint")
-            .takes_value(true)
-            .required(true)
-            .help("Mountpoint that shows the checked out contents"))
-        .arg(Arg::with_name("rootrepo")
-            .takes_value(true)
-            .required(true)
-            .help("Connection specification to the root repository. For GitHub this string has \
-            the following form: github+<GitHub URL>/<org>/<repo>"))
-        .arg(Arg::with_name("uid")
-            .takes_value(true)
-            .long("uid")
-            .help("UID to be used for the files. Defaults to the effective UID of the process."))
-        .arg(Arg::with_name("gid")
-            .takes_value(true)
-            .long("gid")
-            .help("GID to be used for the files. Defaults to the effective GID of the process."))
-        .arg(Arg::with_name("umask")
-            .takes_value(true)
-            .default_value("022")
-            .validator(validate_umask)
-            .long("umask"))
-        .arg(Arg::with_name("branch")
-            .takes_value(true)
-            .long("branch")
-            .short("b")
-            .help("Remote branch that shall be tracked instead of the default branch"));
+struct UMask(u16);
 
-    let log = SubCommand::with_name("log")
-        .about("Prints the commit log history of the repository that is mounted at the current \
-        working directory")
-        .arg(Arg::with_name("commit_range")
-            .default_value("..")
-            .help("Specify the commit range that is being displayed. Currently, only the \
-            full range or a start commit can be specified. The full range looks like this: \"..\". \
-            With a start commit, the range looks like this: \"<start_commit>..\""));
+impl FromStr for UMask {
+    type Err = failure::Error;
 
-    let switch = SubCommand::with_name("switch")
-        .about("Switch to the given target branch")
-        .arg(Arg::with_name("target_branch")
-            .required(true)
-            .help("Switch to the given branch. All overlay files will stay as-is."));
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.chars().fold(Ok(0u16), |v, c|
+            v.and_then(|v| Ok((v << 3u16) + c.to_digit(8)
+                .ok_or(format_err!("Unable to convert {} to a number", c))? as u16)))
+        .map(UMask)
+    }
+}
 
-    let branch = SubCommand::with_name("branch")
-        .about("Print the current branch or create a new branch at the current HEAD of the current \
-        branch")
-        .arg(Arg::with_name("new_branch")
-            .help("When given, create a branch with this name that starts at HEAD of the \
-            current branch"));
+impl UMask {
+    fn get(&self) -> u16 {
+        self.0
+    }
+}
 
-    let revert = SubCommand::with_name("revert")
-        .about("Revert the set of files that match a given glob expression")
-        .arg(Arg::with_name("revert_glob")
-                 .default_value("*")
-                 .help("Specify a glob that tells which files shall be reverted"))
-        .arg(Arg::with_name("dry_run")
-                 .long("dry-run"));
+#[derive(StructOpt)]
+/// Mounts the given repository at the given directory using the given temporary file path for
+/// internal metadata and state.
+struct MountArguments {
+    #[structopt(parse(from_os_str))]
+    /// Directory where the cached contents shall be stored.
+    cachedir: PathBuf,
+    #[structopt(parse(from_os_str))]
+    /// Mountpoint that shows the checked out contents.
+    mountpoint: PathBuf,
+    /// Connection specification to the root repository.
+    ///
+    /// For GitHub this string has the following form: github+<GitHub URL>/<org>/<repo>
+    /// For a local git database storage, this string has the following form: git+file://<path>
+    rootrepo: RepoUrl<'static>,
+    #[structopt(long)]
+    /// UID to be used for the files. Defaults to the effective UID of the process.
+    uid: Option<Uid>,
+    #[structopt(long)]
+    /// GID to be used for the files. Defaults to the effective GID of the process.
+    gid: Option<Gid>,
+    #[structopt(long, default_value = "022")]
+    /// Umask applied to all relevant file operations.
+    umask: UMask,
+    #[structopt(short, long)]
+    /// Remote branch that shall be tracked instead of the default branch.
+    branch: Option<String>
+}
 
-    let status = SubCommand::with_name("status")
-        .about("Displays the current workspace status which is a list of files that have been \
-        added/deleted/modified");
-
-    let update = SubCommand::with_name("update")
-        .about("Update the working area to the HEAD revision of the server. Equivalent to \
-        calling \"branch\" without arguments");
-
-    let commit = SubCommand::with_name("commit")
-        .about("Create a new commit with all changes that have been done inside the mounted \
-        repository")
-        .arg(Arg::with_name("message")
-             .short("m")
-             .help("Use the given message as the message for the newly created commit")
-             .takes_value(true)
-             .required(true));
-
-    let dorkfs = App::new("dorkfs")
-        .version(crate_version!())
-        .about("Mount git repositories and work with them just as you would with an ordinary disk \
-        drive")
-        .subcommand(mount)
-        .subcommand(log)
-        .subcommand(switch)
-        .subcommand(branch)
-        .subcommand(revert)
-        .subcommand(status)
-        .subcommand(commit)
-        .subcommand(update);
-
-    dorkfs.get_matches()
+#[derive(StructOpt)]
+/// Mount git repositories and work with them just as you would with an ordinary disk drive.
+enum Arguments {
+    Mount(MountArguments),
+    /// Prints the commit log history of the repository that is mounted at the current
+    /// working directory.
+    Log {
+        #[structopt(default_value = "..")]
+        /// Specify the commit range that is being displayed.
+        ///
+        /// Currently, only the full range or a start commit can be specified. The full range looks
+        /// like this: "..". With a start commit, the range looks like this: "<start_commit>..".
+        commit_range: CommitRange
+    },
+    /// Switch to the given target branch.
+    Switch {
+        /// Switch to the given branch. All overlay files will stay as-is.
+        target_branch: String
+    },
+    /// Print the current branch or create a new branch at the current HEAD of the current branch.
+    Branch {
+        /// When given, create a branch with this name that starts at HEAD of the current branch.
+        /// Otherwise, the command prints the current branch to stdout.
+        new_branch: Option<String>
+    },
+    /// Revert the set of files that match a given glob expression.
+    Revert {
+        #[structopt(default_value = "*")]
+        /// Specify a glob that tells which files shall be reverted
+        revert_glob: String,
+        #[structopt(long)]
+        /// If specified, the revert will just print what it would revert without touching the
+        /// workspace at all.
+        dry_run: bool
+    },
+    /// Displays the current workspace status which is a list of files that have been
+    /// added/deleted/modified
+    Status,
+    /// Update the working area to the HEAD revision of the server. Equivalent to calling "branch"
+    /// without arguments.
+    Update,
+    /// Create a new commit with all changes that have been done inside the mounted repository.
+    Commit {
+        #[structopt(short, long)]
+        /// Use the given message as the message for the newly created commit.
+        message: String
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn mount_fuse<O>(
-    mountpoint: &str,
+fn mount_fuse<O, P>(
+    mountpoint: P,
     root_overlay: O,
     uid: u32,
     gid: u32,
     umask: u16)
     where O: Overlay+Debug+Send+Sync+'static,
-          <O as Overlay>::File: Debug+Send+Sync+'static {
+          <O as Overlay>::File: Debug+Send+Sync+'static,
+          P: AsRef<Path> {
     fuse::DorkFS::with_overlay(root_overlay, uid, gid, umask)
-        .and_then(|dorkfs| dorkfs.mount(mountpoint))
+        .and_then(move |dorkfs| dorkfs.mount(mountpoint))
         .expect("Unable to mount filesystem");
 }
 
@@ -456,13 +509,19 @@ pub fn init_logging() {
     INIT_LOGGING.call_once(env_logger::init);
 }
 
-fn mount(args: &ArgMatches) {
-    let cachedir_base = Path::new(args.value_of("cachedir")
-        .expect("cachedir arg not set!"));
-    let rootrepo = args.value_of("rootrepo").expect("No root URL given");
-    let branch = args.value_of("branch").map(RepoRef::Branch);
+fn mount(args: MountArguments) {
+    let MountArguments {
+        cachedir: cachedir_base,
+        rootrepo: rootrepo_url,
+        branch,
+        mountpoint,
+        uid,
+        gid,
+        umask
+    } = args;
 
-    let rootrepo_url = RepoUrl::from_str(rootrepo).expect("Unable to parse root URL");
+    let branch = branch.as_ref().map(|s| RepoRef::Branch(s.as_str()));
+
     let cachedir = cachedir_base.join("cache");
 
     let fs = new_overlay(cachedir_base.join("overlay"),
@@ -473,25 +532,15 @@ fn mount(args: &ArgMatches) {
 
     #[cfg(target_os = "linux")]
     {
-        let mountpoint = args.value_of("mountpoint").expect("mountpoint arg not set!");
-        let umask = args.value_of("umask")
-            .map(parse_umask)
-            .expect("Unparsable umask");
-        let uid = resolve_uid(args.value_of("uid"))
-            .expect("Cannot parse UID");
-        let gid = resolve_gid(args.value_of("gid"))
-            .expect("Cannot parse GID");
+        let uid = uid.unwrap_or_default();
+        let gid = gid.unwrap_or_default();
 
-        mount_fuse(mountpoint, fs, uid, gid, umask);
+        mount_fuse(mountpoint, fs, uid.get(), gid.get(), umask.get());
     }
 }
 
-fn log(args: &ArgMatches) {
-    let range = CommitRange::from_str(args.value_of("commit_range")
-        .unwrap())
-        .expect("Unparsable commit range");
-
-    let start = match range {
+fn log(range: CommitRange) {
+    let start_commit = match range {
         CommitRange {
             start,
             end: None
@@ -500,10 +549,6 @@ fn log(args: &ArgMatches) {
         _ => unimplemented!("Only unbounded and ranges with only a start supported")
     };
 
-    let start_commit = start
-        .map(|s| cache::CacheRef::from_str(s)
-            .expect("Unable to parse start ref in range"));
-
     let log_command = commandstream::Command::Log { start_commit };
     commandstream::send_command(log_command);
 }
@@ -511,51 +556,45 @@ fn log(args: &ArgMatches) {
 fn main() {
     init_logging();
 
-    let args = parse_arguments();
-    match args.subcommand() {
-        ("mount", Some(subargs)) => mount(subargs),
-        ("log", Some(subargs)) => log(subargs),
-        ("status", Some(_)) =>
-            commandstream::send_command(commandstream::Command::Status),
-        ("branch", Some(subargs)) => {
-            let command = match subargs.value_of("new_branch") {
-                Some(target_branch_name) => commandstream::Command::CreateBranch {
-                    name: target_branch_name.to_string()
-                },
+    let args: Arguments = Arguments::from_args();
+    match args {
+        Arguments::Mount(subargs) => mount(subargs),
 
-                None => commandstream::Command::CurrentBranch {
-                    target_branch: None
-                }
+        Arguments::Log { commit_range } => log(commit_range),
+
+        Arguments::Status => commandstream::send_command(commandstream::Command::Status),
+
+        Arguments::Branch { new_branch: Some(name) } => {
+            let command = commandstream::Command::CreateBranch { name };
+
+            commandstream::send_command(command)
+        }
+
+        Arguments::Branch { new_branch: None } | Arguments::Update => {
+            let command = commandstream::Command::CurrentBranch {
+                target_branch: None
             };
 
             commandstream::send_command(command)
         }
-        ("switch", Some(subargs)) => {
-            let target_branch = subargs.value_of("target_branch").unwrap();
-            commandstream::send_command(
-                commandstream::Command::CurrentBranch {
-                    target_branch: Some(target_branch.to_string())
-                })
+
+        Arguments::Switch { target_branch } => {
+            let command = commandstream::Command::CurrentBranch {
+                target_branch:Some(target_branch)
+            };
+
+            commandstream::send_command(command)
         }
-        ("revert", Some(subargs)) => {
-            let path_glob = subargs.value_of("revert_glob").unwrap().to_string();
-            let dry_run = subargs.is_present("dry_run");
+
+        Arguments::Revert { revert_glob: path_glob, dry_run } => {
             let command = commandstream::Command::Revert {
                 path_glob, dry_run
             };
 
             commandstream::send_command(command)
         }
-        ("update", Some(_)) => {
-            commandstream::send_command(commandstream::Command::CurrentBranch {
-                target_branch: None
-            })
-        }
-        ("commit", Some(subargs)) => {
-            commandstream::send_command(commandstream::Command::Commit {
-                message: subargs.value_of("message").unwrap().to_string()
-            })
-        }
-        _ => unreachable!()
+
+        Arguments::Commit { message } =>
+            commandstream::send_command(commandstream::Command::Commit { message })
     }
 }

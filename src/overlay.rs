@@ -1538,8 +1538,6 @@ pub mod testutil {
     use crate::nullcache::NullCache;
     use crate::types::RepoRef;
 
-    use failure::Error;
-
     pub fn open_working_copy<P: AsRef<Path>>(path: P) -> FilesystemOverlay<HashFileCache<NullCache>> {
         let cache_dir = path.as_ref().join("cache");
         let overlay_dir = path.as_ref().join("overlay");
