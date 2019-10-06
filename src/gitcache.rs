@@ -51,6 +51,7 @@ impl Debug for GitCacheImpl {
 }
 
 impl GitCacheImpl {
+    #[cfg(test)]
     fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(GitCacheImpl {
             repo: git2::Repository::init(path).map_err(GitLayerError::from)?
@@ -287,6 +288,7 @@ impl From<GitCacheImpl> for GitCache {
 }
 
 impl GitCache {
+    #[cfg(test)]
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         GitCacheImpl::new(path).map(Self::from)
     }

@@ -17,7 +17,8 @@ use serde_json;
 use failure::{Fail, Error, Fallible};
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use chrono::{DateTime, FixedOffset};
-use futures::Future;
+use futures::{future, Future};
+use either::Either;
 
 pub trait LayerError: Fail {}
 
@@ -262,7 +263,7 @@ impl Into<(OsString, DirectoryEntry)> for DirectoryEntry {
     }
 }
 
-pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+FromIterator<DirectoryEntry>+Clone {
+pub trait Directory: Sized+IntoIterator<Item=DirectoryEntry>+Clone {
     fn find_entry<S: Borrow<OsStr>+?Sized>(&self, name: &S) -> Option<&DirectoryEntry>;
 }
 
@@ -423,6 +424,26 @@ impl<F, D> Clone for CacheObject<F, D> where F: ReadonlyFile+Clone, D: Directory
     }
 }
 
+impl<F, D> CacheObject<F, D> where F: ReadonlyFile, D: Directory {
+    pub fn map_file<G: ReadonlyFile, M: FnOnce(F) -> G>(self, map_fn: M) -> CacheObject<G, D> {
+        match self {
+            CacheObject::File(f) => CacheObject::File(map_fn(f)),
+            CacheObject::Directory(d) => CacheObject::Directory(d),
+            CacheObject::Commit(c) => CacheObject::Commit(c),
+            CacheObject::Symlink(s) => CacheObject::Symlink(s),
+        }
+    }
+
+    pub fn map_dir<E: Directory, M: FnOnce(D) -> E>(self, map_fn: M) -> CacheObject<F, E> {
+        match self {
+            CacheObject::File(f) => CacheObject::File(f),
+            CacheObject::Directory(d) => CacheObject::Directory(map_fn(d)),
+            CacheObject::Commit(c) => CacheObject::Commit(c),
+            CacheObject::Symlink(s) => CacheObject::Symlink(s),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheObjectMetadata {
     pub size: u64,
@@ -456,8 +477,8 @@ impl<F: ReadonlyFile, D: Directory> CacheObject<F, D> {
 }
 
 pub trait CacheLayer {
-    type File: ReadonlyFile+Debug;
-    type Directory: Directory+Debug;
+    type File: ReadonlyFile;
+    type Directory: Directory;
     type GetFuture: Future<Item=CacheObject<Self::File, Self::Directory>, Error=CacheError>+Send;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>>;
@@ -509,6 +530,205 @@ pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P)
     }
 
     Ok(objs.last().cloned())
+}
+
+#[derive(Debug)]
+pub struct ReadonlyFileWrapper<L: ReadonlyFile+Debug, R: ReadonlyFile+Debug>(Either<L, R>);
+
+impl<L: ReadonlyFile+Debug, R: ReadonlyFile+Debug> io::Read for ReadonlyFileWrapper<L, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<L: ReadonlyFile+Debug, R: ReadonlyFile+Debug> io::Seek for ReadonlyFileWrapper<L, R> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        match self.0 {
+            Either::Left(ref mut l) => l.seek(pos),
+            Either::Right(ref mut r) => r.seek(pos),
+        }
+    }
+}
+
+impl<L: ReadonlyFile+Debug, R: ReadonlyFile+Debug> ReadonlyFile for ReadonlyFileWrapper<L, R> {}
+
+impl<L: ReadonlyFile+Debug, R: ReadonlyFile+Debug> ReadonlyFileWrapper<L, R> {
+    pub fn left(val: L) -> ReadonlyFileWrapper<L, R> {
+        ReadonlyFileWrapper(Either::Left(val))
+    }
+
+    pub fn right(val: R) -> ReadonlyFileWrapper<L, R> {
+        ReadonlyFileWrapper(Either::Right(val))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectoryWrapper<L: Directory+Debug, R: Directory+Debug>(Either<L, R>);
+
+impl<L: Directory+Debug, R: Directory+Debug> IntoIterator for DirectoryWrapper<L, R> {
+    type Item = DirectoryEntry;
+    type IntoIter = Either<<L as IntoIterator>::IntoIter, <R as IntoIterator>::IntoIter>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl <L: Directory+Debug, R: Directory+Debug> Directory for DirectoryWrapper<L, R> {
+    fn find_entry<S: Borrow<OsStr> + ?Sized>(&self, name: &S) -> Option<&DirectoryEntry> {
+        match &self.0 {
+            Either::Left(l) => l.find_entry(name),
+            Either::Right(r) => r.find_entry(name),
+        }
+    }
+}
+
+impl <L: Directory+Debug, R: Directory+Debug> DirectoryWrapper<L, R> {
+    pub fn left(val: L) -> DirectoryWrapper<L, R> {
+        DirectoryWrapper(Either::Left(val))
+    }
+
+    pub fn right(val: R) -> DirectoryWrapper<L, R> {
+        DirectoryWrapper(Either::Right(val))
+    }
+}
+
+impl<L, R> CacheLayer for Either<L, R>
+    where L: CacheLayer,
+          R: CacheLayer,
+          L::Directory: Debug+Send,
+          R::Directory: Debug+Send,
+          L::File: Send,
+          R::File: Send {
+    type File = ReadonlyFileWrapper<L::File, R::File>;
+    type Directory = DirectoryWrapper<L::Directory, R::Directory>;
+    type GetFuture = future::Either<
+        future::Map<
+            L::GetFuture,
+            fn(<L::GetFuture as Future>::Item) -> CacheObject<Self::File, Self::Directory>>,
+        future::Map<
+            R::GetFuture,
+            fn(<R::GetFuture as Future>::Item) -> CacheObject<Self::File, Self::Directory>>>;
+
+    fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
+        let result = match self {
+            Either::Left(l) =>
+                l.get(cache_ref)?
+                    .map_file(ReadonlyFileWrapper::left)
+                    .map_dir(DirectoryWrapper::left),
+            Either::Right(r) =>
+                r.get(cache_ref)?
+                    .map_file(ReadonlyFileWrapper::right)
+                    .map_dir(DirectoryWrapper::right),
+        };
+        Ok(result)
+    }
+
+    fn add_file_by_path<P: AsRef<Path>>(&self, source_path: P) -> Result<CacheRef> {
+        match self {
+            Either::Left(l) => l.add_file_by_path(source_path),
+            Either::Right(r) => r.add_file_by_path(source_path),
+        }
+    }
+
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, items: I) -> Result<CacheRef> {
+        match self {
+            Either::Left(l) => l.add_directory(items),
+            Either::Right(r) => r.add_directory(items),
+        }
+    }
+
+    fn add_commit(&self, commit: Commit) -> Result<CacheRef> {
+        match self {
+            Either::Left(l) => l.add_commit(commit),
+            Either::Right(r) => r.add_commit(commit),
+        }
+    }
+
+    fn get_head_commit<S: AsRef<str>>(&self, branch: S) -> Result<Option<CacheRef>> {
+        match self {
+            Either::Left(l) => l.get_head_commit(branch),
+            Either::Right(r) => r.get_head_commit(branch),
+        }
+    }
+
+    fn merge_commit<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<CacheRef> {
+        match self {
+            Either::Left(l) => l.merge_commit(branch, cache_ref),
+            Either::Right(r) => r.merge_commit(branch, cache_ref),
+        }
+    }
+
+    fn create_branch<S: AsRef<str>>(&self, branch: S, cache_ref: &CacheRef) -> Result<()> {
+        match self {
+            Either::Left(l) => l.create_branch(branch, cache_ref),
+            Either::Right(r) => r.create_branch(branch, cache_ref),
+        }
+    }
+
+    fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
+        match self {
+            Either::Left(l) => future::Either::A(l.get_poll(cache_ref)
+                .map(|f| f.map_file(ReadonlyFileWrapper::left).map_dir(DirectoryWrapper::left))),
+            Either::Right(r) => future::Either::B(r.get_poll(cache_ref)
+                .map(|f| f.map_file(ReadonlyFileWrapper::right).map_dir(DirectoryWrapper::right)))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NullReadonlyFile;
+
+impl io::Read for NullReadonlyFile {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        unimplemented!()
+    }
+}
+
+impl io::Seek for NullReadonlyFile {
+    fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+        unimplemented!()
+    }
+}
+
+impl ReadonlyFile for NullReadonlyFile {}
+
+impl CacheLayer for () {
+    type File = NullReadonlyFile;
+    type Directory = DirectoryImpl;
+    type GetFuture = future::FutureResult<CacheObject<Self::File, Self::Directory>, CacheError>;
+
+    fn get(&self, _cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
+        unimplemented!()
+    }
+
+    fn add_file_by_path<P: AsRef<Path>>(&self, _source_path: P) -> Result<CacheRef> {
+        unimplemented!()
+    }
+
+    fn add_directory<I: IntoIterator<Item=DirectoryEntry>>(&self, _items: I) -> Result<CacheRef> {
+        unimplemented!()
+    }
+
+    fn add_commit(&self, _commit: Commit) -> Result<CacheRef> {
+        unimplemented!()
+    }
+
+    fn get_head_commit<S: AsRef<str>>(&self, _branch: S) -> Result<Option<CacheRef>> {
+        unimplemented!()
+    }
+
+    fn merge_commit<S: AsRef<str>>(&self, _branch: S, _cache_ref: &CacheRef) -> Result<CacheRef> {
+        unimplemented!()
+    }
+
+    fn create_branch<S: AsRef<str>>(&self, _branch: S, _cache_ref: &CacheRef) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn get_poll(&self, _cache_ref: &CacheRef) -> Self::GetFuture {
+        unimplemented!()
+    }
 }
 
 #[cfg(test)]

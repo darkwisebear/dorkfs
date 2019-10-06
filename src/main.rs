@@ -107,6 +107,7 @@ use std::io::Read;
 
 use failure::Fallible;
 use structopt::StructOpt;
+use either::Either;
 
 use crate::{
     hashfilecache::HashFileCache,
@@ -114,7 +115,7 @@ use crate::{
     cache::{CacheLayer, CacheRef, CommitRange},
     control::ControlDir,
     utility::RepoUrl,
-    types::RepoRef
+    types::RepoRef,
 };
 
 #[cfg(not(target_os="linux"))]
@@ -406,10 +407,17 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
 
             Err(err) => warn!("Unable to initialize submodules: {}", err)
         }
+
+        RepoUrl::GitFile { .. } => unimplemented!("Submodules not yet supported for local git storage")
     }
 
     Ok(())
 }
+
+#[cfg(feature = "gitcache")]
+type MaybeGitCache = crate::gitcache::GitCache;
+#[cfg(not(feature = "gitcache"))]
+type MaybeGitCache = ();
 
 fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch: Option<&RepoRef>)
     -> Fallible<BoxedRepository>
@@ -418,7 +426,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
     let default_branch;
     let overlaydir = overlaydir.as_ref();
 
-    let (rootrepo, branch) = match rootrepo_url {
+    let (rootrepo, branch): (Either<_, MaybeGitCache>, _) = match rootrepo_url {
         RepoUrl::GithubHttps { apiurl, org, repo } => {
             let baseurl = format!("https://{}", apiurl);
             let token = ::std::env::var("GITHUB_TOKEN")
@@ -440,9 +448,19 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
             };
 
             let cached_github =
-                HashFileCache::new(github, &cachedir)?;
+                Either::Left(HashFileCache::new(github, &cachedir)?);
 
             (cached_github, branch)
+        }
+
+        #[allow(unused_variables)] 
+        RepoUrl::GitFile { path } => {
+            #[cfg(feature = "gitcache")] {
+                (Either::Right(crate::gitcache::GitCache::open(path)?), RepoRef::Branch("master"))
+            }
+            #[cfg(not(feature = "gitcache"))] {
+                bail!("Log git repositories not enabled in this build!")
+            }
         }
     };
 

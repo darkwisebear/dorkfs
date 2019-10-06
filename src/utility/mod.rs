@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Condvar};
 use std::borrow::{Cow, Borrow};
 use std::io::{self, Read, Seek, Write, SeekFrom};
 use std::str::FromStr;
+use std::path::Path;
 
 use futures::{task::{self, Task}, prelude::*};
 use failure::Fallible;
@@ -91,11 +92,16 @@ impl<T: Debug> OpenHandleSet<T> {
     }
 }
 
+#[derive(Debug)]
 pub enum RepoUrl<'a> {
     GithubHttps {
         apiurl: Cow<'a, str>,
         org: Cow<'a, str>,
         repo: Cow<'a, str>
+    },
+
+    GitFile {
+        path: Cow<'a, Path>
     }
 }
 
@@ -117,6 +123,10 @@ impl FromStr for RepoUrl<'static> {
                     repo: Cow::Owned(repo)
                 })
             }
+
+            RepoUrl::GitFile { path } => Ok(RepoUrl::GitFile {
+                path: Cow::Owned(path.into_owned())
+            })
         }
     }
 }
@@ -139,6 +149,10 @@ impl<'a> RepoUrl<'a> {
                     repo: Cow::Borrowed(repo)
                 })
             }
+
+            "git+file" => Ok(RepoUrl::GitFile {
+                path: Cow::Borrowed(Path::new(remainder))
+            }),
 
             unknown_scheme => bail!("Unknown repo URL scheme {}", unknown_scheme)
         }
@@ -283,6 +297,8 @@ impl Seek for SharedBufferReader {
 
 #[cfg(test)]
 mod test {
+    use std::path::Path;
+
     use super::RepoUrl;
 
     #[test]
@@ -296,6 +312,8 @@ mod test {
                 assert_eq!("darkwisebear", org);
                 assert_eq!("dorkfs", repo);
             }
+
+            wrong_parse => panic!("Repo URL incorrectly parsed: {:?}", wrong_parse)
         }
     }
 
@@ -310,6 +328,21 @@ mod test {
                 assert_eq!("darkwisebear", org);
                 assert_eq!("dorkfs", repo);
             }
+
+            wrong_parse => panic!("Repo URL incorrectly parsed: {:?}", wrong_parse)
+        }
+    }
+
+    #[test]
+    fn parse_local_git_repo() {
+        let repo_parts =
+            RepoUrl::from_borrowed_str("git+file:///tmp/path/to/repo.git")
+                .expect("Unable to parse repo URL");
+        match repo_parts {
+            RepoUrl::GitFile { path } =>
+                assert_eq!(Path::new("/tmp/path/to/repo.git"), path),
+
+            wrong_parse => panic!("Repo URL incorrectly parsed: {:?}", wrong_parse)
         }
     }
 }
