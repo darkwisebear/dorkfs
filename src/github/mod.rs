@@ -15,7 +15,7 @@ use hyper::{self, Uri, Body, Request, Response, Client, StatusCode};
 use hyper_tls::{self, HttpsConnector};
 use native_tls::TlsConnector;
 use futures::{self, Stream, Future, future};
-use tokio::{runtime::Runtime, self};
+use tokio::{util::FutureExt, self};
 use serde::Deserialize;
 use serde_json::{
     de::from_slice as from_json_slice,
@@ -29,7 +29,6 @@ use lru::LruCache;
 use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
                    CacheLayer, LayerError, Commit};
 use crate::utility::{RepoUrl, gitmodules::GitModules};
-use crate::tokio_runtime;
 
 pub fn initialize_github_submodules<R: Read>(file: R,
                                        apiurl: &str,
@@ -575,7 +574,6 @@ query {{ \
 
 pub struct Github {
     request_builder: GithubRequestBuilder,
-    tokio: Arc<Runtime>,
     object_cache: Arc<Mutex<LruCache<CacheRef, CacheObject<GithubBlob, GithubTree>>>>
 }
 
@@ -694,7 +692,6 @@ impl Github {
         };
 
         Ok(Github {
-            tokio: tokio_runtime::get(),
             request_builder: GithubRequestBuilder(Arc::new(request_builder)),
             object_cache: Arc::new(Mutex::new(LruCache::new(8)))
         })
@@ -758,13 +755,14 @@ impl Github {
         where T: Send+'static,
               E: Into<CacheError>+Send+'static,
               F: Future<Item=T, Error=E>+Send+'static {
-        tokio_runtime::execute(self.tokio.as_ref(), request_future, Duration::from_secs(60))
+        request_future.timeout(Duration::from_secs(60))
             .map_err(|e|
                 if let Some(inner_err) = e.into_inner() {
                     inner_err.into()
                 } else {
                     CacheError::from(Error::TimeoutError)
                 })
+            .wait()
     }
 
     fn get_ref_info(&self, branch: Option<&str>) -> Result<Option<(String, CacheRef)>, CacheError> {

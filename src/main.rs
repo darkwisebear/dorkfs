@@ -46,59 +46,6 @@ mod github;
 mod nullcache;
 mod commandstream;
 
-mod tokio_runtime {
-    use std::{
-        sync::{
-            mpsc::channel,
-            Mutex,
-            Weak,
-            Arc
-        },
-        time::Duration
-    };
-
-    use tokio::{
-        prelude::*,
-        runtime::Runtime,
-        timer::timeout::Error as TimeoutError
-    };
-
-    lazy_static! {
-        static ref TOKIO_RUNTIME: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
-    }
-
-    pub fn get() -> Arc<Runtime> {
-        let mut runtime = TOKIO_RUNTIME.lock().unwrap();
-        match runtime.upgrade() {
-            Some(tokio) => tokio,
-            None => {
-                let new_runtime = Runtime::new().expect("Unable to instantiate tokio runtime");
-                let new_runtime = Arc::new(new_runtime);
-                *runtime = Arc::downgrade(&new_runtime);
-                new_runtime
-            }
-        }
-    }
-
-    pub fn execute<T, E, I, F>(tokio: &Runtime, request_future: I, timeout: Duration)
-        -> Result<T, TimeoutError<E>>
-        where T: Send+'static,
-              E: Send+'static,
-              I: IntoFuture<Future=F, Item=T, Error=E>+Send+'static,
-              F: Future<Item=T, Error=E>+Send+'static {
-        let (send, recv) = channel();
-
-        let finalizing_future = request_future
-            .into_future()
-            .timeout(timeout)
-            .then(move |r| send.send(r)
-                .map_err(|_| unreachable!("Unexpected send error during GitHub request")));
-
-        tokio.executor().spawn(finalizing_future);
-        recv.recv().expect("Unexpected receive error during GitHub request")
-    }
-}
-
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::fmt::Debug;
@@ -108,6 +55,7 @@ use std::io::Read;
 use failure::Fallible;
 use structopt::StructOpt;
 use either::Either;
+use futures::future::lazy;
 
 use crate::{
     hashfilecache::HashFileCache,
@@ -123,7 +71,7 @@ mod uidgid {
     use std::str::FromStr;
     use std::num::ParseIntError;
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     pub struct Uid(u32);
 
     impl Uid {
@@ -140,7 +88,7 @@ mod uidgid {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     pub struct Gid(u32);
 
     impl Gid {
@@ -166,6 +114,7 @@ mod uidgid {
     use failure;
     use libc;
 
+    #[derive(Clone, Copy)]
     pub struct Uid(u32);
 
     impl Uid {
@@ -203,6 +152,7 @@ mod uidgid {
         }
     }
 
+    #[derive(Clone, Copy)]
     pub struct Gid(u32);
 
     impl Gid {
@@ -243,6 +193,7 @@ mod uidgid {
 
 use uidgid::{Uid, Gid};
 
+#[derive(Clone, Copy)]
 struct UMask(u16);
 
 impl FromStr for UMask {
@@ -262,7 +213,7 @@ impl UMask {
     }
 }
 
-#[derive(StructOpt)]
+#[derive(Clone, StructOpt)]
 /// Mounts the given repository at the given directory using the given temporary file path for
 /// internal metadata and state.
 struct MountArguments {
@@ -576,7 +527,11 @@ fn main() {
 
     let args: Arguments = Arguments::from_args();
     match args {
-        Arguments::Mount(subargs) => mount(subargs),
+        Arguments::Mount(subargs) =>
+            tokio::run(lazy(move || {
+                mount(subargs);
+                Ok(())
+            })),
 
         Arguments::Log { commit_range } => log(commit_range),
 

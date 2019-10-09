@@ -92,7 +92,7 @@ impl<T: Debug> OpenHandleSet<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RepoUrl<'a> {
     GithubHttps {
         apiurl: Cow<'a, str>,
