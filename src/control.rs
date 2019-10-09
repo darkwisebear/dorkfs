@@ -17,7 +17,8 @@ use crate::{
     overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
               WorkspaceFileStatus, OverlayDirEntry, WorkspaceLog, Repository},
     cache::{CacheRef, ReferencedCommit},
-    tempfile::TempDir
+    tempfile::TempDir,
+    commandstream::FinishCommandSocket
 };
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
@@ -249,7 +250,8 @@ impl<O> SpecialFileRegistry<O> where for<'a> O: Overlay+WorkspaceController<'a>+
 pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     overlay: Arc<RwLock<O>>,
     special_files: SpecialFileRegistry<O>,
-    tempdir: TempDir
+    tempdir: TempDir,
+    command_socket_finisher: Option<FinishCommandSocket>
 }
 
 impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
@@ -259,25 +261,30 @@ impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>
         let overlay = Arc::new(RwLock::new(overlay));
 
         #[cfg(target_os = "linux")]
-        {
+        let command_socket_finisher = {
             use std::os::unix::ffi::OsStrExt;
+            use crate::commandstream::{create_command_socket, CommandExecutor};
 
             let dorkcmd_path = tempdir.path().join("dorkcmd");
             let link_file_factory = ConstantFileFactory::new(
                 dorkcmd_path.as_os_str().as_bytes(), true);
             special_files.insert("cmd", link_file_factory);
 
-            let command_executor =
-                crate::commandstream::CommandExecutor::new(Arc::clone(&overlay));
-            let command_socket_future =
-                crate::commandstream::create_command_socket(dorkcmd_path, command_executor);
+            let command_executor = CommandExecutor::new(Arc::clone(&overlay));
+            let (command_socket_future, command_socket_finisher) =
+                create_command_socket(dorkcmd_path, command_executor);
             tokio::spawn(command_socket_future);
-        }
+
+            Some(command_socket_finisher)
+        };
+
+        #[cfg(not(target_os = "linux"))] let command_socket_finisher = None;
 
         ControlDir {
             overlay,
             special_files,
-            tempdir
+            tempdir,
+            command_socket_finisher
         }
     }
 }

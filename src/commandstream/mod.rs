@@ -374,21 +374,38 @@ pub fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
         })
 }
 
+#[derive(Debug)]
+pub struct FinishCommandSocket(futures::sync::oneshot::Sender<()>);
+
 #[cfg(target_os = "linux")]
 pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>)
-    -> impl Future<Item=(), Error=()> where P: AsRef<Path>,
-                                            R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
+    -> (impl Future<Item=(), Error=()>, FinishCommandSocket)
+    where P: AsRef<Path>,
+          R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
     debug!("Creating command socket at {}", path.as_ref().display());
 
     let listener = tokio_uds::UnixListener::bind(&path)
         .expect(format!("Unable to bind UDS listener {}", path.as_ref().display()).as_str());
 
-    listener.incoming()
+    let stream_future = listener.incoming()
         .map_err(|e| {
             error!("Error during command socket processing: {}", e);
         })
         .for_each(move |connection|
-            tokio::spawn(execute_commands(connection, command_executor.clone())))
+            tokio::spawn(execute_commands(connection, command_executor.clone())));
+
+    let (finisher, finish_future) = futures::sync::oneshot::channel::<()>();
+
+    let future = stream_future.select(
+        finish_future
+            .map(|_| unreachable!("The command channel finisher shall never send anything."))
+            .map_err(|_| {
+                debug!("Closing command socket");
+                ()
+            }))
+        .then(|_| Ok(()));
+
+    (future, FinishCommandSocket(finisher))
 }
 
 #[cfg(target_os = "linux")]
