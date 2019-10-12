@@ -389,7 +389,11 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
 
     let stream_future = listener.incoming()
         .map_err(|e| {
-            error!("Error during command socket processing: {}", e);
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                error!("Error during command socket processing: {}", e);
+            } else {
+                debug!("Broken pipe during command socket processing: {}", e);
+            }
         })
         .for_each(move |connection|
             tokio::spawn(execute_commands(connection, command_executor.clone())));
@@ -461,11 +465,22 @@ pub fn send_command(command: Command) {
                 Ok(stream)
             }
         })
-        .and_then(|stream| tokio::io::copy(stream, tokio::io::stdout()))
-        .and_then(|(_, stream, _)| tokio::io::shutdown(stream))
+        .map_err(|e| {
+            error!("Unable to send command to daemon: {}", &e);
+            None
+        })
+        .and_then(|stream|
+            tokio::io::copy(stream, tokio::io::stdout()).map_err(Some))
+        .and_then(|(_, stream, _)| tokio::io::shutdown(stream).map_err(Some))
         .map(|_| ())
         .map_err(|e| {
-            error!("Unable to communicate with daemon: {}", e);
+            if let Some(e) = e {
+                if e.kind() != io::ErrorKind::BrokenPipe {
+                    error!("Unable to communicate with daemon: {}", e);
+                } else {
+                    debug!("Broken pipe during result reception");
+                }
+            }
         });
 
     tokio::runtime::run(task);
