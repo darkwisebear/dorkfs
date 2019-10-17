@@ -1,6 +1,6 @@
 use std::fs;
 
-use failure::Error;
+use failure::{format_err, Error};
 use chrono::{DateTime, Utc};
 
 use crate::cache::{self, CacheRef};

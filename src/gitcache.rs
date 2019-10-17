@@ -10,7 +10,7 @@ use std::{
 use git2;
 use tempfile;
 use futures::future::FutureResult;
-use failure;
+use failure::{self, Fail, format_err};
 
 use crate::cache::*;
 

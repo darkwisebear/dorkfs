@@ -11,8 +11,9 @@ use std::str::FromStr;
 use std::path::Path;
 
 use futures::{task::{self, Task}, prelude::*};
-use failure::Fallible;
+use failure::{format_err, bail, Fallible};
 use tokio::io::AsyncWrite;
+use log::info;
 
 pub fn os_string_to_string(s: OsString) -> Fallible<String> {
     s.into_string()

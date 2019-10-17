@@ -21,10 +21,11 @@ use serde_json::{
     de::from_slice as from_json_slice,
     ser::to_string as to_json_string
 };
-use failure;
+use failure::{self, Fail, format_err};
 use base64;
 use bytes::Bytes;
 use lru::LruCache;
+use log::{debug, info, warn, error};
 
 use crate::cache::{self, DirectoryEntry, ReadonlyFile, CacheObject, CacheError, CacheRef,
                    CacheLayer, LayerError, Commit};

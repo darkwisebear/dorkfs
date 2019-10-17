@@ -14,7 +14,7 @@ use std::fs;
 use std::mem;
 
 use serde_json;
-use failure::{Fail, Error, Fallible};
+use failure::{Fail, Error, Fallible, format_err, ensure, bail};
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use chrono::{DateTime, FixedOffset};
 use futures::{future, Future};

@@ -1,35 +1,5 @@
 #![allow(clippy::unneeded_field_pattern, clippy::new_ret_no_self)]
 
-#[macro_use] extern crate failure;
-#[macro_use] extern crate failure_derive;
-extern crate libc;
-extern crate chrono;
-#[macro_use] extern crate log;
-extern crate env_logger;
-extern crate serde;
-extern crate serde_json;
-extern crate rand;
-extern crate tiny_keccak;
-#[macro_use] extern crate lazy_static;
-extern crate tempfile;
-extern crate hyper;
-extern crate hyper_tls;
-extern crate http;
-extern crate futures;
-extern crate tokio;
-extern crate base64;
-extern crate bytes;
-extern crate regex;
-extern crate owning_ref;
-extern crate either;
-extern crate glob;
-extern crate lru;
-
-#[cfg(target_os = "linux")]
-extern crate fuse_mt;
-#[cfg(target_os = "linux")]
-extern crate tokio_uds;
-
 #[cfg(target_os = "linux")]
 mod fuse;
 #[cfg(feature = "gitcache")]
@@ -52,10 +22,11 @@ use std::fmt::Debug;
 use std::borrow::Cow;
 use std::io::Read;
 
-use failure::Fallible;
+use failure::{Fallible, format_err};
 use structopt::StructOpt;
 use either::Either;
 use futures::future::lazy;
+use log::{error, warn, info, debug};
 
 use crate::{
     hashfilecache::HashFileCache,
@@ -111,7 +82,7 @@ mod uidgid {
     use std::str::FromStr;
     use std::ffi::CString;
 
-    use failure;
+    use failure::{self, bail};
     use libc;
 
     #[derive(Clone, Copy)]
@@ -410,6 +381,7 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
                 (Either::Right(crate::gitcache::GitCache::open(path)?), RepoRef::Branch("master"))
             }
             #[cfg(not(feature = "gitcache"))] {
+                use failure::bail;
                 bail!("Log git repositories not enabled in this build!")
             }
         }

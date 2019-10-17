@@ -20,6 +20,8 @@ use either::Either;
 use futures::{
     Async, Future, Stream
 };
+use failure::{Fail, format_err};
+use log::{debug, warn, info};
 
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
@@ -1579,6 +1581,7 @@ mod test {
     };
     use tempfile::tempdir;
     use chrono::{Utc, Offset};
+    use log::debug;
     use crate::overlay::{Overlay, OverlayFile, OverlayDirEntry, FileState, WorkspaceController};
     use crate::types::RepoRef;
     use super::testutil::*;

@@ -11,6 +11,7 @@ use serde_json;
 use lru::LruCache;
 use futures::{future, prelude::*};
 use serde::{Serialize, Deserialize};
+use log::{debug, info, error, warn};
 
 use crate::{
     cache::{

@@ -5,7 +5,8 @@ use regex::Regex;
 use std::fmt::{self, Display, Formatter};
 use std::iter;
 
-use failure::Fallible;
+use failure::{format_err, Fallible};
+use lazy_static::lazy_static;
 
 use super::gitconfig::{GitConfig, Section};
 

@@ -11,6 +11,8 @@ use time::{get_time, Timespec};
 use chrono::{DateTime, TimeZone, Timelike};
 use fuse_mt::*;
 use libc;
+use lazy_static::lazy_static;
+use log::{error, warn, info};
 
 use crate::overlay::{self, *};
 use crate::types;

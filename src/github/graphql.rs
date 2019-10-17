@@ -5,7 +5,7 @@ use std::mem::replace;
 use std::vec;
 use std::iter::FromIterator;
 
-use failure::{Fallible, Error};
+use failure::{Fallible, Error, bail, format_err};
 use serde::{Deserialize, Deserializer, de::Visitor};
 use chrono::{DateTime, FixedOffset};
 

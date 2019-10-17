@@ -7,8 +7,9 @@ use std::io::{Read, BufReader, BufRead};
 use std::env;
 use std::str::FromStr;
 
-use failure::Fallible;
+use failure::{bail, format_err, Fallible};
 use regex::Regex;
+use lazy_static::lazy_static;
 
 lazy_static! {
     static ref SECTION_PARSER: Regex = Regex::new(r#"\[([[[:alnum:]]-.]+)(?:\s+"(.+)")?\s*]"#)

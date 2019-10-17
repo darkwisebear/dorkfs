@@ -11,13 +11,16 @@ use std::vec;
 
 use chrono;
 use owning_ref::{RwLockReadGuardRef, OwningHandle};
+use tempfile::TempDir;
+use lazy_static::lazy_static;
+use failure::format_err;
+use log::warn;
 
 use crate::{
     types::{Metadata, ObjectType, RepoRef},
     overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
               WorkspaceFileStatus, OverlayDirEntry, WorkspaceLog, Repository},
     cache::{CacheRef, ReferencedCommit},
-    tempfile::TempDir,
     commandstream::FinishCommandSocket
 };
 

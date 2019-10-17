@@ -17,10 +17,11 @@ use tokio::{
     self,
     io::{AsyncRead, AsyncWrite}
 };
-use failure::{self, Fallible};
+use failure::{self, Fallible, format_err};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use glob::Pattern as GlobPattern;
+use log::{debug, info, warn, error};
 
 struct LogStreamEmitter<S> {
     stream: S,
