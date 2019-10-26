@@ -208,7 +208,7 @@ impl<O> FilesystemMT for DorkFS<O> where
             .map(drop)
     }
 
-    fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32 )
+    fn create(&self, _req: RequestInfo, parent: &Path, name: &OsStr, _mode: u32, flags: u32)
         -> ResultCreate {
         let path = parent.strip_prefix("/").expect("Expect absolute path").join(name);
         let mut state = self.state.write().unwrap();
@@ -440,5 +440,92 @@ impl<O> DorkFS<O> where
             .join(name);
         let state = self.state.read().unwrap();
         state.overlay.delete_file(&path)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[cfg(feature = "gitcache")]
+    mod withgitcache {
+        use std::{
+            path::Path,
+            borrow::Cow,
+            ffi::OsStr,
+            io::{self, Read, Write, Seek, SeekFrom},
+            iter::repeat
+        };
+
+        use tempfile::tempdir;
+        use fuse_mt::{CreatedEntry, FileAttr, FilesystemMT, RequestInfo};
+        use libc;
+
+        use crate::{
+            init_logging,
+            gitcache::GitCache,
+            hashfilecache::HashFileCache,
+            overlay::{FilesystemOverlay, Overlay, WorkspaceController, OverlayFile},
+            types::RepoRef,
+            fuse::DorkFS
+        };
+
+        #[test]
+        fn check_file_after_revert() {
+            init_logging();
+
+            let tempdir = tempdir().expect("Unable to create temporary dir!");
+            let tempdir_path = tempdir.path();
+
+            let overlay_dir = tempdir_path.join("overlay");
+            let git_dir = tempdir_path.join("git");
+            let cache_dir = tempdir_path.join("cache");
+
+            let storage = GitCache::new(git_dir)
+                .expect("Unable to initialize Git storage");
+            let hashcache = HashFileCache::new(storage, cache_dir).unwrap();
+            let overlay =
+                FilesystemOverlay::new(hashcache,
+                                       Cow::Borrowed(&overlay_dir),
+                                       RepoRef::Branch("master"))
+                    .expect("Unable to create overlay");
+
+            let dorkfs = DorkFS::with_overlay(overlay, 1000, 1000, 0o022).unwrap();
+
+            let req_info = RequestInfo {
+                unique: 0,
+                uid: 1000,
+                gid: 1000,
+                pid: 0
+            };
+            let CreatedEntry { fh, .. } = dorkfs.create(req_info, &Path::new("/"), &OsStr::new("test.txt"), 0, libc::O_WRONLY as u32).unwrap();
+
+            let data = repeat(b'a').take(1024).collect();
+            dorkfs.write(req_info, &Path::new("/test.txt"), fh, 0, data, 0).unwrap();
+            dorkfs.release(req_info, &Path::new("/test.txt"), fh, 0, 0, true).unwrap();
+
+            let mut state = dorkfs.state.write().unwrap();
+            state.overlay.commit("Test commit").unwrap();
+            drop(state);
+
+            let (_, FileAttr { size, ..  }) = dorkfs.getattr(req_info, &Path::new("/test.txt"), None).unwrap();
+            assert_eq!(size, 1024);
+
+            let (fh, _) = dorkfs.open(req_info, &Path::new("/test.txt"), libc::O_WRONLY as u32).unwrap();
+            dorkfs.truncate(req_info, &Path::new("/test.txt"), Some(fh), 512).unwrap();
+            dorkfs.release(req_info, &Path::new("/test.txt"), fh, 0, 0, true).unwrap();
+
+            let (_, FileAttr { size, ..  }) = dorkfs.getattr(req_info, &Path::new("/test.txt"), None).unwrap();
+            assert_eq!(size, 512);
+
+            let mut state = dorkfs.state.write().unwrap();
+            state.overlay.revert_file(&Path::new("test.txt")).unwrap();
+            drop(state);
+
+            let (_, FileAttr { size, ..  }) = dorkfs.getattr(req_info, &Path::new("/test.txt"), None).unwrap();
+            assert_eq!(size, 1024);
+
+            let (fh, _) = dorkfs.open(req_info, &Path::new("/test.txt"), libc::O_RDONLY as u32).unwrap();
+            let contents = dorkfs.read(req_info, &Path::new("/test.txt"), fh, 0, 1024).unwrap();
+            assert_eq!(contents.len(), 1024);
+        }
     }
 }
