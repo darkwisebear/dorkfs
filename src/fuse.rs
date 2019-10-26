@@ -18,6 +18,9 @@ use crate::overlay::{self, *};
 use crate::types;
 use crate::utility::OpenHandleSet;
 
+/// Validity of getattr results in milliseconds
+const ATTR_TIMEOUT_MS: u32 = 100;
+
 lazy_static! {
     static ref STANDARD_DIR_ENTRIES: [::fuse_mt::DirectoryEntry; 2] = [
         ::fuse_mt::DirectoryEntry {
@@ -103,7 +106,9 @@ impl<O> FilesystemMT for DorkFS<O> where
             flags: 0
         };
 
-        Ok((get_time(), attr))
+        Ok((Timespec::new(ATTR_TIMEOUT_MS as i64 / 1000,
+                          (ATTR_TIMEOUT_MS % 1000) as i32 * 1000000),
+                          attr))
     }
 
     fn opendir(&self, _req: RequestInfo, path: &Path, _flags: u32) -> ResultOpen {
