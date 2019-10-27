@@ -794,6 +794,14 @@ mod test {
     use chrono::{Local, FixedOffset};
     use super::*;
 
+    fn async_test<F: Send+'static+FnOnce() -> ()>(test: F) {
+        crate::init_logging();
+        ::tokio::run(::futures::lazy(move || {
+            test();
+            Ok(())
+        }))
+    }
+
     fn setup_github() -> Github {
         let gh_token = env::var("GITHUB_TOKEN")
             .expect("Please set GITHUB_TOKEN to your GitHub token so that the test can access \
@@ -806,37 +814,40 @@ mod test {
 
     #[test]
     fn get_github_commit() {
-        crate::init_logging();
-        let github = setup_github();
-        let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
-        let commit = obj.into_commit().expect("Unable to convert into commit");
-        let parent_ref = commit.parents[0];
-        github.get_cached(&parent_ref).expect("Parent commit uncached");
-        debug!("Commit from GitHub: {:?}", commit);
+        async_test(|| {
+            let github = setup_github();
+            let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
+            let commit = obj.into_commit().expect("Unable to convert into commit");
+            let parent_ref = commit.parents[0];
+            github.get_cached(&parent_ref).expect("Parent commit uncached");
+            debug!("Commit from GitHub: {:?}", commit);
+        });
     }
 
     #[test]
     fn get_github_tree() {
-        crate::init_logging();
-        let github = setup_github();
-        let obj = github.get(&CacheRef::from_str("20325767a89a3f96949dee6f3cb29ad57f86c1c2000000000000000000000000").unwrap()).unwrap();
-        debug!("Tree from GitHub: {:?}", obj);
+        async_test(|| {
+            let github = setup_github();
+            let obj = github.get(&CacheRef::from_str("20325767a89a3f96949dee6f3cb29ad57f86c1c2000000000000000000000000").unwrap()).unwrap();
+            debug!("Tree from GitHub: {:?}", obj);
+        });
     }
 
     #[test]
     fn get_github_blob() {
-        crate::init_logging();
-        let github = setup_github();
-        let cache_ref = CacheRef::from_str("77bd95d183dbe757ebd53c0aa95d1a710b85460f000000000000000000000000").unwrap();
-        let obj = github.get(&cache_ref).unwrap();
-        debug!("Blob from GitHub: {:?}", obj);
+        async_test(|| {
+            let github = setup_github();
+            let cache_ref = CacheRef::from_str("77bd95d183dbe757ebd53c0aa95d1a710b85460f000000000000000000000000").unwrap();
+            let obj = github.get(&cache_ref).unwrap();
+            debug!("Blob from GitHub: {:?}", obj);
 
-        let explicit_get = github.execute_request(github.request_builder.get_blob_data(&cache_ref))
-            .expect("Explicit get for blob failed");
+            let explicit_get = github.execute_request(github.request_builder.get_blob_data(&cache_ref))
+                .expect("Explicit get for blob failed");
 
-        let mut contents = String::new();
-        obj.into_file().unwrap().read_to_string(&mut contents).unwrap();
-        assert_eq!(contents.into_bytes(), explicit_get);
+            let mut contents = String::new();
+            obj.into_file().unwrap().read_to_string(&mut contents).unwrap();
+            assert_eq!(contents.into_bytes(), explicit_get);
+        });
     }
 
     #[test]
@@ -882,56 +893,57 @@ mod test {
 
     #[test]
     fn change_file_and_commit() {
-        use std::io::Write;
+        async_test(|| {
+            use std::io::Write;
 
-        crate::init_logging();
-        let mut github = setup_github();
-        let head_commit_ref = github.get_head_commit("test")
-            .expect("Unable to get the head commit ref of the test branch")
-            .expect("No head commit in test branch");
-        let head_commit = github.get(&head_commit_ref)
-            .and_then(CacheObject::into_commit)
-            .expect("Unable to get the head commit of the test branch");
-        let mut root_tree = github.get(&head_commit.tree)
-            .and_then(CacheObject::into_directory)
-            .map(hash_map_from_dir)
-            .expect("Unable to get root tree of test branch");
-        let mut src_tree = github.get(&root_tree.get("src")
-            .expect("src dir not found in root tree").cache_ref)
-            .expect("Unable to retrieve src dir")
-            .into_directory().map(hash_map_from_dir)
-            .expect("src is not a directory");
+            let mut github = setup_github();
+            let head_commit_ref = github.get_head_commit("test")
+                .expect("Unable to get the head commit ref of the test branch")
+                .expect("No head commit in test branch");
+            let head_commit = github.get(&head_commit_ref)
+                .and_then(CacheObject::into_commit)
+                .expect("Unable to get the head commit of the test branch");
+            let mut root_tree = github.get(&head_commit.tree)
+                .and_then(CacheObject::into_directory)
+                .map(hash_map_from_dir)
+                .expect("Unable to get root tree of test branch");
+            let mut src_tree = github.get(&root_tree.get("src")
+                .expect("src dir not found in root tree").cache_ref)
+                .expect("Unable to retrieve src dir")
+                .into_directory().map(hash_map_from_dir)
+                .expect("src is not a directory");
 
-        let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
-        writeln!(temp_file, "Test executed on {}", ::chrono::Local::now().to_rfc2822()).unwrap();
-        let file_cache_ref = github.add_file_by_path(
-            temp_file.into_temp_path())
-            .expect("Unable to upload file contents");
-        src_tree.get_mut("hashfilecache.rs")
-            .expect("Cannot find github.rs in src").cache_ref = file_cache_ref;
+            let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
+            writeln!(temp_file, "Test executed on {}", ::chrono::Local::now().to_rfc2822()).unwrap();
+            let file_cache_ref = github.add_file_by_path(
+                temp_file.into_temp_path())
+                .expect("Unable to upload file contents");
+            src_tree.get_mut("hashfilecache.rs")
+                .expect("Cannot find github.rs in src").cache_ref = file_cache_ref;
 
-        let updated_dir = github.add_directory(
-            &mut src_tree.into_iter().map(|(_, v)| v))
-            .expect("Unable to upload updated src dir");
-        root_tree.get_mut("src").unwrap().cache_ref = updated_dir;
+            let updated_dir = github.add_directory(
+                &mut src_tree.into_iter().map(|(_, v)| v))
+                .expect("Unable to upload updated src dir");
+            root_tree.get_mut("src").unwrap().cache_ref = updated_dir;
 
-        let updated_root = github.add_directory(
-            &mut root_tree.into_iter().map(|(_, v)| v))
-            .expect("Unable to upload updated root dir");
+            let updated_root = github.add_directory(
+                &mut root_tree.into_iter().map(|(_, v)| v))
+                .expect("Unable to upload updated root dir");
 
-        let new_commit = crate::cache::Commit {
-            tree: updated_root,
-            parents: vec![head_commit_ref],
-            message: "Test commit from unit test".to_string(),
-            committed_date: Local::now().with_timezone(&FixedOffset::east(0))
-        };
+            let new_commit = crate::cache::Commit {
+                tree: updated_root,
+                parents: vec![head_commit_ref],
+                message: "Test commit from unit test".to_string(),
+                committed_date: Local::now().with_timezone(&FixedOffset::east(0))
+            };
 
-        let new_commit_ref = github.add_commit(new_commit)
-            .and_then(|cache_ref| github.merge_commit("test", &cache_ref))
-            .expect("Unable to upload commit");
-        assert_eq!(new_commit_ref, github.get_head_commit("test")
-            .expect("Error getting new head commit")
-            .expect("No new head commit"));
+            let new_commit_ref = github.add_commit(new_commit)
+                .and_then(|cache_ref| github.merge_commit("test", &cache_ref))
+                .expect("Unable to upload commit");
+            assert_eq!(new_commit_ref, github.get_head_commit("test")
+                .expect("Error getting new head commit")
+                .expect("No new head commit"));
+        });
     }
 
     fn create_test_commit<R: Rng>(mut rng: R, gh: &Github, parent_commit: CacheRef)
@@ -962,42 +974,42 @@ mod test {
 
     #[test]
     fn merge_concurrent_changes() {
-        crate::init_logging();
+        async_test(|| {
+            let mut gh = setup_github();
+            let mut rng = StdRng::from_entropy();
 
-        let mut gh = setup_github();
-        let mut rng = StdRng::from_entropy();
+            let current_head = gh.get_head_commit("mergetest")
+                .expect("Unable to retrieve current HEAD")
+                .expect("This test needs at least one root commit to work.");
 
-        let current_head = gh.get_head_commit("mergetest")
-            .expect("Unable to retrieve current HEAD")
-            .expect("This test needs at least one root commit to work.");
+            let commit1ref =
+                create_test_commit(&mut rng, &gh, current_head);
+            gh.merge_commit("mergetest", &commit1ref)
+                .expect("Unable to merge first commit to master");
+            let commit2ref =
+                create_test_commit(&mut rng, &gh, current_head);
+            let final_ref = gh.merge_commit("mergetest", &commit2ref)
+                .expect("Unable to merge second commit to master");
 
-        let commit1ref =
-            create_test_commit(&mut rng, &gh, current_head);
-        gh.merge_commit("mergetest", &commit1ref)
-            .expect("Unable to merge first commit to master");
-        let commit2ref =
-            create_test_commit(&mut rng, &gh, current_head);
-        let final_ref = gh.merge_commit("mergetest", &commit2ref)
-            .expect("Unable to merge second commit to master");
+            info!("Created parent commits {} and {}", commit1ref, &commit2ref);
 
-        info!("Created parent commits {} and {}", commit1ref, &commit2ref);
+            let new_head = gh.get_head_commit("mergetest")
+                .expect("Unable to get new HEAD commit ref")
+                .unwrap();
 
-        let new_head = gh.get_head_commit("mergetest")
-            .expect("Unable to get new HEAD commit ref")
-            .unwrap();
+            info!("New HEAD after merge is {}", new_head);
+            assert_eq!(final_ref, new_head);
 
-        info!("New HEAD after merge is {}", new_head);
-        assert_eq!(final_ref, new_head);
+            let new_head_commit = gh.get(&new_head)
+                .expect("Unable to fetch new HEAD commit contents")
+                .into_commit()
+                .expect("Retrieved HEAD object is not a commit");
 
-        let new_head_commit = gh.get(&new_head)
-            .expect("Unable to fetch new HEAD commit contents")
-            .into_commit()
-            .expect("Retrieved HEAD object is not a commit");
-
-        assert_eq!(2, new_head_commit.parents.len(), "New commit is not a merge commit");
-        assert!(new_head_commit.parents.contains(&commit1ref) &&
-                    new_head_commit.parents.contains(&commit2ref),
-                "New merge commit does not contain the two commits created");
+            assert_eq!(2, new_head_commit.parents.len(), "New commit is not a merge commit");
+            assert!(new_head_commit.parents.contains(&commit1ref) &&
+                        new_head_commit.parents.contains(&commit2ref),
+                    "New merge commit does not contain the two commits created");
+        });
     }
 
     #[test]
