@@ -196,7 +196,10 @@ struct MountArguments {
     mountpoint: PathBuf,
     /// Connection specification to the root repository.
     ///
-    /// For GitHub this string has the following form: github+<GitHub URL>/<org>/<repo>
+    /// For GitHub this string has the following form:
+    /// github+https://[<token>@]<GitHub hostname>/<org>/<repo>
+    /// If <token> isn't given inside the URL it may also be set via the environment variable
+    /// "GITHUB_TOKEN".
     /// For a local git database storage, this string has the following form: git+file://<path>
     rootrepo: RepoUrl<'static>,
     #[structopt(long)]
@@ -297,9 +300,12 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
 
     match rootrepo_url {
         RepoUrl::GithubHttps {
-            apiurl, org, ..
+            apiurl,
+            org,
+            token,
+            repo: _
         } => match github::initialize_github_submodules(
-            gitmodules, apiurl.as_ref(), org.as_ref()) {
+            gitmodules, apiurl.as_ref(), org.as_ref(), token.as_ref()) {
             Ok(submodules) => {
                 for (submodule_path, submodule_url) in submodules.into_iter() {
                     let cache = fs.get_cache();
@@ -349,16 +355,15 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
     let overlaydir = overlaydir.as_ref();
 
     let (rootrepo, branch): (Either<_, MaybeGitCache>, _) = match rootrepo_url {
-        RepoUrl::GithubHttps { apiurl, org, repo } => {
+        RepoUrl::GithubHttps {
+            apiurl,
+            org,
+            repo,
+            token
+        } => {
             let baseurl = format!("https://{}", apiurl);
-            let token = ::std::env::var("GITHUB_TOKEN")
-                .expect("GITHUB_TOKEN needed in order to authenticate against GitHub");
             debug!("Connecting to GitHub at {} org {} repo {}", &baseurl, org, repo);
-            let github = github::Github::new(
-                baseurl.as_str(),
-                &org,
-                &repo,
-                token.as_str())?;
+            let github = github::Github::new(baseurl.as_str(), &org, &repo, &token)?;
 
             let branch = match branch {
                 Some(&RepoRef::Branch(branch)) => RepoRef::Branch(branch),

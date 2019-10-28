@@ -33,7 +33,8 @@ use crate::utility::{RepoUrl, gitmodules::GitModules};
 
 pub fn initialize_github_submodules<R: Read>(file: R,
                                        apiurl: &str,
-                                       org: &str)
+                                       org: &str,
+                                       token: &str)
     -> failure::Fallible<Vec<(PathBuf, RepoUrl<'static>)>> {
     let submodules = GitModules::from_reader(file)?;
 
@@ -49,7 +50,8 @@ pub fn initialize_github_submodules<R: Read>(file: R,
                     let github_submodule_url = crate::utility::RepoUrl::GithubHttps {
                         apiurl: Cow::Owned(baseurl.to_string()),
                         org: Cow::Owned(github_submodule.org.to_string()),
-                        repo: Cow::Owned(github_submodule.repo.to_string())
+                        repo: Cow::Owned(github_submodule.repo.to_string()),
+                        token: Cow::Owned(token.to_string())
                     };
 
                     Some((submodule.path, github_submodule_url))
