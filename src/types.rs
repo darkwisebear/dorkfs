@@ -16,7 +16,6 @@ pub enum ObjectType {
 
 // This is basically a placeholder until creating a branch from a ref other than the
 // current HEAD is supported
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepoRef<'a> {
     CacheRef(CacheRef),

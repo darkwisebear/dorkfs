@@ -151,7 +151,7 @@ impl<'a> RepoUrl<'a> {
                 let (token, apiurl) = if let Some(pos) = hostname.find('@') {
                     (Cow::Borrowed(&hostname[..pos]), Cow::Borrowed(&hostname[pos+1..]))
                 } else {
-                    let token = env::var("GITHUB_TOKEN").map_err(|e|
+                    let token = env::var("GITHUB_TOKEN").map_err(|_|
                         failure::err_msg("Github token must be given either in the URL \
                         before the hostname, separated by an '@' or in the environment as \
                         GITHUB_TOKEN"))?;

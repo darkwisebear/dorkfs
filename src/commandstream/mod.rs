@@ -9,7 +9,8 @@ use std::{
 
 use crate::{
     cache::{CacheRef, ReferencedCommit},
-    overlay::{self, Overlay, WorkspaceController}
+    overlay::{self, Overlay, WorkspaceController},
+    types::RepoRef
 };
 
 use futures::{prelude::*, future::Either, stream};
@@ -155,8 +156,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
         let branch_status = match target_branch {
             Some(target_branch_name) =>
                 repo
-                    .switch_branch(Some(&target_branch_name))
-                    .and_then(|_| repo.update_head())
+                    .switch(RepoRef::Branch(&target_branch_name))
                     .map(move |cache_ref|
                         (Cow::Owned(target_branch_name), cache_ref))
                     .map_err(failure::Error::from),
@@ -195,7 +195,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
     fn handle_revert<T>(&self, target: T, path_glob: String, dry_run: bool)
         -> impl Future<Item=T, Error=failure::Error> where T: AsyncWrite+Send+Sync+'static {
-        let repo = self.repo.read().unwrap();
+        let mut repo = self.repo.write().unwrap();
 
         let matching_paths = repo.get_status()
             .map_err(failure::Error::from)
@@ -496,7 +496,8 @@ mod test {
 
     use crate::{
         overlay::testutil::{check_file_content, open_working_copy},
-        cache::ReferencedCommit
+        cache::ReferencedCommit,
+        types::RepoRef
     };
 
     use tempfile::tempdir;
@@ -603,15 +604,13 @@ mod test {
             .expect("Unable to create second commit");
 
         // Switch back to master
-        working_copy.write().unwrap().switch_branch(Some("master")).unwrap();
-        working_copy.write().unwrap().update_head().unwrap();
+        working_copy.write().unwrap().switch(RepoRef::Branch("master")).unwrap();
 
         // ...and check if the second file is gone
         assert!(working_copy.write().unwrap().open_file(Path::new("file2.txt"), false).is_err());
 
         // Switch back to feature branch
-        working_copy.write().unwrap().switch_branch(Some("feature")).unwrap();
-        working_copy.write().unwrap().update_head().unwrap();
+        working_copy.write().unwrap().switch(RepoRef::Branch("feature")).unwrap();
 
         // Check if all committed files are present and contain the correct contents
         let mut file1 =

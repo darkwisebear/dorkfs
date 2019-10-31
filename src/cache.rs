@@ -493,8 +493,7 @@ pub trait CacheLayer {
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture;
 }
 
-pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P)
-    -> result::Result<Option<CacheRef>, Error>
+pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P) -> Fallible<Option<CacheRef>>
     where C: CacheLayer+?Sized,
           T: ::std::ops::Deref<Target=C>,
           P: AsRef<Path> {
@@ -530,6 +529,16 @@ pub fn resolve_object_ref<C, P, T>(cache: T, commit: &Commit, path: P)
     }
 
     Ok(objs.last().cloned())
+}
+
+pub fn get_gitlink<C: CacheLayer, P: AsRef<Path>>(cache: &C, commit_ref: &CacheRef, path: P) -> Fallible<CacheRef> {
+    cache.get(commit_ref)
+        .and_then(CacheObject::into_commit)
+        .map_err(failure::Error::from)
+        .and_then(|commit| resolve_object_ref(cache, &commit, path.as_ref()))
+        .and_then(|cache_ref|
+            cache_ref.ok_or_else(|| format_err!("Unable to find gitlink at {}",
+            path.as_ref().display())))
 }
 
 #[derive(Debug)]

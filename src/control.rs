@@ -400,11 +400,11 @@ impl<O> Overlay for ControlDir<O>
         }
     }
 
-    fn revert_file(&self, path: &Path) -> overlay::Result<()> {
+    fn revert_file(&mut self, path: &Path) -> overlay::Result<()> {
         if path.starts_with(DORK_DIR_ENTRY) {
             Err("Cannot revert .dork special files".into())
         } else {
-            self.overlay.read().unwrap().revert_file(path)
+            self.overlay.write().unwrap().revert_file(path)
         }
     }
 }
@@ -503,8 +503,8 @@ impl<'a, T> WorkspaceController<'a> for ControlDir<T>
             .map(|r| r.map(|o| Cow::Owned(o.into_owned())))
     }
 
-    fn switch_branch(&mut self, branch: Option<&str>) -> overlay::Result<()> {
-        self.overlay.write().unwrap().switch_branch(branch)
+    fn switch(&mut self, target: RepoRef) -> overlay::Result<CacheRef> {
+        self.overlay.write().unwrap().switch(target)
     }
 
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef>) -> overlay::Result<()> {

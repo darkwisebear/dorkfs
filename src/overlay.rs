@@ -151,7 +151,7 @@ pub trait Overlay {
         self.metadata(path).is_ok()
     }
     fn delete_file(&self, path: &Path) -> Result<()>;
-    fn revert_file(&self, path: &Path) -> Result<()>;
+    fn revert_file(&mut self, path: &Path) -> Result<()>;
 }
 
 pub trait WorkspaceLog: Iterator<Item=Result<ReferencedCommit>> { }
@@ -193,7 +193,7 @@ pub trait WorkspaceController<'a>: Debug {
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
     fn get_current_branch(&self) -> Result<Option<Cow<str>>>;
     // TODO: Check why branch is optional
-    fn switch_branch(&mut self, branch: Option<&str>) -> Result<()>;
+    fn switch(&mut self, target: RepoRef) -> Result<CacheRef>;
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()>;
     fn get_log(&'a self, start_commit: &CacheRef) -> Result<Self::Log>;
     fn get_log_stream(&self, start_commit: CacheRef) -> Self::LogStream;
@@ -330,7 +330,7 @@ impl<R> Overlay for RepositoryWrapper<R> where for <'a> R: Repository<'a>+Debug,
         self.0.delete_file(path)
     }
 
-    fn revert_file(&self, path: &Path) -> Result<()> {
+    fn revert_file(&mut self, path: &Path) -> Result<()> {
         self.0.revert_file(path)
     }
 }
@@ -354,8 +354,8 @@ impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Re
         self.0.get_current_branch()
     }
 
-    fn switch_branch(&mut self, branch: Option<&str>) -> Result<()> {
-        self.0.switch_branch(branch)
+    fn switch(&mut self, target: RepoRef) -> Result<CacheRef> {
+        self.0.switch(target)
     }
 
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>) -> Result<()> {
@@ -409,8 +409,8 @@ impl Overlay for BoxedRepository {
         self.deref().delete_file(path)
     }
 
-    fn revert_file(&self, path: &Path) -> Result<()> {
-        self.deref().revert_file(path)
+    fn revert_file(&mut self, path: &Path) -> Result<()> {
+        self.deref_mut().revert_file(path)
     }
 }
 
@@ -1094,9 +1094,28 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
         Ok(self.branch.as_ref().map(|b| Cow::Borrowed(b.as_str())))
     }
 
-    fn switch_branch(&mut self, new_branch: Option<&str>) -> Result<()> {
-        self.branch = new_branch.map(str::to_string);
-        Ok(())
+    fn switch(&mut self, target: RepoRef) -> Result<CacheRef> {
+        match target {
+            RepoRef::Branch(branch) => {
+                if !self.is_clean()? {
+                    return Err(Error::UncleanWorkspace);
+                }
+
+                self.branch = Some(branch.to_string());
+                self.cache.get_head_commit(branch)
+                    .map_err(Into::into)
+                    .and_then(|cache_ref|
+                        cache_ref.ok_or_else(|| Error::MissingHeadRef(self.branch.clone().unwrap())))
+                    .and_then(|cache_ref|
+                        self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
+            }
+
+            RepoRef::CacheRef(cache_ref) => {
+                self.branch = None;
+                self.head.set_ref(Some(cache_ref))?;
+                Ok(cache_ref)
+            }
+        }
     }
 
     fn create_branch(&mut self, new_branch: &str, repo_ref: Option<RepoRef<'a>>)
@@ -1162,23 +1181,16 @@ impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
     fn next(&mut self) -> Option<Self::Item> {
         let BoxedRepoDispatcherIter(iter, fs) = self;
 
-        let head_commit = match fs.get_head_commit() {
-            Ok(Some(commit)) => commit,
-            Ok(None) => return None,
-            Err(e) => return Some(Err(e))
+        let head_commit = match fs.head.cache_ref {
+            Some(commit) => commit,
+            None => return None,
         };
 
         iter.by_ref().filter_map(|(overlay, submodule_path)| {
             let cache = fs.get_cache();
-            let gitlink_ref = match
-                cache::resolve_object_ref(cache, &head_commit, submodule_path)
-                    .map_err(Error::Generic)
-                    .and_then(|cache_ref|
-                        cache_ref.ok_or_else(|| Error::Generic(
-                            format_err!("Unable to find gitlink for submodule in path {}",
-                                        submodule_path.display())))) {
-                Ok(gitlink) => gitlink,
-                Err(e) => return Some(Err(e))
+            let gitlink_ref = match cache::get_gitlink(&*cache, &head_commit, submodule_path) {
+                Ok(gitlink_ref)  => gitlink_ref,
+                Err(e) => return Some(Err(Error::Generic(e)))
             };
 
             let head_ref = match overlay.get_current_head_ref()
@@ -1465,9 +1477,17 @@ impl<C: CacheLayer+Debug+Send+Sync+'static> Overlay for FilesystemOverlay<C> {
         }
     }
 
-    fn revert_file(&self, path: &Path) -> Result<()> {
-        if let Some((overlay, subpath)) = self.submodules.get_overlay(path)? {
-            return overlay.revert_file(subpath);
+    fn revert_file(&mut self, path: &Path) -> Result<()> {
+        if let Some((overlay, subpath)) = self.submodules.get_overlay_mut(path)? {
+            if subpath.as_os_str() == "" {
+                let head_ref = self.head.cache_ref
+                    .ok_or_else(|| Error::MissingHeadRef(format!("Cannot revert submodule at {}", path.display())))?;
+                let gitref = cache::get_gitlink(&*self.cache, &head_ref, path)?;
+                debug!("Resetting submodule at {} to {}", path.display(), &gitref);
+                return overlay.switch(RepoRef::CacheRef(gitref)).map(|_| ());
+            } else {
+                return overlay.revert_file(subpath);
+            }
         }
 
         use std::path::Component::Normal;

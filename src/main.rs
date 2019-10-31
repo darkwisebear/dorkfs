@@ -31,7 +31,7 @@ use log::{error, warn, info, debug};
 use crate::{
     hashfilecache::HashFileCache,
     overlay::{WorkspaceController, FilesystemOverlay, BoxedRepository, RepositoryWrapper, Overlay},
-    cache::{CacheLayer, CacheRef, CommitRange},
+    cache::{CacheLayer, CommitRange},
     control::ControlDir,
     utility::RepoUrl,
     types::RepoRef,
@@ -291,10 +291,7 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
           C: CacheLayer+Debug+Send+Sync+'static,
           <C as CacheLayer>::GetFuture: Send {
     let head_commit = match fs.get_current_head_ref()? {
-        Some(head_commit) => {
-            let cache = fs.get_cache();
-            get_commit(&*cache, &head_commit)?
-        }
+        Some(head_commit) => head_commit,
         None => return Ok(()),
     };
 
@@ -308,14 +305,8 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
             gitmodules, apiurl.as_ref(), org.as_ref(), token.as_ref()) {
             Ok(submodules) => {
                 for (submodule_path, submodule_url) in submodules.into_iter() {
-                    let cache = fs.get_cache();
-                    let gitlink_ref =
-                        cache::resolve_object_ref(cache, &head_commit, &submodule_path)
-                            .map_err(failure::Error::from)
-                            .and_then(|cache_ref|
-                                cache_ref.ok_or_else(||
-                                    format_err!("Unable to find gitlink for submodule in path {}",
-                                                    submodule_path.display())));
+                    let gitlink_ref = cache::get_gitlink(&*fs.get_cache(),
+                                                         &head_commit, &submodule_path);
                     match gitlink_ref {
                         Ok(gitlink_ref) =>
                             new_overlay(workspace_dir.as_ref().join(&submodule_path),
@@ -442,12 +433,6 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
             Box::new(RepositoryWrapper::new(control_dir)) as BoxedRepository
         })
         .map_err(Into::into)
-}
-
-fn get_commit<C: CacheLayer>(cache: &C, commit_ref: &CacheRef) -> Fallible<cache::Commit> {
-    cache.get(commit_ref)
-        .and_then(|obj| obj.into_commit())
-        .map_err(failure::Error::from)
 }
 
 pub fn init_logging() {
