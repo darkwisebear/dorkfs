@@ -35,7 +35,7 @@ glob = "0.3"
 lru = "0.1"
 native-tls = "0.2"
 structopt = "0.3"
-fsoperation = { git = "https://github.com/darkwisebear/fsgrinder", branch = "workspace-test" }
+futures_preview = { package = "futures-preview", version = "0.3.0-alpha.19", features = ["compat", "io-compat"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse_mt = "0.4"

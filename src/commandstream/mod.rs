@@ -4,7 +4,8 @@ use std::{
     io,
     net::Shutdown,
     borrow::Cow,
-    fmt::Display
+    fmt::Display,
+    pin::Pin
 };
 
 use crate::{
@@ -13,11 +14,20 @@ use crate::{
     types::RepoRef
 };
 
-use futures::{prelude::*, future::Either, stream};
-use tokio::{
-    self,
-    io::{AsyncRead, AsyncWrite}
+use futures_preview::{
+    Poll, FutureExt, TryFutureExt, Stream, StreamExt, TryStreamExt,
+    compat::{
+        AsyncRead01CompatExt,
+        Stream01CompatExt
+    },
+    io::{
+        AsyncRead, AsyncWrite,
+        AsyncReadExt, AsyncWriteExt
+    },
+    task::Context,
+    stream
 };
+use futures::{self, Future as Future01, Stream as _, IntoFuture};
 use failure::{self, Fallible, format_err};
 use serde::{Serialize, Deserialize};
 use serde_json;
@@ -38,25 +48,27 @@ impl<S> LogStreamEmitter<S> {
     }
 }
 
-impl<S> Stream for LogStreamEmitter<S>
-    where S: Stream<Item=ReferencedCommit, Error=overlay::Error> {
+impl<S> Stream for LogStreamEmitter<S> where S: Stream<Item=Result<ReferencedCommit, overlay::Error>> {
     type Item = String;
-    type Error = (); // Actually this should be '!'
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         if !self.error_encountered {
-            match self.stream.poll() {
-                Ok(Async::Ready(commit)) =>
-                    Ok(Async::Ready(commit.as_ref().map(ReferencedCommit::to_string))),
-                Err(err) => {
-                    self.error_encountered = true;
+            let stream = unsafe { self.as_mut().map_unchecked_mut(|s| &mut s.stream) };
+            match stream.poll_next(cx) {
+                Poll::Ready(Some(Ok(commit))) =>
+                    Poll::Ready(Some(commit.to_string())),
+                Poll::Ready(Some(Err(err))) => {
+                    unsafe {
+                        self.get_unchecked_mut().error_encountered = true;
+                    }
                     warn!("Error during log streaming: {}", err);
-                    Ok(Async::Ready(Some(format!("ERROR: Unable to retrieve log entry: {}", err))))
+                    Poll::Ready(Some(format!("ERROR: Unable to retrieve log entry: {}", err)))
                 }
-                Ok(Async::NotReady) => Ok(Async::NotReady)
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending
             }
         } else {
-            Ok(Async::Ready(None))
+            Poll::Ready(None)
         }
     }
 }
@@ -118,20 +130,18 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
         }
     }
 
-    pub fn command<T: AsyncWrite+Send+Sync+'static>(&self, command: Command, target: T)
-        -> impl Future<Item=T, Error=failure::Error>+Send {
+    pub async fn command<T: AsyncWrite+Send+Sync+'static+Unpin>(&self, command: Command, target: T)
+        -> Result<T, failure::Error> {
         match command {
-            Command::Commit { message } =>
-                Box::new(self.commit_handler(message, target))
-                    as Box<dyn Future<Item=T, Error=failure::Error>+Send>,
+            Command::Commit { message } => self.commit_handler(message, target).await,
 
             Command::Log { start_commit } =>
-                Box::new(self.handle_log_stream(start_commit, target)) as Box<_>,
+                self.handle_log_stream(start_commit, target).await,
 
-            Command::Status => Box::new(self.handle_status(target)) as Box<_>,
+            Command::Status => self.handle_status(target).await,
 
             Command::CurrentBranch { target_branch } =>
-                Box::new(self.handle_switch(target_branch, target)) as Box<_>,
+                self.handle_switch(target_branch, target).await,
 
             Command::CreateBranch {
                 name
@@ -139,39 +149,38 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                 let create_result =
                     self.repo.write().unwrap().create_branch(name.as_str(), None)
                         .map(|_| format!("Successfully created branch {}", name.as_str()));
-                Box::new(Self::send_result_string(
-                    target, create_result, "Failed to create branch")) as Box<_>
+                Self::send_result_string(
+                    target, create_result, "Failed to create branch").await
             }
 
             Command::Revert {
                 path_glob,
                 dry_run
-            } => Box::new(self.handle_revert(target, path_glob, dry_run)) as Box<_>
+            } => self.handle_revert(target, path_glob, dry_run).await
         }
     }
 
-    fn handle_switch<T>(&self, target_branch: Option<String>, target: T)
-        -> impl Future<Item=T, Error=failure::Error> where T: AsyncWrite+Send+Sync+'static {
-        let mut repo = self.repo.write().unwrap();
+    async fn handle_switch<T>(&self, target_branch: Option<String>, target: T)
+        -> Result<T, failure::Error> where T: AsyncWrite+Send+Sync+'static+Unpin {
         let branch_status = match target_branch {
             Some(target_branch_name) =>
-                repo
+                self.repo.write().unwrap()
                     .switch(RepoRef::Branch(&target_branch_name))
                     .map(move |cache_ref|
                         (Cow::Owned(target_branch_name), cache_ref))
                     .map_err(failure::Error::from),
 
             None => {
-                let current_branch = repo.get_current_branch()
+                let current_branch = self.repo.read().unwrap().get_current_branch()
                     .map(|option| option.map(Cow::into_owned));
                 match current_branch {
                     Ok(Some(name)) =>
-                        repo.update_head()
+                        self.repo.write().unwrap().update_head()
                             .map(|cache_ref|
                                 (Cow::Owned(name), cache_ref))
                             .map_err(failure::Error::from),
                     Ok(None) =>
-                        repo.get_current_head_ref()
+                        self.repo.read().unwrap().get_current_head_ref()
                             .map(|cache_ref| {
                                 let cache_ref = cache_ref
                                     .unwrap_or_else(CacheRef::null);
@@ -183,21 +192,15 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             }
         };
 
-        branch_status
-            .into_future()
-            .then(|branch_status|
-                Self::send_result_string(
-                    target,
-                    branch_status.map(|(branch_name, cache_ref)|
-                        format!("{} checked out at {}", branch_name, cache_ref)),
-                    "Unable to retrieve workspace status"))
+        let string = branch_status.map(|(branch_name, cache_ref)|
+            format!("{} checked out at {}", branch_name, cache_ref));
+        Self::send_result_string(target, string, "Unable to retrieve workspace status")
+            .await
     }
 
-    fn handle_revert<T>(&self, target: T, path_glob: String, dry_run: bool)
-        -> impl Future<Item=T, Error=failure::Error> where T: AsyncWrite+Send+Sync+'static {
-        let mut repo = self.repo.write().unwrap();
-
-        let matching_paths = repo.get_status()
+    async fn handle_revert<T>(&self, target: T, path_glob: String, dry_run: bool)
+        -> Result<T, failure::Error> where T: AsyncWrite+Send+Sync+'static+Unpin {
+        let matching_paths = self.repo.read().unwrap().get_status()
             .map_err(failure::Error::from)
             .and_then(|status_iter| {
                 let glob = GlobPattern::new(path_glob.as_str())
@@ -220,7 +223,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             .and_then(|matching_paths| {
                 if !dry_run {
                     for matching_path in &matching_paths {
-                        repo.revert_file(matching_path.as_path())
+                        self.repo.write().unwrap().revert_file(matching_path.as_path())
                             .map_err(failure::Error::from)?
                     }
                 }
@@ -228,37 +231,40 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                 Ok(matching_paths)
             });
 
-        revert_result.into_future()
-            .then(|matching_paths| match matching_paths {
+            match revert_result {
                 Ok(matching_paths) =>
-                    Either::A(stream::iter_ok::<_, failure::Error>(matching_paths)
-                        .fold(target, |target, matching_path| {
-                            let message = format!("Reverting {}\n", matching_path.display());
-                            tokio::io::write_all(target, message)
-                                .map(|(target, _)| target)
+                    stream::iter(matching_paths.into_iter().map(Ok))
+                        .try_fold(target, |mut target: T, matching_path: PathBuf| {
+                            async move {
+                                let message = format!("Reverting {}\n", matching_path.display());
+                                let r = target.write_all(message.as_bytes()).await;
+                                r.map(|_| target)
+                            }
                         })
-                        .map_err(failure::Error::from)),
+                        .map_err(failure::Error::from)
+                        .await,
                 Err(e) => {
                     warn!("Revert failed: {}", e);
-                    Either::B(Self::send_string(
-                        target, format!("ERROR: Unable to execute revert operation: {}", e)))
+                    let string = format!("ERROR: Unable to execute revert operation: {}", e);
+                    Self::send_string(target, string).await
                 }
-            })
+            }
     }
 
-    fn send_string<T, E>(target: T, string: String)
-        -> impl Future<Item=T, Error=E> where T: AsyncWrite+Send+Sync+'static,
-                                              E: From<io::Error> {
-        tokio::io::write_all(target, string.into_bytes())
-            .map(|(target, _)| target)
+    async fn send_string<T, E>(mut target: T, string: String) -> Result<T, E>
+        where T: AsyncWrite+Send+Sync+'static+Unpin,
+              E: From<io::Error> {
+        target.write_all(string.as_bytes())
+            .await
+            .map(|_| target)
             .map_err(E::from)
     }
 
-    fn send_result_string<T, S, E, F>(target: T, string: Result<S, F>, error_prefix: &str)
-        -> impl Future<Item=T, Error=E> where T: AsyncWrite+Send+Sync+'static,
-                                              S: Display,
-                                              E: From<io::Error>,
-                                              F: Display {
+    async fn send_result_string<T, S, E, F>(target: T, string: Result<S, F>, error_prefix: &str)
+        -> Result<T, E> where T: AsyncWrite+Send+Sync+'static+Unpin,
+                              S: Display,
+                              E: From<io::Error>,
+                              F: Display {
         let message = match string {
             Ok(string) => string.to_string(),
             Err(err) => {
@@ -266,11 +272,11 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                 format!("ERROR: {}: {}", error_prefix, err)
             }
         };
-        Self::send_string(target, message)
+        Self::send_string(target, message).await
     }
 
-    fn handle_status<T: AsyncWrite+Send+Sync+'static>(&self, target: T)
-        -> impl Future<Item=T, Error=failure::Error> {
+    async fn handle_status<T: AsyncWrite+Send+Sync+'static+Unpin>(&self, target: T)
+        -> Result<T, failure::Error> {
         let status_string: Result<String, _> = self.repo.read().unwrap().get_status()
             .and_then(|status_iter|
                 status_iter.fold(Ok(String::new()), |s: overlay::Result<String>, t| {
@@ -282,97 +288,89 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                 }))
             .map_err(failure::Error::from);
 
-        status_string
-            .into_future()
-            .then(move |status_string|
-                Self::send_result_string(
-                    target,
-                    status_string,
-                    "Failed to retrieve status"))
+        Self::send_result_string(
+            target,
+            status_string,
+            "Failed to retrieve status").await
     }
 
-    fn handle_log_stream<T>(&self, start_commit: Option<CacheRef>, target: T)
-        -> impl Future<Item=T, Error=failure::Error>+Send
-        where T: AsyncWrite+Send+Sync+'static {
+    async fn handle_log_stream<T>(&self, start_commit: Option<CacheRef>, mut target: T)
+        -> Result<T, failure::Error> where T: AsyncWrite+Send+Sync+'static+Unpin {
         static NO_LOG_STRING: &[u8] = b"(empty log)";
-
-        let repo = self.repo.read().unwrap();
 
         let start_commit = match start_commit {
             Some(start_commit) => Ok(Some(start_commit)),
-            None => repo.get_current_head_ref()
+            None => self.repo.read().unwrap().get_current_head_ref()
                 .map_err(failure::Error::from)
         };
 
         match start_commit {
             Ok(start_commit) => {
-                let ok_future = match start_commit {
+                match start_commit {
                     Some(start_commit) => {
-                        let log_stream = LogStreamEmitter::new(repo.get_log_stream(start_commit));
-                        Either::A(log_stream
-                            .map_err(|_| unreachable!()) // LogStreamEmitter don't error!
-                            .fold(target, |target, mut message| {
-                                message.push('\n');
-                                tokio::io::write_all(target, message)
-                                    .map(|(target, _)| target)
-                                    .map_err(failure::Error::from)
-                            }))
+                        let log_stream = LogStreamEmitter::new(
+                            self.repo.read().unwrap().get_log_stream(start_commit).compat());
+                        log_stream
+                            .map(Fallible::Ok)
+                            .try_fold(target, |mut target, mut message| {
+                                async move {
+                                    message.push('\n');
+                                    target.write_all(message.as_bytes())
+                                        .await
+                                        .map(|_| target)
+                                        .map_err(failure::Error::from)
+                                }
+                            })
+                            .await
                     }
 
-                    None => Either::B(tokio::io::write_all(target, NO_LOG_STRING)
-                                .map(|(target, _)| target)
-                                .map_err(failure::Error::from)),
-                };
-
-                Either::A(ok_future)
+                    None => target.write_all(NO_LOG_STRING)
+                        .await
+                        .map(|_| target)
+                        .map_err(failure::Error::from),
+                }
             }
 
             Err(e) => {
                 warn!("Unable to get start commit for log listing: {}", e);
-                Either::B(Self::send_string(
-                    target,
-                    format!("ERROR: Unable to get start commit for log listing: {}", e)))
+                let string = format!("ERROR: Unable to get start commit for log listing: {}", e);
+                Self::send_string(target, string).await
             }
         }
     }
 
-    fn commit_handler<T>(&self, message: String, target: T)
-        -> impl Future<Item=T, Error=failure::Error>
-        where T: AsyncWrite+Send+Sync+'static {
+    async fn commit_handler<T>(&self, message: String, target: T) -> Result<T, failure::Error>
+        where T: AsyncWrite+Send+Sync+'static+Unpin {
         let commit_result = self.repo.write().unwrap()
             .commit(message.as_str());
-        Self::send_result_string(
-            target,
-            commit_result.map(|cache_ref|
-                format!("Successfully committed, HEAD at {}", cache_ref)),
-            "Failed to commit")
+        let string = commit_result.map(|cache_ref|
+            format!("Successfully committed, HEAD at {}", cache_ref));
+        Self::send_result_string(target, string, "Failed to commit").await
     }
 }
 
-pub fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
-    -> impl Future<Item=(), Error=()> where R: Overlay+for<'a> WorkspaceController<'a>+'static,
-                                                        C: AsyncRead+AsyncWrite+Send+'static {
-    let (input, output) = channel.split();
-    tokio::io::read_to_end(input, Vec::new())
-        .map_err(failure::Error::from)
-        .and_then(|(_, command_string)|
-                  serde_json::from_slice(&command_string[..])
-                    .map_err(failure::Error::from))
-        .and_then(move |command| {
-            debug!("Received command {:?}", command);
-            executor.command(command, output)
-        })
-        .and_then(|target|
-            tokio::io::shutdown(target)
-                .map(|_| ())
-                .map_err(failure::Error::from))
-        .then(|result| match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                error!("Error during command processing: {}", e);
-                Ok(())
-            }
-        })
+async fn execute_single_command<R, C>(channel: C, executor: CommandExecutor<R>) -> Fallible<()>
+    where R: Overlay+for<'a> WorkspaceController<'a>+'static,
+          C: AsyncRead+AsyncWrite+Send+'static {
+    let (mut input, output) = channel.split();
+    let mut command_string = Vec::new();
+    input.read_to_end(&mut command_string).await?;
+    let command = serde_json::from_slice(&command_string[..])?;
+    debug!("Received command {:?}", command);
+    let mut output = executor.command(command, output).await?;
+    Ok(output.close().await?)
+}
+
+pub fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>) -> impl Future01<Item=(), Error=()>
+    where R: Overlay+for<'a> WorkspaceController<'a>+'static+Send+Sync,
+          C: tokio::io::AsyncRead+tokio::io::AsyncWrite+Send+'static {
+    let result = async {
+        if let Err(e) = execute_single_command(channel.compat(), executor).await {
+            warn!("Error processing command: {}", e);
+        }
+        Ok(())
+    };
+    result.boxed().compat()
 }
 
 #[derive(Debug)]
@@ -380,7 +378,7 @@ pub struct FinishCommandSocket(futures::sync::oneshot::Sender<()>);
 
 #[cfg(target_os = "linux")]
 pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>)
-    -> (impl Future<Item=(), Error=()>, FinishCommandSocket)
+    -> (impl Future01<Item=(), Error=()>, FinishCommandSocket)
     where P: AsRef<Path>,
           R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
     debug!("Creating command socket at {}", path.as_ref().display());
@@ -414,7 +412,7 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
 }
 
 #[cfg(target_os = "linux")]
-fn find_command_stream() -> impl Future<Item=tokio_uds::UnixStream, Error=io::Error> {
+fn find_command_stream() -> impl Future01<Item=tokio_uds::UnixStream, Error=io::Error> {
     fn find_stream_path() -> io::Result<PathBuf> {
         let cwd = std::env::current_dir()?;
 
@@ -447,7 +445,7 @@ fn find_command_stream() -> impl Future<Item=tokio_uds::UnixStream, Error=io::Er
 }
 
 #[cfg(not(target_os = "linux"))]
-fn find_command_stream() -> impl Future<Item=tokio::fs::File, Error=io::Error> {
+fn find_command_stream() -> impl Future01<Item=tokio::fs::File, Error=io::Error> {
     futures::failed(io::Error::new(
         io::ErrorKind::Other,
         "dorkfs only supports Linux. Bummer."))
@@ -491,26 +489,35 @@ pub fn send_command(command: Command) {
 mod test {
     use std::{
         io::{Read, Write, Cursor, self},
-        path::Path, fmt::Debug
+        path::Path, fmt::Debug,
+        sync::{Arc, RwLock}
     };
 
     use crate::{
+        overlay::{Overlay, WorkspaceController},
         overlay::testutil::{check_file_content, open_working_copy},
         cache::ReferencedCommit,
         types::RepoRef
     };
 
     use tempfile::tempdir;
-    use futures;
-    use tokio::runtime::current_thread::run as run_current_thread;
+    use futures_preview::{
+        AsyncWrite, Future, FutureExt, TryFutureExt,
+        io::AllowStdIo
+    };
+    use futures::future::Future as _;
+    use tokio;
 
-    use super::*;
+    use super::{Command, CommandExecutor};
 
     fn execute_command_future<T, E, F>(command_future: F) -> T
         where T: AsyncWrite+Send+Sync+'static,
               E: Debug,
-              F: Future<Item=T, Error=E>+'static {
-        command_future.wait().expect("Unable to execute command")
+              F: Future<Output=Result<T, E>>+Send {
+        match command_future.boxed().compat().wait() {
+            Ok(target) => target,
+            Err(e) => panic!("Unable to finish future in test: {}")
+        }
     }
 
     #[test]
@@ -519,7 +526,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = Arc::new(RwLock::new(open_working_copy(&dir)));
-        let output = io::sink();
+        let output = AllowStdIo::new(io::sink());
         let commander = CommandExecutor::new(Arc::clone(&working_copy));
 
         let mut file = working_copy.write().unwrap().open_file(Path::new("test.txt"), true)
@@ -568,7 +575,7 @@ mod test {
 
         // Create branch "feature"
         let create_branch_command = Command::CreateBranch { name: String::from("feature") };
-        let create_branch_future = commander.command(create_branch_command, io::sink());
+        let create_branch_future = commander.command(create_branch_command, AllowStdIo::new(io::sink()));
         execute_command_future(create_branch_future);
 
         // Check if we still track "master"
@@ -660,7 +667,7 @@ mod test {
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("file1.txt"), dry_run: false };
-        let revert_future = commander.command(revert_command, io::sink());
+        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
         execute_command_future(revert_future);
 
         assert_eq!(0, working_copy.read().unwrap().get_status().unwrap().count());
@@ -683,7 +690,7 @@ mod test {
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("file2.txt"), dry_run: false };
-        let revert_future = commander.command(revert_command, io::sink());
+        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
         execute_command_future(revert_future);
 
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
@@ -714,12 +721,12 @@ mod test {
         assert_eq!(2, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("file1.txt"), dry_run: false };
-        let revert_future = commander.command(revert_command, io::sink());
+        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
         execute_command_future(revert_future);
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("dir/*"), dry_run: false };
-        let revert_future = commander.command(revert_command, io::sink());
+        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
         execute_command_future(revert_future);
         assert_eq!(0, working_copy.read().unwrap().get_status().unwrap().count());
     }
