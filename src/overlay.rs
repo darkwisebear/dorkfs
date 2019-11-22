@@ -14,11 +14,12 @@ use std::cmp::max;
 use std::borrow::Cow;
 use std::vec;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 
 use chrono::{Utc, Offset};
 use either::Either;
 use futures::{
-    Async, Future, Stream
+    FutureExt, Stream, task::{Poll, Context},
 };
 use failure::{Fail, format_err};
 use log::{debug, warn, info};
@@ -186,7 +187,7 @@ impl Display for WorkspaceFileStatus {
 
 pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog+'a;
-    type LogStream: Stream<Item=ReferencedCommit, Error=Error>+Send+'static;
+    type LogStream: Stream<Item=Result<ReferencedCommit>>+Send+Unpin+'static;
     type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
@@ -283,7 +284,7 @@ pub type BoxedDirIter = Box<dyn Iterator<Item=Result<OverlayDirEntry>>>;
 
 pub type BoxedRepository = Box<dyn for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
-    LogStream=Box<dyn Stream<Item=ReferencedCommit, Error=Error>+Send>,
+    LogStream=Box<dyn Stream<Item=Result<ReferencedCommit>>+Send+Unpin>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
     File=BoxedOverlayFile,
     DirIter=BoxedDirIter>
@@ -339,7 +340,7 @@ impl<T> WorkspaceLog for Box<T> where T: WorkspaceLog+?Sized {}
 
 impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Repository<'b>+Debug {
     type Log = Box<dyn WorkspaceLog+'a>;
-    type LogStream = Box<dyn Stream<Item=ReferencedCommit, Error=Error>+Send>;
+    type LogStream = Box<dyn Stream<Item=Result<ReferencedCommit>>+Send+Unpin>;
     type StatusIter = Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
@@ -975,14 +976,13 @@ impl<C> CacheLayerLogStream<C> where C: CacheLayer {
 }
 
 impl<C> Stream for CacheLayerLogStream<C> where C: CacheLayer {
-    type Item = ReferencedCommit;
-    type Error = Error;
+    type Item = Result<ReferencedCommit>;
 
-    fn poll(&mut self) -> Result<Async<Option<Self::Item>>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         match self.current_poll.take() {
-            Some((cur_ref, mut cur_poll)) =>
-                match cur_poll.poll() {
-                    Ok(Async::Ready(obj)) => {
+            Some((cur_ref, mut cur_poll)) => {
+                match cur_poll.poll_unpin(cx) {
+                    Poll::Ready(Ok(obj)) => {
                         let commit = obj.into_commit()?;
 
                         if !commit.parents.is_empty() {
@@ -995,18 +995,19 @@ impl<C> Stream for CacheLayerLogStream<C> where C: CacheLayer {
                             self.current_poll = Some((commit.parents[0], new_poll));
                         }
 
-                        Ok(Async::Ready(Some(ReferencedCommit(cur_ref, commit))))
+                        Poll::Ready(Some(Ok(ReferencedCommit(cur_ref, commit))))
                     }
 
-                    Ok(Async::NotReady) => {
+                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Error::from(e)))),
+
+                    Poll::Pending => {
                         self.current_poll = Some((cur_ref, cur_poll));
-                        Ok(Async::NotReady)
+                        Poll::Pending
                     }
+                }
+            }
 
-                    Err(e) => Err(Error::from(e))
-                },
-
-            None => Ok(Async::Ready(None))
+            None => Poll::Ready(None)
         }
     }
 }

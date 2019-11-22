@@ -15,13 +15,13 @@ use tempfile::TempDir;
 use lazy_static::lazy_static;
 use failure::format_err;
 use log::warn;
+use futures::future::AbortHandle;
 
 use crate::{
     types::{Metadata, ObjectType, RepoRef},
     overlay::{self, Overlay, OverlayFile, DebuggableOverlayFile, WorkspaceController,
               WorkspaceFileStatus, OverlayDirEntry, WorkspaceLog, Repository},
-    cache::{CacheRef, ReferencedCommit},
-    commandstream::FinishCommandSocket
+    cache::{CacheRef, ReferencedCommit}
 };
 
 static DORK_DIR_ENTRY: &'static str = ".dork";
@@ -254,7 +254,7 @@ pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
     overlay: Arc<RwLock<O>>,
     special_files: SpecialFileRegistry<O>,
     tempdir: TempDir,
-    command_socket_finisher: Option<FinishCommandSocket>
+    command_socket_finisher: Option<AbortHandle>
 }
 
 impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {

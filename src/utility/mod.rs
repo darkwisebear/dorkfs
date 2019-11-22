@@ -4,16 +4,13 @@ mod gitconfig;
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::Arc;
 use std::borrow::{Cow, Borrow};
-use std::io::{self, Read, Seek, Write, SeekFrom};
 use std::str::FromStr;
 use std::path::Path;
 use std::env;
 
-use futures::{task::{self, Task}, prelude::*};
 use failure::{format_err, bail, Fallible};
-use tokio::io::AsyncWrite;
 use log::info;
 
 pub fn os_string_to_string(s: OsString) -> Fallible<String> {
@@ -181,6 +178,7 @@ impl<'a> RepoUrl<'a> {
     }
 }
 
+/*
 const BUF_PREFILL: usize = 2048;
 
 #[derive(Debug)]
@@ -242,7 +240,7 @@ impl Write for SharedBuffer {
 }
 
 impl AsyncWrite for SharedBuffer {
-    fn shutdown(&mut self) -> Result<Async<()>, io::Error> {
+    fn close(self: Pin<&mut Self>) -> Poll<Result<(), io::Error>> {
         self.finish();
         Ok(Async::Ready(()))
     }
@@ -309,7 +307,7 @@ impl Seek for SharedBufferReader {
         }
     }
 }
-
+*/
 #[cfg(test)]
 mod test {
     use std::{

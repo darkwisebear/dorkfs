@@ -297,12 +297,11 @@ impl<C: CacheLayer+Debug> Debug for HashFileCache<C> {
 
 impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                                                C::GetFuture: Send+'static,
-                                               <C::GetFuture as IntoFuture>::Future: Send+'static,
                                                C::File: Send,
                                                C::Directory: Send {
     type File = HashFile;
     type Directory = HashDirectory;
-    type GetFuture = Box<dyn Future<Item=CacheObject<HashFile, HashDirectory>, Error=CacheError>+Send>;
+    type GetFuture = Box<dyn Future<Output=Result<CacheObject<HashFile, HashDirectory>>>+Send+Unpin>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let mut obj_cache = self.obj_cache.lock().unwrap();
@@ -404,7 +403,7 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                 file_cached
             });
         let result = match file_cached {
-            Ok(object) => future::Either::A(future::ok(object)),
+            Ok(object) => future::Either::Left(future::ok(object)),
 
             Err(CacheError::ObjectNotFound(_)) => {
                 let cache_path = self.cache_path.clone();
@@ -412,7 +411,6 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                 let obj_cache = Arc::clone(&self.obj_cache);
                 let upstream_object_future =
                     self.cache.get_poll(&cache_ref)
-                        .into_future()
                         .and_then(move |mut upstream_object| {
                             let result = match upstream_object {
                                 CacheObject::File(ref mut file) => {
@@ -446,13 +444,13 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                                 obj_cache.lock().unwrap().put(&cache_ref, obj);
                             }
 
-                            result
+                            future::ready(result)
                         });
 
-                future::Either::B(upstream_object_future)
+                future::Either::Right(upstream_object_future)
             }
 
-            Err(e) => future::Either::A(future::failed(e))
+            Err(e) => future::Either::Left(future::err(e))
         };
 
         Box::new(result) as Self::GetFuture
@@ -461,7 +459,6 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
 
 impl<C> HashFileCache<C>  where C: CacheLayer,
                                 C::GetFuture: Send+'static,
-                                <C::GetFuture as IntoFuture>::Future: Send+'static,
                                 C::File: Send,
                                 C::Directory: Send {
     pub fn new<P: AsRef<Path>>(cache: C, cache_dir: P) -> Result<Self> {

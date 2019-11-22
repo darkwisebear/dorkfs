@@ -9,13 +9,13 @@ use std::{
 
 use git2;
 use tempfile;
-use futures::future::FutureResult;
+use futures::future;
 use failure::{self, Fail, format_err};
 
 use crate::cache::*;
 
 type GitResult<T> = result::Result<T, git2::Error>;
-type GitGetFuture<T> = FutureResult<T, CacheError>;
+type GitGetFuture<T> = future::Ready<Result<T>>;
 
 #[derive(Debug, Fail)]
 enum GitLayerError {
@@ -270,7 +270,7 @@ impl CacheLayer for GitCacheImpl {
     }
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
-        FutureResult::from(self.get(cache_ref))
+        future::ready(self.get(cache_ref))
     }
 }
 

@@ -25,7 +25,6 @@ use std::io::Read;
 use failure::{Fallible, format_err};
 use structopt::StructOpt;
 use either::Either;
-use futures::future::lazy;
 use log::{error, warn, info, debug};
 
 use crate::{
@@ -470,7 +469,7 @@ fn mount(args: MountArguments) {
     }
 }
 
-fn log(range: CommitRange) {
+async fn log(range: CommitRange) {
     let start_commit = match range {
         CommitRange {
             start,
@@ -481,28 +480,27 @@ fn log(range: CommitRange) {
     };
 
     let log_command = commandstream::Command::Log { start_commit };
-    commandstream::send_command(log_command);
+    commandstream::send_command(log_command).await;
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     init_logging();
 
     let args: Arguments = Arguments::from_args();
     match args {
         Arguments::Mount(subargs) =>
-            tokio::run(lazy(move || {
+            async move {
                 mount(subargs);
-                Ok(())
-            })),
+            }.await,
 
-        Arguments::Log { commit_range } => log(commit_range),
+        Arguments::Log { commit_range } => log(commit_range).await,
 
-        Arguments::Status => commandstream::send_command(commandstream::Command::Status),
+        Arguments::Status => commandstream::send_command(commandstream::Command::Status).await,
 
         Arguments::Branch { new_branch: Some(name) } => {
             let command = commandstream::Command::CreateBranch { name };
-
-            commandstream::send_command(command)
+            commandstream::send_command(command).await
         }
 
         Arguments::Branch { new_branch: None } | Arguments::Update => {
@@ -510,7 +508,7 @@ fn main() {
                 target_branch: None
             };
 
-            commandstream::send_command(command)
+            commandstream::send_command(command).await
         }
 
         Arguments::Switch { target_branch } => {
@@ -518,7 +516,7 @@ fn main() {
                 target_branch:Some(target_branch)
             };
 
-            commandstream::send_command(command)
+            commandstream::send_command(command).await
         }
 
         Arguments::Revert { revert_glob: path_glob, dry_run } => {
@@ -526,10 +524,10 @@ fn main() {
                 path_glob, dry_run
             };
 
-            commandstream::send_command(command)
+            commandstream::send_command(command).await
         }
 
         Arguments::Commit { message } =>
-            commandstream::send_command(commandstream::Command::Commit { message })
+            commandstream::send_command(commandstream::Command::Commit { message }).await
     }
 }

@@ -14,25 +14,22 @@ use crate::{
     types::RepoRef
 };
 
-use futures_preview::{
-    Poll, FutureExt, TryFutureExt, Stream, StreamExt, TryStreamExt,
-    compat::{
-        AsyncRead01CompatExt,
-        Stream01CompatExt
-    },
-    io::{
-        AsyncRead, AsyncWrite,
-        AsyncReadExt, AsyncWriteExt
-    },
+use futures::{
+    future::{self, AbortHandle},
+    Future, FutureExt, TryFutureExt, Stream, StreamExt, TryStreamExt,
+    task::Poll,
     task::Context,
     stream
 };
-use futures::{self, Future as Future01, Stream as _, IntoFuture};
 use failure::{self, Fallible, format_err};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use glob::Pattern as GlobPattern;
 use log::{debug, info, warn, error};
+use tokio::{
+    self,
+    io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}
+};
 
 struct LogStreamEmitter<S> {
     stream: S,
@@ -40,7 +37,7 @@ struct LogStreamEmitter<S> {
 }
 
 impl<S> LogStreamEmitter<S> {
-    fn new(stream:S ) -> Self {
+    fn new(stream:S) -> Self {
         Self {
             stream,
             error_encountered: false
@@ -309,7 +306,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                 match start_commit {
                     Some(start_commit) => {
                         let log_stream = LogStreamEmitter::new(
-                            self.repo.read().unwrap().get_log_stream(start_commit).compat());
+                            self.repo.read().unwrap().get_log_stream(start_commit));
                         log_stream
                             .map(Fallible::Ok)
                             .try_fold(target, |mut target, mut message| {
@@ -351,138 +348,119 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
 async fn execute_single_command<R, C>(channel: C, executor: CommandExecutor<R>) -> Fallible<()>
     where R: Overlay+for<'a> WorkspaceController<'a>+'static,
-          C: AsyncRead+AsyncWrite+Send+'static {
-    let (mut input, output) = channel.split();
+          C: AsyncRead+AsyncWrite+Send+Sync+'static {
+    let (mut input, output) = tokio::io::split(channel);
     let mut command_string = Vec::new();
     input.read_to_end(&mut command_string).await?;
     let command = serde_json::from_slice(&command_string[..])?;
     debug!("Received command {:?}", command);
-    let mut output = executor.command(command, output).await?;
-    Ok(output.close().await?)
+    executor.command(command, output).await?;
+    Ok(())
 }
 
-pub fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>) -> impl Future01<Item=(), Error=()>
+pub async fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
     where R: Overlay+for<'a> WorkspaceController<'a>+'static+Send+Sync,
-          C: tokio::io::AsyncRead+tokio::io::AsyncWrite+Send+'static {
-    let result = async {
-        if let Err(e) = execute_single_command(channel.compat(), executor).await {
-            warn!("Error processing command: {}", e);
-        }
-        Ok(())
-    };
-    result.boxed().compat()
+          C: AsyncRead+AsyncWrite+Send+Sync+'static {
+    if let Err(e) = execute_single_command(channel, executor).await {
+        warn!("Error processing command: {}", e);
+    }
 }
-
-#[derive(Debug)]
-pub struct FinishCommandSocket(futures::sync::oneshot::Sender<()>);
 
 #[cfg(target_os = "linux")]
 pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>)
-    -> (impl Future01<Item=(), Error=()>, FinishCommandSocket)
+    -> (impl Future<Output=()>, AbortHandle)
     where P: AsRef<Path>,
           R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
+    use futures_util_preview::StreamExt as _;
     debug!("Creating command socket at {}", path.as_ref().display());
 
-    let listener = tokio_uds::UnixListener::bind(&path)
+    let listener = tokio::net::unix::UnixListener::bind(&path)
         .expect(format!("Unable to bind UDS listener {}", path.as_ref().display()).as_str());
 
     let stream_future = listener.incoming()
-        .map_err(|e| {
-            if e.kind() != io::ErrorKind::BrokenPipe {
-                error!("Error during command socket processing: {}", e);
-            } else {
-                debug!("Broken pipe during command socket processing: {}", e);
+        .filter_map(|val| future::ready(
+            match val {
+                Ok(connection) => Some(connection),
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::BrokenPipe {
+                        error!("Error during command socket processing: {}", e);
+                    } else {
+                        debug!("Broken pipe during command socket processing: {}", e);
+                    }
+                    None
+                }
             }
-        })
-        .for_each(move |connection|
-            tokio::spawn(execute_commands(connection, command_executor.clone())));
+        ))
+        .for_each(move |connection| {
+            tokio::spawn(execute_commands(connection, command_executor.clone()));
+            future::ready(())
+        });
 
-    let (finisher, finish_future) = futures::sync::oneshot::channel::<()>();
-
-    let future = stream_future.select(
-        finish_future
-            .map(|_| unreachable!("The command channel finisher shall never send anything."))
-            .map_err(|_| {
-                debug!("Closing command socket");
-                ()
-            }))
-        .then(|_| Ok(()));
-
-    (future, FinishCommandSocket(finisher))
+    let (abortable, abort_handle) = future::abortable(stream_future);
+    let abortable = abortable.map(|_| ());
+    
+    (abortable, abort_handle)
 }
 
 #[cfg(target_os = "linux")]
-fn find_command_stream() -> impl Future01<Item=tokio_uds::UnixStream, Error=io::Error> {
-    fn find_stream_path() -> io::Result<PathBuf> {
-        let cwd = std::env::current_dir()?;
+async fn find_command_stream() -> Result<tokio::net::unix::UnixStream, io::Error> {
+    let cwd = std::env::current_dir()?;
 
-        let mut dork_root = cwd.as_path();
-        if dork_root.ends_with(".dork") {
-            dork_root = dork_root.parent().unwrap();
-        }
-
-        loop {
-            debug!("Looking for command socket in {}", dork_root.display());
-
-            let command_socket_path = dork_root.join(".dork/cmd");
-            if command_socket_path.exists() {
-                info!("Using {} as command socket path", command_socket_path.display());
-                break Ok(command_socket_path);
-            }
-
-            match dork_root.parent() {
-                Some(parent) => dork_root = parent,
-                None => break Err(io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        format!("Unable to find a mounted dork file system at {}",
-                                cwd.display())))
-            }
-        }
+    let mut dork_root = cwd.as_path();
+    if dork_root.ends_with(".dork") {
+        dork_root = dork_root.parent().unwrap();
     }
 
-    find_stream_path().into_future()
-        .and_then(tokio_uds::UnixStream::connect)
+    let path = loop {
+        debug!("Looking for command socket in {}", dork_root.display());
+
+        let command_socket_path = dork_root.join(".dork/cmd");
+        if command_socket_path.exists() {
+            info!("Using {} as command socket path", command_socket_path.display());
+            break command_socket_path;
+        }
+
+        match dork_root.parent() {
+            Some(parent) => dork_root = parent,
+            None => return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("Unable to find a mounted dork file system at {}",
+                            cwd.display())))
+        }
+    };
+
+    tokio::net::unix::UnixStream::connect(path).await
 }
 
 #[cfg(not(target_os = "linux"))]
-fn find_command_stream() -> impl Future01<Item=tokio::fs::File, Error=io::Error> {
-    futures::failed(io::Error::new(
+async fn find_command_stream() -> Result<tokio::fs::File, io::Error> {
+    Err(io::Error::new(
         io::ErrorKind::Other,
         "dorkfs only supports Linux. Bummer."))
 }
 
-pub fn send_command(command: Command) {
-    let command_string = serde_json::to_string(&command).unwrap();
-    let task = find_command_stream()
-        .and_then(move |stream| tokio::io::write_all(stream, command_string))
-        .and_then(|(stream, _)| {
-            #[cfg(target_os = "linux")] {
-                let result = ::tokio_uds::UnixStream::shutdown(&stream, Shutdown::Write);
-                result.map(move |_| stream)
-            }
-            #[cfg(not(target_os = "linux"))] {
-                Ok(stream)
-            }
-        })
-        .map_err(|e| {
-            error!("Unable to send command to daemon: {}", &e);
-            None
-        })
-        .and_then(|stream|
-            tokio::io::copy(stream, tokio::io::stdout()).map_err(Some))
-        .and_then(|(_, stream, _)| tokio::io::shutdown(stream).map_err(Some))
-        .map(|_| ())
-        .map_err(|e| {
-            if let Some(e) = e {
-                if e.kind() != io::ErrorKind::BrokenPipe {
-                    error!("Unable to communicate with daemon: {}", e);
-                } else {
-                    debug!("Broken pipe during result reception");
-                }
-            }
-        });
+async fn send_command_impl(command: Command) -> io::Result<()> {
+    let command_string = serde_json::to_string(&command)?;
+    let mut stream = find_command_stream().await?;
+    if let Err(e) = stream.write_all(command_string.as_bytes()).await {
+        error!("Unable to send command t daemon: {}", e);
+        return Ok(())
+    }
+    #[cfg(target_os = "linux")] {
+        tokio::net::unix::UnixStream::shutdown(&stream, Shutdown::Write)?;
+    }
+    stream.copy(&mut tokio::io::stdout()).await?;
+    Ok(())
+}
 
-    tokio::runtime::run(task);
+pub async fn send_command(command: Command) {
+    if let Err(e) = send_command_impl(command).await {
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            error!("Unable to communicate with daemon: {}", e);
+        } else {
+            debug!("Broken pipe during result reception");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,11 +479,10 @@ mod test {
     };
 
     use tempfile::tempdir;
-    use futures_preview::{
+    use futures::{
         AsyncWrite, Future, FutureExt, TryFutureExt,
         io::AllowStdIo
     };
-    use futures::future::Future as _;
     use tokio;
 
     use super::{Command, CommandExecutor};
@@ -514,10 +491,8 @@ mod test {
         where T: AsyncWrite+Send+Sync+'static,
               E: Debug,
               F: Future<Output=Result<T, E>>+Send {
-        match command_future.boxed().compat().wait() {
-            Ok(target) => target,
-            Err(e) => panic!("Unable to finish future in test: {}")
-        }
+        futures::executor::block_on(command_future)
+            .expect("Unable to finish future in test")
     }
 
     #[test]
@@ -581,22 +556,22 @@ mod test {
         // Check if we still track "master"
         let current_branch_command = Command::CurrentBranch { target_branch: None };
         let current_branch_future =
-            commander.command(current_branch_command,Cursor::new(Vec::<u8>::new()));
-        let output = execute_command_future(current_branch_future).into_inner();
+            commander.command(current_branch_command,Vec::<u8>::new());
+        let output = execute_command_future(current_branch_future);
         assert_eq!(format!("master checked out at {}", first_commit).as_bytes(), output.as_slice());
 
         // Switch to branch "feature"
         let current_branch_command = Command::CurrentBranch { target_branch: Some(String::from("feature")) };
         let current_branch_future =
-            commander.command(current_branch_command,Cursor::new(Vec::<u8>::new()));
-        let output = execute_command_future(current_branch_future).into_inner();
+            commander.command(current_branch_command,Vec::<u8>::new());
+        let output = execute_command_future(current_branch_future);
         assert_eq!(format!("feature checked out at {}", first_commit).as_bytes(), output.as_slice());
 
         // Check if switch is reflected
         let current_branch_command = Command::CurrentBranch { target_branch: None };
         let current_branch_future =
-            commander.command(current_branch_command,Cursor::new(Vec::<u8>::new()));
-        let output = execute_command_future(current_branch_future).into_inner();
+            commander.command(current_branch_command,Vec::<u8>::new());
+        let output = execute_command_future(current_branch_future);
         assert_eq!(format!("feature checked out at {}", first_commit).as_bytes(), output.as_slice());
 
         // Add a commit with a second file to the branch "feature"
@@ -646,7 +621,7 @@ mod test {
         let commander = CommandExecutor::new(Arc::clone(&working_copy));
 
         let log_command = Command::Log { start_commit: None };
-        let log_future = commander.command(log_command, Cursor::<Vec<u8>>::default());
+        let log_future = commander.command(log_command, Vec::<u8>::new());
         execute_command_future(log_future);
     }
 

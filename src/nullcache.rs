@@ -7,7 +7,8 @@ use std::{
     collections::HashMap,
     borrow::Borrow,
     ffi::OsStr,
-    sync::Mutex
+    sync::Mutex,
+    mem::MaybeUninit
 };
 
 use tiny_keccak::Keccak;
@@ -27,11 +28,11 @@ impl HashWriter {
     }
 
     pub fn finish(self) -> [u8; 32] {
-        let mut result = unsafe {
-            ::std::mem::uninitialized::<[u8; 32]>()
-        };
-        self.hasher.finalize(&mut result);
-        result
+        let mut result = MaybeUninit::<[u8; 32]>::uninit();
+        unsafe {
+            self.hasher.finalize(result.as_mut_ptr().as_mut().unwrap());
+            result.assume_init()
+        }
     }
 }
 
@@ -92,7 +93,7 @@ pub struct NullCache {
 impl CacheLayer for NullCache {
     type File = NullFile;
     type Directory = NullDirectory;
-    type GetFuture = ::futures::future::FutureResult<CacheObject<NullFile, NullDirectory>, cache::CacheError>;
+    type GetFuture = ::futures::future::Ready<Result<CacheObject<NullFile, NullDirectory>, cache::CacheError>>;
 
     fn get(&self, cache_ref: &CacheRef) -> cache::Result<CacheObject<Self::File, Self::Directory>> {
         Err(CacheError::ObjectNotFound(cache_ref.clone()))
@@ -145,6 +146,6 @@ impl CacheLayer for NullCache {
     }
 
     fn get_poll(&self, cache_ref: &CacheRef) -> Self::GetFuture {
-        self.get(cache_ref).into()
+        futures::future::ready(self.get(cache_ref))
     }
 }
