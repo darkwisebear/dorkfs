@@ -588,6 +588,7 @@ impl CacheLayer for Github {
     type File = GithubBlob;
     type Directory = GithubTree;
     // Replace with existential type once https://github.com/rust-lang/rfcs/pull/2515 lands.
+    #[allow(clippy::type_complexity)]
     type GetFuture = Pin<Box<dyn Future<Output=Result<CacheObject<Self::File, Self::Directory>, CacheError>>+Send>>;
 
     fn get(&self, cache_ref: &CacheRef) -> cache::Result<CacheObject<Self::File, Self::Directory>> {

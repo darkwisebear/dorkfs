@@ -24,7 +24,7 @@ use crate::{
     cache::{CacheRef, ReferencedCommit}
 };
 
-static DORK_DIR_ENTRY: &'static str = ".dork";
+static DORK_DIR_ENTRY: &str = ".dork";
 
 lazy_static! {
     static ref ADDITIONAL_ROOT_DIRECTORIES: [OverlayDirEntry; 1] = [
@@ -324,12 +324,11 @@ impl<O> Overlay for ControlDir<O>
                             .map(DynamicOverlayFileWrapper)
                             .map(ControlFile::DynamicOverlayFile)
                     } else {
-                        return Err(overlay::Error::from(format_err!("Unable to open special file {}",
-                                                                    dorkfile.to_string_lossy())));
+                        Err(overlay::Error::from(format_err!("Unable to open special file {}", dorkfile.to_string_lossy())))
                     }
                 }
 
-                None => return Err("No filename given!".into())
+                None => Err("No filename given!".into())
             }
         } else {
             self.overlay.write().unwrap().open_file(&path, writable)

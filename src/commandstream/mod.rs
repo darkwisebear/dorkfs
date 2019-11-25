@@ -375,7 +375,7 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
     debug!("Creating command socket at {}", path.as_ref().display());
 
     let listener = tokio::net::unix::UnixListener::bind(&path)
-        .expect(format!("Unable to bind UDS listener {}", path.as_ref().display()).as_str());
+        .unwrap_or_else(|_| panic!("Unable to bind UDS listener {}", path.as_ref().display()));
 
     let stream_future = listener.incoming()
         .filter_map(|val| future::ready(

@@ -107,7 +107,7 @@ impl<O> FilesystemMT for DorkFS<O> where
         };
 
         Ok((Timespec::new(ATTR_TIMEOUT_MS as i64 / 1000,
-                          (ATTR_TIMEOUT_MS % 1000) as i32 * 1000000),
+                          (ATTR_TIMEOUT_MS % 1000) as i32 * 1_000_000),
                           attr))
     }
 

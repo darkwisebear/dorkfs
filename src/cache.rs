@@ -602,6 +602,11 @@ impl <L: Directory+Debug, R: Directory+Debug> DirectoryWrapper<L, R> {
     }
 }
 
+type MapEitherFuture<Other, Me> =
+future::MapOk<
+    <Other as CacheLayer>::GetFuture,
+    fn(<<Other as CacheLayer>::GetFuture as TryFuture>::Ok) -> CacheObject<<Me as CacheLayer>::File, <Me as CacheLayer>::Directory>>;
+
 impl<L, R> CacheLayer for either::Either<L, R>
     where L: CacheLayer,
           R: CacheLayer,
@@ -611,13 +616,7 @@ impl<L, R> CacheLayer for either::Either<L, R>
           R::File: Send {
     type File = ReadonlyFileWrapper<L::File, R::File>;
     type Directory = DirectoryWrapper<L::Directory, R::Directory>;
-    type GetFuture = future::Either<
-        future::MapOk<
-            L::GetFuture,
-            fn(<L::GetFuture as TryFuture>::Ok) -> CacheObject<Self::File, Self::Directory>>,
-        future::MapOk<
-            R::GetFuture,
-            fn(<R::GetFuture as TryFuture>::Ok) -> CacheObject<Self::File, Self::Directory>>>;
+    type GetFuture = future::Either<MapEitherFuture<L, Self>, MapEitherFuture<R, Self>>;
 
     fn get(&self, cache_ref: &CacheRef) -> Result<CacheObject<Self::File, Self::Directory>> {
         let result = match self {

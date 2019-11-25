@@ -45,7 +45,7 @@ mod uidgid {
     pub struct Uid(u32);
 
     impl Uid {
-        pub fn get(&self) -> u32 {
+        pub fn get(self) -> u32 {
             self.0
         }
     }
@@ -62,7 +62,7 @@ mod uidgid {
     pub struct Gid(u32);
 
     impl Gid {
-        pub fn get(&self) -> u32 {
+        pub fn get(self) -> u32 {
             self.0
         }
     }
@@ -88,7 +88,7 @@ mod uidgid {
     pub struct Uid(u32);
 
     impl Uid {
-        pub fn get(&self) -> u32 {
+        pub fn get(self) -> u32 {
             self.0
         }
     }
@@ -126,7 +126,7 @@ mod uidgid {
     pub struct Gid(u32);
 
     impl Gid {
-        pub fn get(&self) -> u32 {
+        pub fn get(self) -> u32 {
             self.0
         }
     }
@@ -172,13 +172,13 @@ impl FromStr for UMask {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.chars().fold(Ok(0u16), |v, c|
             v.and_then(|v| Ok((v << 3u16) + c.to_digit(8)
-                .ok_or(format_err!("Unable to convert {} to a number", c))? as u16)))
+                .ok_or_else(|| format_err!("Unable to convert {} to a number", c))? as u16)))
         .map(UMask)
     }
 }
 
 impl UMask {
-    fn get(&self) -> u16 {
+    fn get(self) -> u16 {
         self.0
     }
 }
@@ -217,7 +217,9 @@ struct MountArguments {
 
 #[derive(StructOpt)]
 /// Mount git repositories and work with them just as you would with an ordinary disk drive.
+#[allow(clippy::large_enum_variant)]
 enum Arguments {
+    /// Mount the specified repository at the given folder.
     Mount(MountArguments),
     /// Prints the commit log history of the repository that is mounted at the current
     /// working directory.

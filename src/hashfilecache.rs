@@ -348,9 +348,8 @@ impl<C> CacheLayer for HashFileCache<C>  where C: CacheLayer,
                 Err(e) => Err(e)
             };
 
-            match result {
-                Ok(ref obj) => obj_cache.put(cache_ref, obj),
-                Err(_) => ()
+            if let Ok(ref obj) = result {
+                obj_cache.put(cache_ref, obj)
             }
 
             result
