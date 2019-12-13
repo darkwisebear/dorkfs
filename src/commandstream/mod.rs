@@ -16,7 +16,7 @@ use crate::{
 
 use futures::{
     future::{self, AbortHandle},
-    Future, FutureExt, TryFutureExt, Stream, StreamExt, TryStreamExt,
+    Future, FutureExt, Stream, StreamExt, TryStreamExt,
     task::Poll,
     task::Context,
     stream
@@ -30,6 +30,9 @@ use tokio::{
     self,
     io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}
 };
+
+type InOutResult<T, E, U = T> = Result<U, (T, E)>;
+type InOutFallible<T, U = T> = Result<U, (T, failure::Error)>;
 
 struct LogStreamEmitter<S> {
     stream: S,
@@ -98,6 +101,8 @@ pub enum Command {
         #[serde(default = "Command::dry_run_default")]
         dry_run: bool
     },
+
+    Diff,
 }
 
 impl Command {
@@ -128,7 +133,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
     }
 
     pub async fn command<T: AsyncWrite+Send+Sync+'static+Unpin>(&self, command: Command, target: T)
-        -> Result<T, failure::Error> {
+        -> InOutFallible<T> {
         match command {
             Command::Commit { message } => self.commit_handler(message, target).await,
 
@@ -153,12 +158,32 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             Command::Revert {
                 path_glob,
                 dry_run
-            } => self.handle_revert(target, path_glob, dry_run).await
+            } => self.handle_revert(target, path_glob, dry_run).await,
+
+            Command::Diff => {
+                let iter = match crate::utility::diff::WorkspaceDiffIter::new(Arc::clone(&self.repo)) {
+                    Ok(iter) => iter,
+                    Err(e) => return Err((target, e.into()))
+                };
+                let target = iter.fold(target, move |target, diff|
+                    Self::send_result_string::<failure::Error, _, _, _>(
+                        target, diff, "Unable to display file diff")
+                        .map(|result|
+                            match result {
+                                Ok(target) => target,
+                                Err((target, e)) => {
+                                    warn!("Unable to send diff to client: {}", e);
+                                    target
+                                }
+                            }))
+                    .await;
+                Ok(target)
+            }
         }
     }
 
     async fn handle_switch<T>(&self, target_branch: Option<String>, target: T)
-        -> Result<T, failure::Error> where T: AsyncWrite+Send+Sync+'static+Unpin {
+        -> InOutFallible<T> where T: AsyncWrite+Send+Sync+'static+Unpin {
         let branch_status = match target_branch {
             Some(target_branch_name) =>
                 self.repo.write().unwrap()
@@ -196,7 +221,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
     }
 
     async fn handle_revert<T>(&self, target: T, path_glob: String, dry_run: bool)
-        -> Result<T, failure::Error> where T: AsyncWrite+Send+Sync+'static+Unpin {
+        -> InOutFallible<T> where T: AsyncWrite+Send+Sync+'static+Unpin {
         let matching_paths = self.repo.read().unwrap().get_status()
             .map_err(failure::Error::from)
             .and_then(|status_iter| {
@@ -231,15 +256,16 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             match revert_result {
                 Ok(matching_paths) =>
                     stream::iter(matching_paths.into_iter().map(Ok))
-                        .try_fold(target, |mut target: T, matching_path: PathBuf| {
+                        .try_fold(target, |target: T, matching_path: PathBuf| {
                             async move {
                                 let message = format!("Reverting {}\n", matching_path.display());
-                                let r = target.write_all(message.as_bytes()).await;
-                                r.map(|_| target)
+                                Self::send_string::<failure::Error, _, _>(target, &message).await
                             }
                         })
-                        .map_err(failure::Error::from)
-                        .await,
+                        .map(|result| match result {
+                            Ok(target) => Ok(target),
+                            Err((target, e)) => Err((target, failure::Error::from(e)))
+                        }).await,
                 Err(e) => {
                     warn!("Revert failed: {}", e);
                     let string = format!("ERROR: Unable to execute revert operation: {}", e);
@@ -248,20 +274,21 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             }
     }
 
-    async fn send_string<T, E>(mut target: T, string: String) -> Result<T, E>
+    async fn send_string<E, T, S>(mut target: T, string: S) -> InOutResult<T, E>
         where T: AsyncWrite+Send+Sync+'static+Unpin,
+              S: AsRef<str>,
               E: From<io::Error> {
-        target.write_all(string.as_bytes())
-            .await
-            .map(|_| target)
-            .map_err(E::from)
+        match target.write_all(string.as_ref().as_bytes()).await {
+            Ok(_) => Ok(target),
+            Err(e) => Err((target, E::from(e)))
+        }
     }
 
-    async fn send_result_string<T, S, E, F>(target: T, string: Result<S, F>, error_prefix: &str)
-        -> Result<T, E> where T: AsyncWrite+Send+Sync+'static+Unpin,
-                              S: Display,
-                              E: From<io::Error>,
-                              F: Display {
+    async fn send_result_string<E, S, T, F>(target: T, string: Result<S, F>, error_prefix: &str)
+        -> InOutResult<T, E> where T: AsyncWrite+Send+Sync+'static+Unpin,
+                                   S: Display,
+                                   E: From<io::Error>,
+                                   F: Display {
         let message = match string {
             Ok(string) => string.to_string(),
             Err(err) => {
@@ -273,7 +300,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
     }
 
     async fn handle_status<T: AsyncWrite+Send+Sync+'static+Unpin>(&self, target: T)
-        -> Result<T, failure::Error> {
+        -> InOutFallible<T> {
         let status_string: Result<String, _> = self.repo.read().unwrap().get_status()
             .and_then(|status_iter|
                 status_iter.fold(Ok(String::new()), |s: overlay::Result<String>, t| {
@@ -291,9 +318,9 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             "Failed to retrieve status").await
     }
 
-    async fn handle_log_stream<T>(&self, start_commit: Option<CacheRef>, mut target: T)
-        -> Result<T, failure::Error> where T: AsyncWrite+Send+Sync+'static+Unpin {
-        static NO_LOG_STRING: &[u8] = b"(empty log)";
+    async fn handle_log_stream<T>(&self, start_commit: Option<CacheRef>, target: T)
+        -> InOutFallible<T> where T: AsyncWrite+Send+Sync+'static+Unpin {
+        static NO_LOG_STRING: &str = "(empty log)";
 
         let start_commit = match start_commit {
             Some(start_commit) => Ok(Some(start_commit)),
@@ -308,23 +335,17 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                         let log_stream = LogStreamEmitter::new(
                             self.repo.read().unwrap().get_log_stream(start_commit));
                         log_stream
-                            .map(Fallible::Ok)
-                            .try_fold(target, |mut target, mut message| {
+                            .map(|i| Result::<_, (_, failure::Error)>::Ok(i))
+                            .try_fold(target, |target, mut message| {
                                 async move {
                                     message.push('\n');
-                                    target.write_all(message.as_bytes())
-                                        .await
-                                        .map(|_| target)
-                                        .map_err(failure::Error::from)
+                                    Self::send_string(target, &message).await
                                 }
                             })
                             .await
                     }
 
-                    None => target.write_all(NO_LOG_STRING)
-                        .await
-                        .map(|_| target)
-                        .map_err(failure::Error::from),
+                    None => Self::send_string(target, NO_LOG_STRING).await,
                 }
             }
 
@@ -336,7 +357,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
         }
     }
 
-    async fn commit_handler<T>(&self, message: String, target: T) -> Result<T, failure::Error>
+    async fn commit_handler<T>(&self, message: String, target: T) -> InOutFallible<T>
         where T: AsyncWrite+Send+Sync+'static+Unpin {
         let commit_result = self.repo.write().unwrap()
             .commit(message.as_str());
@@ -354,8 +375,9 @@ async fn execute_single_command<R, C>(channel: C, executor: CommandExecutor<R>) 
     input.read_to_end(&mut command_string).await?;
     let command = serde_json::from_slice(&command_string[..])?;
     debug!("Received command {:?}", command);
-    executor.command(command, output).await?;
-    Ok(())
+    executor.command(command, output).await
+        .map(|_| ())
+        .map_err(|(_, e)| e)
 }
 
 pub async fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
@@ -481,7 +503,6 @@ mod test {
     use tempfile::tempdir;
     use futures::{
         AsyncWrite, Future, FutureExt, TryFutureExt,
-        io::AllowStdIo
     };
     use tokio;
 
@@ -501,7 +522,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = Arc::new(RwLock::new(open_working_copy(&dir)));
-        let output = AllowStdIo::new(io::sink());
+        let output = Vec::<u8>::new();
         let commander = CommandExecutor::new(Arc::clone(&working_copy));
 
         let mut file = working_copy.write().unwrap().open_file(Path::new("test.txt"), true)
@@ -550,7 +571,7 @@ mod test {
 
         // Create branch "feature"
         let create_branch_command = Command::CreateBranch { name: String::from("feature") };
-        let create_branch_future = commander.command(create_branch_command, AllowStdIo::new(io::sink()));
+        let create_branch_future = commander.command(create_branch_command, Vec::<u8>::new());
         execute_command_future(create_branch_future);
 
         // Check if we still track "master"
@@ -642,7 +663,7 @@ mod test {
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("file1.txt"), dry_run: false };
-        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
+        let revert_future = commander.command(revert_command, Vec::<u8>::new());
         execute_command_future(revert_future);
 
         assert_eq!(0, working_copy.read().unwrap().get_status().unwrap().count());
@@ -665,7 +686,7 @@ mod test {
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("file2.txt"), dry_run: false };
-        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
+        let revert_future = commander.command(revert_command, Vec::<u8>::new());
         execute_command_future(revert_future);
 
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
@@ -696,12 +717,12 @@ mod test {
         assert_eq!(2, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("file1.txt"), dry_run: false };
-        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
+        let revert_future = commander.command(revert_command, Vec::<u8>::new());
         execute_command_future(revert_future);
         assert_eq!(1, working_copy.read().unwrap().get_status().unwrap().count());
 
         let revert_command = Command::Revert { path_glob: String::from("dir/*"), dry_run: false };
-        let revert_future = commander.command(revert_command, AllowStdIo::new(io::sink()));
+        let revert_future = commander.command(revert_command, Vec::<u8>::new());
         execute_command_future(revert_future);
         assert_eq!(0, working_copy.read().unwrap().get_status().unwrap().count());
     }

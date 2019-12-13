@@ -1,4 +1,5 @@
 pub mod gitmodules;
+pub mod diff;
 mod gitconfig;
 
 use std::ffi::{OsStr, OsString};

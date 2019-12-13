@@ -19,10 +19,11 @@ use std::pin::Pin;
 use chrono::{Utc, Offset};
 use either::Either;
 use futures::{
-    FutureExt, Stream, task::{Poll, Context},
+    Future, FutureExt, Stream, task::{Poll, Context},
 };
 use failure::{Fail, format_err};
 use log::{debug, warn, info};
+use difference;
 
 use crate::{
     cache::{self, DirectoryEntry, CacheLayer, CacheRef, Commit, ReferencedCommit, CacheObject,
@@ -31,6 +32,7 @@ use crate::{
     types::*,
     utility::*
 };
+use difference::Difference;
 
 #[derive(Debug, Fail)]
 pub enum Error {
@@ -189,6 +191,7 @@ pub trait WorkspaceController<'a>: Debug {
     type Log: WorkspaceLog+'a;
     type LogStream: Stream<Item=Result<ReferencedCommit>>+Send+Unpin+'static;
     type StatusIter: Iterator<Item=Result<WorkspaceFileStatus>>+'a;
+    type DiffFuture: Future<Output=Result<Vec<difference::Difference>>>+Send+'static;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef>;
     fn get_current_head_ref(&self) -> Result<Option<CacheRef>>;
@@ -200,6 +203,7 @@ pub trait WorkspaceController<'a>: Debug {
     fn get_log_stream(&self, start_commit: CacheRef) -> Self::LogStream;
     fn get_status(&'a self) -> Result<Self::StatusIter>;
     fn update_head(&mut self) -> Result<CacheRef>;
+    fn get_diff(&mut self, path: &Path) -> Self::DiffFuture;
 
     fn is_clean(&'a self) -> Result<bool> {
         self.get_status()
@@ -286,6 +290,7 @@ pub type BoxedRepository = Box<dyn for<'a> Repository<'a,
     Log=Box<dyn WorkspaceLog+'a>,
     LogStream=Box<dyn Stream<Item=Result<ReferencedCommit>>+Send+Unpin>,
     StatusIter=Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>,
+    DiffFuture=Pin<Box<dyn Future<Output=Result<Vec<difference::Difference>>>+Send>>,
     File=BoxedOverlayFile,
     DirIter=BoxedDirIter>
 +Send+Sync>;
@@ -342,6 +347,7 @@ impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Re
     type Log = Box<dyn WorkspaceLog+'a>;
     type LogStream = Box<dyn Stream<Item=Result<ReferencedCommit>>+Send+Unpin>;
     type StatusIter = Box<dyn Iterator<Item=Result<WorkspaceFileStatus>>+'a>;
+    type DiffFuture = Pin<Box<dyn Future<Output=Result<Vec<difference::Difference>>>+Send>>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
         self.0.commit(message)
@@ -379,6 +385,10 @@ impl<'a, R> WorkspaceController<'a> for RepositoryWrapper<R> where for<'b> R: Re
 
     fn update_head(&mut self) -> Result<CacheRef> {
         self.0.update_head()
+    }
+
+    fn get_diff(&mut self, path: &Path) -> Self::DiffFuture {
+        Box::pin(self.0.get_diff(path)) as Self::DiffFuture
     }
 }
 
@@ -571,7 +581,8 @@ pub struct FilesystemOverlay<C> where C: CacheLayer {
     submodules: PathDispatcher<BoxedRepository>
 }
 
-impl<C: CacheLayer+Debug+Send+Sync+'static> FilesystemOverlay<C> {
+impl<C> FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'static,
+                                   <C as CacheLayer>::File: Send {
     fn file_path<P: AsRef<Path>>(base_path: P) -> PathBuf {
         base_path.as_ref().join("files")
     }
@@ -905,6 +916,41 @@ impl<C: CacheLayer+Debug+Send+Sync+'static> FilesystemOverlay<C> {
                 .map_err(Error::CacheError))
             .transpose()
     }
+
+    fn create_diff_future<P: AsRef<Path>>(&mut self, path: P) -> impl Future<Output=Result<Vec<Difference>>> {
+        let repo_file =
+            self.open_file(path.as_ref(), false);
+        let head = self.head.cache_ref;
+        let cache = Arc::clone(&self.cache);
+        async move {
+            let head = head
+                .ok_or_else(|| Error::MissingHeadRef("Unable to generate diff wthout HEAD".to_string()))?;
+            let head_commit = cache.get_poll(&head).await?.into_commit()?;
+            let base_file_ref = cache::resolve_object_ref(cache.as_ref(), &head_commit, path.as_ref())?
+                .ok_or_else(|| format_err!("Unable to resolve {} to create diff", path.as_ref().display()))?;
+            let base_file = cache.get_poll(&base_file_ref).await?;
+
+            let differences = match base_file {
+                CacheObject::File(mut file) => {
+                    let mut base_bytes = Vec::new();
+                    file.read_to_end(&mut base_bytes)?;
+                    let mut modified_bytes = Vec::new();
+                    repo_file?.read_to_end(&mut modified_bytes)?;
+                    let base_str = String::from_utf8_lossy(&base_bytes[..]);
+                    let modified_str = String::from_utf8_lossy(&modified_bytes[..]);
+                    difference::Changeset::new(base_str.as_ref(), modified_str.as_ref(), "\n").diffs
+                }
+                CacheObject::Directory(_) =>
+                    unreachable!("Directories shouldn't be part of a workspace status."),
+                // TODO: Get current commit ref and display as Difference::Add
+                CacheObject::Commit(_) => vec![Difference::Rem(base_file_ref.to_string())],
+                // TODO: Get current symlink contents and display as Difference::Add
+                CacheObject::Symlink(symlink) => vec![Difference::Rem(symlink)]
+            };
+
+            Ok(differences)
+        }
+    }
 }
 
 pub struct CacheLayerLog<C: CacheLayer, T: Deref<Target=C>> {
@@ -1013,10 +1059,11 @@ impl<C> Stream for CacheLayerLogStream<C> where C: CacheLayer {
 }
 
 impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
-    where C: CacheLayer+Debug+Send+Sync+'static {
+    where C: CacheLayer+Debug+Send+Sync+'static, <C as CacheLayer>::File: Send {
     type Log = CacheLayerLog<C, &'a C>;
     type LogStream = CacheLayerLogStream<C>;
     type StatusIter = iter::Chain<FSStatusIter<'a, C>, BoxedRepoDispatcherIter<'a, C>>;
+    type DiffFuture = Pin<Box<dyn Future<Output=Result<Vec<Difference>>>+Send>>;
 
     fn commit(&mut self, message: &str) -> Result<CacheRef> {
         // lock all opened files to block writes as long as the commit is pending
@@ -1163,6 +1210,10 @@ impl<'a, C> WorkspaceController<'a> for FilesystemOverlay<C>
             .and_then(|cache_ref|
                 self.head.set_ref(Some(cache_ref)).map(|_| cache_ref))
     }
+
+    fn get_diff(&mut self, path: &Path) -> Self::DiffFuture {
+        self.create_diff_future(PathBuf::from(path)).boxed::<'static>() as Self::DiffFuture
+    }
 }
 
 pub struct BoxedRepoDispatcherIter<'a, C>(dispatch::Iter<'a, BoxedRepository>, &'a FilesystemOverlay<C>)
@@ -1176,7 +1227,7 @@ impl<'a, C> BoxedRepoDispatcherIter<'a, C> where C: CacheLayer+Debug+Send+Sync+'
 }
 
 impl<'a, C> Iterator for BoxedRepoDispatcherIter<'a, C>
-    where C: CacheLayer+Debug+Send+Sync+'static {
+    where C: CacheLayer+Debug+Send+Sync+'static, <C as CacheLayer>::File: Send {
     type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1234,7 +1285,8 @@ impl<'a, C: CacheLayer> FSStatusIter<'a, C> {
     }
 }
 
-impl<'a, C: CacheLayer+Debug+Send+Sync+'static> Iterator for FSStatusIter<'a, C> {
+impl<'a, C> Iterator for FSStatusIter<'a, C> where C: CacheLayer+Debug+Send+Sync+'static,
+                                                   <C as CacheLayer>::File: Send {
     type Item = Result<WorkspaceFileStatus>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1313,7 +1365,8 @@ type AddResultFn<T> = fn(T) -> Result<T>;
 type MapAddResultToHashSetIter<T> = iter::Map<hash_set::IntoIter<T>, AddResultFn<T>>;
 type HashOrBoxedDirIter = Either<MapAddResultToHashSetIter<OverlayDirEntry>, BoxedDirIter>;
 
-impl<C: CacheLayer+Debug+Send+Sync+'static> Overlay for FilesystemOverlay<C> {
+impl<C> Overlay for FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'static,
+                                               <C as CacheLayer>::File: Send {
     type File = FSOverlayFile<C>;
     type DirIter = HashOrBoxedDirIter;
 

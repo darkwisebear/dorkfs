@@ -263,7 +263,9 @@ enum Arguments {
         #[structopt(short, long)]
         /// Use the given message as the message for the newly created commit.
         message: String
-    }
+    },
+    /// Show Changes on files in workspace
+    Diff,
 }
 
 #[cfg(target_os = "linux")]
@@ -290,7 +292,8 @@ fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
           P: AsRef<Path>,
           Q: AsRef<Path>,
           C: CacheLayer+Debug+Send+Sync+'static,
-          <C as CacheLayer>::GetFuture: Send {
+          <C as CacheLayer>::GetFuture: Send,
+          <C as CacheLayer>::File: Send {
     let head_commit = match fs.get_current_head_ref()? {
         Some(head_commit) => head_commit,
         None => return Ok(()),
@@ -530,6 +533,9 @@ async fn main() {
         }
 
         Arguments::Commit { message } =>
-            commandstream::send_command(commandstream::Command::Commit { message }).await
+            commandstream::send_command(commandstream::Command::Commit { message }).await,
+
+        Arguments::Diff =>
+            commandstream::send_command(commandstream::Command::Diff).await,
     }
 }

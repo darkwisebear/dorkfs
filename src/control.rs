@@ -488,6 +488,7 @@ impl<'a, T> WorkspaceController<'a> for ControlDir<T>
     type Log = ControlDirLog<'a, T>;
     type LogStream = <T as WorkspaceController<'a>>::LogStream;
     type StatusIter = ControlDirStatusIter<'a, T>;
+    type DiffFuture = <T as WorkspaceController<'a>>::DiffFuture;
 
     fn commit(&mut self, message: &str) -> overlay::Result<CacheRef> {
         self.overlay.write().unwrap().commit(message)
@@ -526,6 +527,10 @@ impl<'a, T> WorkspaceController<'a> for ControlDir<T>
 
     fn update_head(&mut self) -> overlay::Result<CacheRef> {
         self.overlay.write().unwrap().update_head()
+    }
+
+    fn get_diff(&mut self, path: &Path) -> Self::DiffFuture {
+        self.overlay.write().unwrap().get_diff(path)
     }
 }
 
