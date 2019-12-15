@@ -11,7 +11,7 @@ use std::{
     mem::MaybeUninit
 };
 
-use tiny_keccak::Keccak;
+use tiny_keccak::{Hasher, Keccak};
 
 use crate::cache::{self, CacheLayer, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
             DirectoryEntry, ReadonlyFile, Directory, Commit};
@@ -23,7 +23,7 @@ pub struct HashWriter {
 impl HashWriter {
     pub fn new() -> Self {
         HashWriter {
-            hasher: Keccak::new_shake256()
+            hasher: Keccak::v256()
         }
     }
 

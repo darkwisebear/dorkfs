@@ -176,23 +176,32 @@ impl<O> FilesystemMT for DorkFS<O> where
         }
     }
 
-    fn read(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, size: u32) -> ResultData {
+    fn read(&self, _req: RequestInfo, _path: &Path, fh: u64, offset: u64, size: u32, result: impl FnOnce(Result<&[u8], libc::c_int>)) {
         let mut state = self.state.write().unwrap();
         let file_obj =
-            state.open_handles.get_mut(fh).ok_or(libc::EBADF)?;
+            match state.open_handles.get_mut(fh) {
+                Some(handle) => handle,
+                None => {
+                    result(Err(libc::EBADF));
+                    return;
+                }
+            };
         if let OpenObject::File(ref mut file) = *file_obj {
-            let mut result = Vec::with_capacity(size as usize);
-            unsafe { result.set_len(size as usize); }
-            let count = file.seek(SeekFrom::Start(offset))
-                .and_then(|_| file.read(result.as_mut_slice()))
+            let mut data = Vec::with_capacity(size as usize);
+            unsafe { data.set_len(size as usize); }
+            let data = file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.read(data.as_mut_slice()))
                 .map_err(|e| {
                     error!("Couldn't read from file: {}", e);
                     libc::EIO
-                })?;
-            result.truncate(count);
-            Ok(result)
+                })
+                .map(|count| {
+                    data.truncate(count);
+                    data.as_slice()
+                });
+            result(data);
         } else {
-            Err(libc::EBADF)
+            result(Err(libc::EBADF))
         }
     }
 

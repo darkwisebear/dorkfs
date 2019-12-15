@@ -14,8 +14,8 @@ use std::pin::Pin;
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Body, Request, Response, Client, StatusCode};
 use hyper_tls::{self, HttpsConnector};
-use native_tls::TlsConnector;
-use futures::{self, Future, FutureExt, TryFutureExt, future};
+use native_tls::{self, TlsConnector};
+use futures::{self, Future, FutureExt, StreamExt, TryFutureExt, future};
 use tokio;
 use tokio_tls;
 use serde::Deserialize;
@@ -25,7 +25,7 @@ use serde_json::{
 };
 use failure::{self, Fail, format_err};
 use base64;
-use bytes::{Bytes, Buf};
+use bytes::{Bytes, BytesMut};
 use lru::LruCache;
 use log::{debug, info, warn, error};
 
@@ -79,7 +79,7 @@ pub enum Error {
     #[fail(display = "Unexpected GraphQL response from GitHub: {}", _0)]
     UnexpectedGraphQlResponse(&'static str),
     #[fail(display = "TLS connection error {}", _0)]
-    TlsConnectionError(hyper_tls::Error),
+    TlsConnectionError(native_tls::Error),
     #[fail(display = "async IO error {}", _0)]
     TokioIoError(tokio::io::Error),
     #[fail(display = "Unable to convert to UTF-8 {}", _0)]
@@ -102,8 +102,8 @@ pub enum Error {
 
 impl LayerError for Error {}
 
-impl From<hyper_tls::Error> for Error {
-    fn from(err: hyper_tls::Error) -> Self {
+impl From<native_tls::Error> for Error {
+    fn from(err: native_tls::Error) -> Self {
         Error::TlsConnectionError(err)
     }
 }
@@ -185,7 +185,7 @@ struct GithubRequestBuilderImpl {
 struct GithubRequestBuilder(Arc<GithubRequestBuilderImpl>);
 
 impl GithubRequestBuilder {
-    async fn issue_request(&self, mut request_builder: request::Builder, body: Body)
+    async fn issue_request(&self, request_builder: request::Builder, body: Body)
         -> Result<Response<Bytes>, Error> {
         let user_agent = format!("dorkfs/{}",
                                  option_env!("CARGO_PKG_VERSION").unwrap_or("(unknown)"));
@@ -198,15 +198,15 @@ impl GithubRequestBuilder {
         let response = self.0.http_client.request(request).await
             .map_err(Error::HyperError)?;
         let (parts, mut body) = response.into_parts();
-        let mut bytes = Bytes::new();
+        let mut bytes = BytesMut::new();
         loop {
             match body.next().await {
-                Some(Ok(chunk)) => bytes.extend_from_slice(chunk.bytes()),
+                Some(Ok(chunk)) => bytes.extend_from_slice(chunk.as_ref()),
                 Some(Err(e)) => return Err(Error::from(e)),
                 None => break
             }
         }
-        Ok(Response::from_parts(parts, bytes))
+        Ok(Response::from_parts(parts, bytes.freeze()))
     }
 
     async fn execute_graphql_query(&self, query: String) -> Result<Response<Bytes>, Error> {
@@ -224,19 +224,21 @@ impl GithubRequestBuilder {
                            repo = self.0.repo,
                            sha = &cache_ref.to_string()[0..40]);
         // This shouldn't fail as we already checked the validity URL during construction
-        let uri = Uri::from_shared(path.into()).unwrap();
+        let uri = Uri::from_maybe_shared(Bytes::from(path)).unwrap();
 
         info!("Retrieving git blob from {}", uri);
 
-        let mut request_builder = Request::get(uri);
-        request_builder.header("Accept", "application/vnd.github.v3+json");
+        let request_builder = Request::get(uri)
+            .header("Accept", "application/vnd.github.v3+json");
         let response = self.issue_request(request_builder, Body::empty()).await?;
         // TODO: Explicitly handle the case when an object can't be found.
         // In case the object wasn't found (or isn't a blob) this call will fail with a
         // weird error. This should be handled explicitly.
         let git_blob: restv3::GitBlob = from_json_slice(response.body().as_ref())?;
         if git_blob.encoding.as_str() == "base64" {
-            base64::decode_config(git_blob.content.as_str(), base64::MIME)
+            let mut content = git_blob.content.into_bytes();
+            content.retain(|c| *c != b'\n');
+            base64::decode_config(content.as_slice(), base64::STANDARD)
                 .map_err(|e|
                     Error::Custom(format_err!("Base64 decodong failed: {}", e)))
         } else {
@@ -325,10 +327,10 @@ query {{ \
                            repo = self.0.repo,
                            obj_type = git_obj_type);
         // This shouldn't fail as we already checked the validity URL during construction
-        let uri = Uri::from_shared(path.into()).unwrap();
+        let uri = Uri::from_maybe_shared(Bytes::from(path)).unwrap();
 
-        let mut request_builder = Request::post(uri);
-        request_builder.header("Accept", "application/vnd.github.v3+json");
+        let request_builder = Request::post(uri)
+            .header("Accept", "application/vnd.github.v3+json");
         self.issue_request(request_builder, obj_json.into())
             .await
             .and_then(|response| {
@@ -347,7 +349,7 @@ query {{ \
         let obj_json = reader.read_to_end(&mut input)
             .map_err(Into::into)
             .and_then(move |_| {
-                let content = base64::encode_config(input.as_slice(), base64::MIME);
+                let content = base64::encode_config(input.as_slice(), base64::CRYPT);
                 let blob = restv3::GitBlob {
                     content,
                     encoding: "base64".to_string(),
@@ -487,7 +489,7 @@ query {{ \
                           baseuri = self.0.rest_base_uri,
                           owner = self.0.org,
                           repo = self.0.repo);
-        let request = Request::post(Uri::from_shared(uri.into()).unwrap());
+        let request = Request::post(Uri::from_maybe_shared(Bytes::from(uri)).unwrap());
         let body = format!(r#"{{ "ref": "refs/heads/{gitref}", "sha": "{sha}" }}"#,
                            gitref = branch,
                            sha = cache_ref_to_sha(cache_ref.to_string()));
@@ -521,7 +523,7 @@ query {{ \
                                       sha=sha);
             debug!("Updating ref with URL {} to {}", update_uri.as_str(), update_body.as_str());
             let ff_ref_request =
-                Request::patch(Uri::from_shared(update_uri.into()).unwrap());
+                Request::patch(Uri::from_maybe_shared(Bytes::from(update_uri)).unwrap());
             let ff_ref_response = request_builder.issue_request(
                 ff_ref_request,
                 Body::from(update_body)).await?;
@@ -537,7 +539,7 @@ query {{ \
                             base=ref_name,
                             head=sha);
                 let merge_request =
-                    Request::post(Uri::from_shared(merge_uri.into()).unwrap());
+                    Request::post(Uri::from_maybe_shared(Bytes::from(merge_uri)).unwrap());
                 let response = request_builder.issue_request(
                     merge_request, Body::from(merge_body))
                     .await?;
@@ -740,7 +742,7 @@ impl Github {
         where T: Send+'static,
               E: Into<CacheError>+Send+'static,
               F: Future<Output=Result<T, E>>+Send {
-        let request = tokio::timer::Timeout::new(request_future, Duration::from_secs(60))
+        let request = tokio::time::timeout(Duration::from_secs(60), request_future)
             .map(|e| match e {
                 Ok(inner) => inner.map_err(Into::into),
                 Err(_) => Err(CacheError::from(Error::TimeoutError))
@@ -772,28 +774,6 @@ mod test {
     use tokio::{self, runtime::Runtime};
     use super::*;
 
-    lazy_static::lazy_static! {
-        static ref TOKIO_RT: Mutex<Weak<Runtime>> = Mutex::new(Weak::new());
-    }
-
-    fn run_async_test<F: Future<Output=()>>(future: F) {
-        crate::init_logging();
-
-        let rt = {
-            let mut global_rt = TOKIO_RT.lock().unwrap();
-            match global_rt.upgrade() {
-                Some(rt) => rt,
-                None => {
-                    let rt = Arc::new(Runtime::new().unwrap());
-                    *global_rt = Arc::downgrade(&rt);
-                    rt
-                }
-            }
-        };
-
-        rt.block_on(future);
-    }
-
     fn setup_github() -> Github {
         let gh_token = env::var("GITHUB_TOKEN")
             .expect("Please set GITHUB_TOKEN to your GitHub token so that the test can access \
@@ -804,40 +784,37 @@ mod test {
                     gh_token.as_str()).unwrap()
     }
 
-    #[test]
-    fn get_github_commit() {
-        run_async_test(async {
-            let github = setup_github();
-            let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
-            let commit = obj.into_commit().expect("Unable to convert into commit");
-            debug!("Commit from GitHub: {:?}", commit);
-        });
+    #[tokio::test(threaded_scheduler)]
+    async fn get_github_commit() {
+        crate::init_logging();
+        let github = setup_github();
+        let obj = github.get(&CacheRef::from_str("ccc13b55a0b2f41201e745a4bdc9a20bce19cce5000000000000000000000000").unwrap()).unwrap();
+        let commit = obj.into_commit().expect("Unable to convert into commit");
+        debug!("Commit from GitHub: {:?}", commit);
     }
 
-    #[test]
-    fn get_github_tree() {
-        run_async_test(async {
-            let github = setup_github();
-            let obj = github.get(&CacheRef::from_str("20325767a89a3f96949dee6f3cb29ad57f86c1c2000000000000000000000000").unwrap()).unwrap();
-            debug!("Tree from GitHub: {:?}", obj);
-        });
+    #[tokio::test(threaded_scheduler)]
+    async fn get_github_tree() {
+        crate::init_logging();
+        let github = setup_github();
+        let obj = github.get(&CacheRef::from_str("20325767a89a3f96949dee6f3cb29ad57f86c1c2000000000000000000000000").unwrap()).unwrap();
+        debug!("Tree from GitHub: {:?}", obj);
     }
 
-    #[test]
-    fn get_github_blob() {
-        run_async_test(async {
-            let github = setup_github();
-            let cache_ref = CacheRef::from_str("77bd95d183dbe757ebd53c0aa95d1a710b85460f000000000000000000000000").unwrap();
-            let obj = github.get(&cache_ref).unwrap();
-            debug!("Blob from GitHub: {:?}", obj);
+    #[tokio::test(threaded_scheduler)]
+    async fn get_github_blob() {
+        crate::init_logging();
+        let github = setup_github();
+        let cache_ref = CacheRef::from_str("77bd95d183dbe757ebd53c0aa95d1a710b85460f000000000000000000000000").unwrap();
+        let obj = github.get(&cache_ref).unwrap();
+        debug!("Blob from GitHub: {:?}", obj);
 
-            let explicit_get = github.execute_request(github.request_builder.get_blob_data(&cache_ref))
-                .expect("Explicit get for blob failed");
+        let explicit_get = github.execute_request(github.request_builder.get_blob_data(&cache_ref))
+            .expect("Explicit get for blob failed");
 
-            let mut contents = String::new();
-            obj.into_file().unwrap().read_to_string(&mut contents).unwrap();
-            assert_eq!(contents.into_bytes(), explicit_get);
-        });
+        let mut contents = String::new();
+        obj.into_file().unwrap().read_to_string(&mut contents).unwrap();
+        assert_eq!(contents.into_bytes(), explicit_get);
     }
 
     #[test]
@@ -881,59 +858,58 @@ mod test {
         dir.into_iter().map(|entry| (entry.name.clone(), entry)).collect()
     }
 
-    #[test]
-    fn change_file_and_commit() {
-        run_async_test(async {
-            use std::io::Write;
+    #[tokio::test(threaded_scheduler)]
+    async fn change_file_and_commit() {
+        use std::io::Write;
 
-            let mut github = setup_github();
-            let head_commit_ref = github.get_head_commit("test")
-                .expect("Unable to get the head commit ref of the test branch")
-                .expect("No head commit in test branch");
-            let head_commit = github.get(&head_commit_ref)
-                .and_then(CacheObject::into_commit)
-                .expect("Unable to get the head commit of the test branch");
-            let mut root_tree = github.get(&head_commit.tree)
-                .and_then(CacheObject::into_directory)
-                .map(hash_map_from_dir)
-                .expect("Unable to get root tree of test branch");
-            let mut src_tree = github.get(&root_tree.get("src")
-                .expect("src dir not found in root tree").cache_ref)
-                .expect("Unable to retrieve src dir")
-                .into_directory().map(hash_map_from_dir)
-                .expect("src is not a directory");
+        crate::init_logging();
+        let mut github = setup_github();
+        let head_commit_ref = github.get_head_commit("test")
+            .expect("Unable to get the head commit ref of the test branch")
+            .expect("No head commit in test branch");
+        let head_commit = github.get(&head_commit_ref)
+            .and_then(CacheObject::into_commit)
+            .expect("Unable to get the head commit of the test branch");
+        let mut root_tree = github.get(&head_commit.tree)
+            .and_then(CacheObject::into_directory)
+            .map(hash_map_from_dir)
+            .expect("Unable to get root tree of test branch");
+        let mut src_tree = github.get(&root_tree.get("src")
+            .expect("src dir not found in root tree").cache_ref)
+            .expect("Unable to retrieve src dir")
+            .into_directory().map(hash_map_from_dir)
+            .expect("src is not a directory");
 
-            let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
-            writeln!(temp_file, "Test executed on {}", ::chrono::Local::now().to_rfc2822()).unwrap();
-            let file_cache_ref = github.add_file_by_path(
-                temp_file.into_temp_path())
-                .expect("Unable to upload file contents");
-            src_tree.get_mut("hashfilecache.rs")
-                .expect("Cannot find github.rs in src").cache_ref = file_cache_ref;
+        let mut temp_file = ::tempfile::NamedTempFile::new().unwrap();
+        writeln!(temp_file, "Test executed on {}", ::chrono::Local::now().to_rfc2822()).unwrap();
+        let file_cache_ref = github.add_file_by_path(
+            temp_file.into_temp_path())
+            .expect("Unable to upload file contents");
+        src_tree.get_mut("hashfilecache.rs")
+            .expect("Cannot find github.rs in src").cache_ref = file_cache_ref;
 
-            let updated_dir = github.add_directory(
-                &mut src_tree.into_iter().map(|(_, v)| v))
-                .expect("Unable to upload updated src dir");
-            root_tree.get_mut("src").unwrap().cache_ref = updated_dir;
+        let updated_dir = github.add_directory(
+            &mut src_tree.into_iter().map(|(_, v)| v))
+            .expect("Unable to upload updated src dir");
+        root_tree.get_mut("src").unwrap().cache_ref = updated_dir;
 
-            let updated_root = github.add_directory(
-                &mut root_tree.into_iter().map(|(_, v)| v))
-                .expect("Unable to upload updated root dir");
+        let updated_root = github.add_directory(
+            &mut root_tree.into_iter().map(|(_, v)| v))
+            .expect("Unable to upload updated root dir");
 
-            let new_commit = crate::cache::Commit {
-                tree: updated_root,
-                parents: vec![head_commit_ref],
-                message: "Test commit from unit test".to_string(),
-                committed_date: Local::now().with_timezone(&FixedOffset::east(0))
-            };
+        let new_commit = crate::cache::Commit {
+            tree: updated_root,
+            parents: vec![head_commit_ref],
+            message: "Test commit from unit test".to_string(),
+            committed_date: Local::now().with_timezone(&FixedOffset::east(0))
+        };
 
-            let new_commit_ref = github.add_commit(new_commit)
-                .and_then(|cache_ref| github.merge_commit("test", &cache_ref))
-                .expect("Unable to upload commit");
-            assert_eq!(new_commit_ref, github.get_head_commit("test")
-                .expect("Error getting new head commit")
-                .expect("No new head commit"));
-        });
+        let new_commit_ref = github.add_commit(new_commit)
+            .and_then(|cache_ref| github.merge_commit("test", &cache_ref))
+            .expect("Unable to upload commit");
+        assert_eq!(new_commit_ref, github.get_head_commit("test")
+            .expect("Error getting new head commit")
+            .expect("No new head commit"));
     }
 
     fn create_test_commit<R: Rng>(mut rng: R, gh: &Github, parent_commit: CacheRef)
@@ -962,44 +938,43 @@ mod test {
             .expect("Unable to create first commit")
     }
 
-    #[test]
-    fn merge_concurrent_changes() {
-        run_async_test(async {
-            let mut gh = setup_github();
-            let mut rng = StdRng::from_entropy();
+    #[tokio::test(threaded_scheduler)]
+    async fn merge_concurrent_changes() {
+        crate::init_logging();
+        let mut gh = setup_github();
+        let mut rng = StdRng::from_entropy();
 
-            let current_head = gh.get_head_commit("mergetest")
-                .expect("Unable to retrieve current HEAD")
-                .expect("This test needs at least one root commit to work.");
+        let current_head = gh.get_head_commit("mergetest")
+            .expect("Unable to retrieve current HEAD")
+            .expect("This test needs at least one root commit to work.");
 
-            let commit1ref =
-                create_test_commit(&mut rng, &gh, current_head);
-            gh.merge_commit("mergetest", &commit1ref)
-                .expect("Unable to merge first commit to master");
-            let commit2ref =
-                create_test_commit(&mut rng, &gh, current_head);
-            let final_ref = gh.merge_commit("mergetest", &commit2ref)
-                .expect("Unable to merge second commit to master");
+        let commit1ref =
+            create_test_commit(&mut rng, &gh, current_head);
+        gh.merge_commit("mergetest", &commit1ref)
+            .expect("Unable to merge first commit to master");
+        let commit2ref =
+            create_test_commit(&mut rng, &gh, current_head);
+        let final_ref = gh.merge_commit("mergetest", &commit2ref)
+            .expect("Unable to merge second commit to master");
 
-            info!("Created parent commits {} and {}", commit1ref, &commit2ref);
+        info!("Created parent commits {} and {}", commit1ref, &commit2ref);
 
-            let new_head = gh.get_head_commit("mergetest")
-                .expect("Unable to get new HEAD commit ref")
-                .unwrap();
+        let new_head = gh.get_head_commit("mergetest")
+            .expect("Unable to get new HEAD commit ref")
+            .unwrap();
 
-            info!("New HEAD after merge is {}", new_head);
-            assert_eq!(final_ref, new_head);
+        info!("New HEAD after merge is {}", new_head);
+        assert_eq!(final_ref, new_head);
 
-            let new_head_commit = gh.get(&new_head)
-                .expect("Unable to fetch new HEAD commit contents")
-                .into_commit()
-                .expect("Retrieved HEAD object is not a commit");
+        let new_head_commit = gh.get(&new_head)
+            .expect("Unable to fetch new HEAD commit contents")
+            .into_commit()
+            .expect("Retrieved HEAD object is not a commit");
 
-            assert_eq!(2, new_head_commit.parents.len(), "New commit is not a merge commit");
-            assert!(new_head_commit.parents.contains(&commit1ref) &&
-                        new_head_commit.parents.contains(&commit2ref),
-                    "New merge commit does not contain the two commits created");
-        });
+        assert_eq!(2, new_head_commit.parents.len(), "New commit is not a merge commit");
+        assert!(new_head_commit.parents.contains(&commit1ref) &&
+                    new_head_commit.parents.contains(&commit2ref),
+                "New merge commit does not contain the two commits created");
     }
 
     #[test]

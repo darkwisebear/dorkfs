@@ -17,7 +17,6 @@ use pin_project::{project, pin_project};
 
 use crate::{
     overlay::{WorkspaceFileStatus, WorkspaceController},
-    cache::{self, ObjectType, Commit, CacheObject}
 };
 
 struct HistoryItem<'a, T>(&'a VecDeque<T>);

@@ -163,7 +163,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             Command::Diff => {
                 let iter = match crate::utility::diff::WorkspaceDiffIter::new(Arc::clone(&self.repo)) {
                     Ok(iter) => iter,
-                    Err(e) => return Err((target, e.into()))
+                    Err(e) => return Err((target, e))
                 };
                 let target = iter.fold(target, move |target, diff|
                     Self::send_result_string::<failure::Error, _, _, _>(
@@ -264,7 +264,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                         })
                         .map(|result| match result {
                             Ok(target) => Ok(target),
-                            Err((target, e)) => Err((target, failure::Error::from(e)))
+                            Err((target, e)) => Err((target, e))
                         }).await,
                 Err(e) => {
                     warn!("Revert failed: {}", e);
@@ -335,7 +335,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                         let log_stream = LogStreamEmitter::new(
                             self.repo.read().unwrap().get_log_stream(start_commit));
                         log_stream
-                            .map(|i| Result::<_, (_, failure::Error)>::Ok(i))
+                            .map(Result::<_, (_, failure::Error)>::Ok)
                             .try_fold(target, |target, mut message| {
                                 async move {
                                     message.push('\n');
@@ -393,30 +393,28 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
     -> (impl Future<Output=()>, AbortHandle)
     where P: AsRef<Path>,
           R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
-    use futures_util_preview::StreamExt as _;
     debug!("Creating command socket at {}", path.as_ref().display());
 
-    let listener = tokio::net::unix::UnixListener::bind(&path)
+    let mut listener = tokio::net::UnixListener::bind(&path)
         .unwrap_or_else(|_| panic!("Unable to bind UDS listener {}", path.as_ref().display()));
 
-    let stream_future = listener.incoming()
-        .filter_map(|val| future::ready(
-            match val {
-                Ok(connection) => Some(connection),
+    let stream_future = async move {
+        let mut incoming = listener.incoming();
+        loop {
+            match incoming.next().await.unwrap() {
+                Ok(connection) => {
+                    tokio::spawn(execute_commands(connection, command_executor.clone()));
+                }
                 Err(e) => {
                     if e.kind() != io::ErrorKind::BrokenPipe {
                         error!("Error during command socket processing: {}", e);
                     } else {
                         debug!("Broken pipe during command socket processing: {}", e);
                     }
-                    None
                 }
             }
-        ))
-        .for_each(move |connection| {
-            tokio::spawn(execute_commands(connection, command_executor.clone()));
-            future::ready(())
-        });
+        }
+    };
 
     let (abortable, abort_handle) = future::abortable(stream_future);
     let abortable = abortable.map(|_| ());
@@ -425,7 +423,7 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
 }
 
 #[cfg(target_os = "linux")]
-async fn find_command_stream() -> Result<tokio::net::unix::UnixStream, io::Error> {
+async fn find_command_stream() -> Result<tokio::net::UnixStream, io::Error> {
     let cwd = std::env::current_dir()?;
 
     let mut dork_root = cwd.as_path();
@@ -451,7 +449,7 @@ async fn find_command_stream() -> Result<tokio::net::unix::UnixStream, io::Error
         }
     };
 
-    tokio::net::unix::UnixStream::connect(path).await
+    tokio::net::UnixStream::connect(path).await
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -469,9 +467,9 @@ async fn send_command_impl(command: Command) -> io::Result<()> {
         return Ok(())
     }
     #[cfg(target_os = "linux")] {
-        tokio::net::unix::UnixStream::shutdown(&stream, Shutdown::Write)?;
+        tokio::net::UnixStream::shutdown(&stream, Shutdown::Write)?;
     }
-    stream.copy(&mut tokio::io::stdout()).await?;
+    tokio::io::copy(&mut stream, &mut tokio::io::stdout()).await?;
     Ok(())
 }
 
