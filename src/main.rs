@@ -494,10 +494,7 @@ async fn main() {
 
     let args: Arguments = Arguments::from_args();
     match args {
-        Arguments::Mount(subargs) =>
-            async move {
-                mount(subargs);
-            }.await,
+        Arguments::Mount(subargs) => mount(subargs),
 
         Arguments::Log { commit_range } => log(commit_range).await,
 

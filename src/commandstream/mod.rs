@@ -28,7 +28,8 @@ use glob::Pattern as GlobPattern;
 use log::{debug, info, warn, error};
 use tokio::{
     self,
-    io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt}
+    io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt},
+    task::block_in_place
 };
 
 type InOutResult<T, E, U = T> = Result<U, (T, E)>;
@@ -184,7 +185,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
     async fn handle_switch<T>(&self, target_branch: Option<String>, target: T)
         -> InOutFallible<T> where T: AsyncWrite+Send+Sync+'static+Unpin {
-        let branch_status = match target_branch {
+        let branch_status = block_in_place(|| match target_branch {
             Some(target_branch_name) =>
                 self.repo.write().unwrap()
                     .switch(RepoRef::Branch(&target_branch_name))
@@ -212,7 +213,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                     Err(e) => Err(format_err!("Error retrieving current branch: {}", e))
                 }
             }
-        };
+        });
 
         let string = branch_status.map(|(branch_name, cache_ref)|
             format!("{} checked out at {}", branch_name, cache_ref));
