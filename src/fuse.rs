@@ -533,8 +533,7 @@ mod test {
             assert_eq!(size, 1024);
 
             let (fh, _) = dorkfs.open(req_info, &Path::new("/test.txt"), libc::O_RDONLY as u32).unwrap();
-            let contents = dorkfs.read(req_info, &Path::new("/test.txt"), fh, 0, 1024).unwrap();
-            assert_eq!(contents.len(), 1024);
+            let contents = dorkfs.read(req_info, &Path::new("/test.txt"), fh, 0, 1024, |result| assert_eq!(result.unwrap().len(), 1024));
         }
     }
 }

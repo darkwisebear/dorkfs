@@ -519,8 +519,8 @@ mod test {
             .expect("Unable to finish future in test")
     }
 
-    #[test]
-    fn commit() {
+    #[tokio::test]
+    async fn commit() {
         crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
@@ -551,8 +551,8 @@ mod test {
         assert_eq!("Test commit message", head_commit.message.as_str());
     }
 
-    #[test]
-    fn switch_between_branches() {
+    #[tokio::test]
+    async fn switch_between_branches() {
         crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
