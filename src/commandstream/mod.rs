@@ -29,7 +29,7 @@ use log::{debug, info, warn, error};
 use tokio::{
     self,
     io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt},
-    task::block_in_place
+    task::spawn_blocking
 };
 
 type InOutResult<T, E, U = T> = Result<U, (T, E)>;
@@ -112,13 +112,13 @@ impl Command {
     }
 }
 
-pub struct CommandExecutor<R: Overlay+for<'a> WorkspaceController<'a>+'static> {
+pub struct CommandExecutor<R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync+'static> {
     repo: Arc<RwLock<R>>
 }
 
 // We need to manually implement this as derive(Clone) will only work
 // if W: Clone.
-impl<R: Overlay+for<'a> WorkspaceController<'a>+'static> Clone for CommandExecutor<R> {
+impl<R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync+'static> Clone for CommandExecutor<R> {
     fn clone(&self) -> Self {
         Self {
             repo: Arc::clone(&self.repo)
@@ -126,7 +126,7 @@ impl<R: Overlay+for<'a> WorkspaceController<'a>+'static> Clone for CommandExecut
     }
 }
 
-impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'static {
+impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync+'static {
     pub fn new(repo: Arc<RwLock<R>>) -> Self {
         Self {
             repo
@@ -149,9 +149,11 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
             Command::CreateBranch {
                 name
             } => {
+                let repo = Arc::clone(&self.repo);
                 let create_result =
-                    self.repo.write().unwrap().create_branch(name.as_str(), None)
-                        .map(|_| format!("Successfully created branch {}", name.as_str()));
+                spawn_blocking(move ||
+                    repo.write().unwrap().create_branch(name.as_str(), None)
+                        .map(|_| format!("Successfully created branch {}", name.as_str()))).await.unwrap();
                 Self::send_result_string(
                     target, create_result, "Failed to create branch").await
             }
@@ -185,25 +187,26 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
     async fn handle_switch<T>(&self, target_branch: Option<String>, target: T)
         -> InOutFallible<T> where T: AsyncWrite+Send+Sync+'static+Unpin {
-        let branch_status = block_in_place(|| match target_branch {
+        let repo = Arc::clone(&self.repo);
+        let branch_status = spawn_blocking(move || match target_branch {
             Some(target_branch_name) =>
-                self.repo.write().unwrap()
+                repo.write().unwrap()
                     .switch(RepoRef::Branch(&target_branch_name))
                     .map(move |cache_ref|
                         (Cow::Owned(target_branch_name), cache_ref))
                     .map_err(failure::Error::from),
 
             None => {
-                let current_branch = self.repo.read().unwrap().get_current_branch()
+                let current_branch = repo.read().unwrap().get_current_branch()
                     .map(|option| option.map(Cow::into_owned));
                 match current_branch {
                     Ok(Some(name)) =>
-                        self.repo.write().unwrap().update_head()
+                        repo.write().unwrap().update_head()
                             .map(|cache_ref|
                                 (Cow::Owned(name), cache_ref))
                             .map_err(failure::Error::from),
                     Ok(None) =>
-                        self.repo.read().unwrap().get_current_head_ref()
+                        repo.read().unwrap().get_current_head_ref()
                             .map(|cache_ref| {
                                 let cache_ref = cache_ref
                                     .unwrap_or_else(CacheRef::null);
@@ -213,7 +216,7 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
                     Err(e) => Err(format_err!("Error retrieving current branch: {}", e))
                 }
             }
-        });
+        }).await.unwrap();
 
         let string = branch_status.map(|(branch_name, cache_ref)|
             format!("{} checked out at {}", branch_name, cache_ref));
@@ -360,15 +363,16 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+'sta
 
     async fn commit_handler<T>(&self, message: String, target: T) -> InOutFallible<T>
         where T: AsyncWrite+Send+Sync+'static+Unpin {
-        let commit_result = self.repo.write().unwrap()
-            .commit(message.as_str());
+        let repo = Arc::clone(&self.repo);
+        let commit_result = spawn_blocking(
+            move || repo.write().unwrap().commit(message.as_str())).await.unwrap();
         let string = commit_result.map(|cache_ref|
             format!("Successfully committed, HEAD at {}", cache_ref));
         Self::send_result_string(target, string, "Failed to commit").await
     }
 }
 
-async fn execute_single_command<R, C>(channel: C, executor: CommandExecutor<R>) -> Fallible<()>
+async fn execute_single_command<R: Send+Sync+'static, C>(channel: C, executor: CommandExecutor<R>) -> Fallible<()>
     where R: Overlay+for<'a> WorkspaceController<'a>+'static,
           C: AsyncRead+AsyncWrite+Send+Sync+'static {
     let (mut input, output) = tokio::io::split(channel);
