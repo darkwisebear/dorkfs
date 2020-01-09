@@ -494,7 +494,9 @@ async fn main() {
 
     let args: Arguments = Arguments::from_args();
     match args {
-        Arguments::Mount(subargs) => mount(subargs),
+        Arguments::Mount(subargs) => async {
+            tokio::task::spawn_blocking(|| mount(subargs)).await.unwrap()
+        }.await,
 
         Arguments::Log { commit_range } => log(commit_range).await,
 
