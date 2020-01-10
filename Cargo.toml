@@ -38,6 +38,8 @@ native-tls = "0.2"
 structopt = "0.3"
 difference = "2.0"
 pin-project = "0.4"
+hyper-proxy = { version = "0.6", features = ["tls"] }
+typed-headers = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse_mt = "0.5"

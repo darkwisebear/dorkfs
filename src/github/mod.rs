@@ -10,11 +10,14 @@ use std::borrow::Cow;
 use std::time::Duration;
 use std::fmt::{Debug, Formatter, self};
 use std::pin::Pin;
+use std::env;
 
 use http::{uri::InvalidUri, request};
 use hyper::{self, Uri, Body, Request, Response, Client, StatusCode};
-use hyper_tls::{self, HttpsConnector};
+use hyper_tls;
 use native_tls::{self, TlsConnector};
+use hyper_proxy;
+use typed_headers;
 use futures::{self, Future, FutureExt, StreamExt, TryFutureExt, future};
 use tokio;
 use tokio_tls;
@@ -23,7 +26,7 @@ use serde_json::{
     de::from_slice as from_json_slice,
     ser::to_string as to_json_string
 };
-use failure::{self, Fail, format_err};
+use failure::{self, Fail, Fallible, format_err};
 use base64;
 use bytes::{Bytes, BytesMut};
 use lru::LruCache;
@@ -80,8 +83,8 @@ pub enum Error {
     UnexpectedGraphQlResponse(&'static str),
     #[fail(display = "TLS connection error {}", _0)]
     TlsConnectionError(native_tls::Error),
-    #[fail(display = "async IO error {}", _0)]
-    TokioIoError(tokio::io::Error),
+    #[fail(display = "I/O error {}", _0)]
+    IoError(tokio::io::Error),
     #[fail(display = "Unable to convert to UTF-8 {}", _0)]
     Utf8Error(str::Utf8Error),
     #[fail(display = "Hyper error {}", _0)]
@@ -116,7 +119,7 @@ impl From<InvalidUri> for Error {
 
 impl From<tokio::io::Error> for Error {
     fn from(err: tokio::io::Error) -> Self {
-        Error::TokioIoError(err)
+        Error::IoError(err)
     }
 }
 
@@ -135,6 +138,18 @@ impl From<hyper::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         Error::JsonError(err)
+    }
+}
+
+impl From<typed_headers::Error> for Error {
+    fn from(err: typed_headers::Error) -> Self {
+        Error::Custom(err.into())
+    }
+}
+
+impl From<&'static str> for Error {
+    fn from(err: &'static str) -> Self {
+        Error::Custom(failure::err_msg(err))
     }
 }
 
@@ -170,6 +185,8 @@ impl ReadonlyFile for GithubBlob {}
 type GithubTree = Vec<DirectoryEntry>;
 type GaiResolver = hyper::client::connect::dns::GaiResolver;
 type HttpConnector = hyper::client::HttpConnector<GaiResolver>;
+type HttpsConnector = hyper_tls::HttpsConnector<HttpConnector>;
+type ProxyConnector = hyper_proxy::ProxyConnector<HttpsConnector>;
 
 #[derive(Debug)]
 struct GithubRequestBuilderImpl {
@@ -178,7 +195,7 @@ struct GithubRequestBuilderImpl {
     org: String,
     repo: String,
     token: String,
-    http_client: Client<HttpsConnector<HttpConnector>>,
+    http_client: Client<ProxyConnector>,
 }
 
 #[derive(Debug, Clone)]
@@ -657,7 +674,8 @@ impl Github {
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         let https = HttpsConnector::from((http, tls_connector));
-        let http_client = Client::builder().build(https);
+        let proxied = Self::build_proxy_connector(https)?;
+        let http_client = Client::builder().build(proxied);
 
         // Here we will also parse the given str. Therefore we can unwrap the parses later as we
         // already verified that the URL is fine.
@@ -690,6 +708,76 @@ impl Github {
             request_builder: GithubRequestBuilder(Arc::new(request_builder)),
             object_cache: Arc::new(Mutex::new(LruCache::new(8)))
         })
+    }
+
+    fn make_no_proxy_matcher() -> impl Fn(&str) -> bool {
+        let mut excludes = Vec::new();
+        match env::var("no_proxy") {
+            Ok(value) => excludes.extend(value.split(',').map(str::to_string)),
+            Err(env::VarError::NotPresent) => (),
+            Err(e) => warn!("Unable to use no_proxy variable: {}. Ignoring.", e)
+        }
+
+        move |host|
+            excludes.iter()
+                .any(|entry| host.ends_with(entry.as_str()))
+    }
+
+    fn build_proxy_connector(connector: HttpsConnector) -> Result<ProxyConnector, Error> {
+        let mut proxy_conn = ProxyConnector::new(connector)?;
+
+        match env::var("https_proxy") {
+            Ok(value) => {
+                match Self::parse_https_proxy_conf(value) {
+                    Ok(proxy) => proxy_conn.add_proxy(proxy),
+                    Err(e) => warn!("Unable to parse contents of https_proxy: {}. Ignoring.", e)
+                }
+            },
+            Err(env::VarError::NotPresent) => (),
+            Err(e) => warn!("Unable to read https_proxy variable: {}. Ignoring.", e)
+        }
+
+        Ok(proxy_conn)
+    }
+
+    fn parse_https_proxy_conf(value: String) -> Fallible<hyper_proxy::Proxy> {
+        let mut uri_parts = value.parse::<Uri>()?.into_parts();
+
+        let auth_split = uri_parts.authority.as_ref()
+            .and_then(|auth|
+                auth.as_str().find('@')
+                    .map(|at| auth.as_str().split_at(at)));
+        let (userpass, new_auth) = match auth_split {
+            Some((userpass, host)) => {
+                let new_auth = http::uri::Authority::from_str(&host[1..]).unwrap();
+                (Some(userpass), Some(new_auth))
+            }
+            None => (None, uri_parts.authority)
+        };
+
+        let cred = match userpass {
+            Some(userpass) => {
+                let colon = userpass.find(':')
+                    .ok_or_else(|| Error::from("Unable to find password inside credentials."))?;
+                let (user, pass) = userpass.split_at(colon);
+                Some(typed_headers::Credentials::basic(user, &pass[1..])?)
+            }
+            None => None
+        };
+
+        uri_parts.authority = new_auth;
+        let uri = Uri::from_parts(uri_parts).unwrap();
+
+        let matches_no_proxy = Self::make_no_proxy_matcher();
+        let intercept = move |scheme: Option<&str>, host: Option<&str>, _|
+            scheme == Some("https") && host.map(|h| !matches_no_proxy(h)).unwrap_or(true);
+
+        let mut proxy = hyper_proxy::Proxy::new(intercept, uri);
+        if let Some(cred) = cred {
+            proxy.set_authorization(cred);
+        }
+
+        Ok(proxy)
     }
 
     pub fn get_default_branch(&self) -> cache::Result<String> {
