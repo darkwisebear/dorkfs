@@ -16,4 +16,6 @@ jobs:
     - name: Run tests
       run: cargo test --verbose --features gitcache
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Execute clippy
+      run: cargo clippy --all-features -- -D warnings
