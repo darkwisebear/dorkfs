@@ -553,8 +553,8 @@ mod test {
         }
     };
 
-    #[test]
-    fn dont_delete_control_files() {
+    #[tokio::test]
+    async fn dont_delete_control_files() {
         crate::init_logging();
 
         let dir = tempdir().expect("Unable to create temp test directory");
