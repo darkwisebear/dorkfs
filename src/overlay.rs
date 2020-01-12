@@ -2250,8 +2250,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn check_thread_safety() {
+    #[tokio::test]
+    async fn check_thread_safety() {
         use crate::nullcache::NullCache;
         use super::{RepositoryWrapper, BoxedRepository};
         use crate::control::ControlDir;
