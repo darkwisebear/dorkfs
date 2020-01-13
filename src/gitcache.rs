@@ -66,10 +66,10 @@ impl GitCacheImpl {
 
     fn filemode_from_direntry(dir_entry: &DirectoryEntry) -> i32 {
         match dir_entry.object_type {
-            ObjectType::File => 0o100644,
-            ObjectType::Directory => 0o40000,
-            ObjectType::Commit => 0o160000,
-            ObjectType::Symlink => 0o120000
+            ObjectType::File => 0o100_644,
+            ObjectType::Directory => 0o40_000,
+            ObjectType::Commit => 0o160_000,
+            ObjectType::Symlink => 0o120_000
         }
     }
 
@@ -170,7 +170,7 @@ impl CacheLayer for GitCacheImpl {
                     use chrono::{TimeZone, FixedOffset};
                     let time = commit.time();
                     let offset = FixedOffset::east_opt(time.offset_minutes())
-                        .ok_or(GitLayerError::RuntimeError(format_err!("Bad time offset").into()))?;
+                        .ok_or_else(|| GitLayerError::RuntimeError(format_err!("Bad time offset")))?;
                     offset.timestamp(time.seconds(), 0)
                 };
                 let commit = Commit {
