@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::io::{self, Read, Write, Seek, SeekFrom, BufReader};
 use std::fmt::{self, Formatter, Debug};
-use std::error::Error;
 use std::iter::FromIterator;
 
 use rand::{prelude::*, distributions::Alphanumeric};
@@ -129,7 +128,7 @@ impl FileCachePath {
 
         debug!("Removing staging file {}", source_path.display());
         if let Err(err) = fs::remove_file(&source_path) {
-            warn!("Unable to remove staging file {}: {}", source_path.display(), err.description());
+            warn!("Unable to remove staging file {}: {}", source_path.display(), err);
         }
 
         Ok(())

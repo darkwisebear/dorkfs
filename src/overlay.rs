@@ -8,7 +8,6 @@ use std::hash::{Hash, Hasher};
 use std::fmt::{self, Formatter, Display, Debug};
 use std::sync::{Arc, Weak, Mutex};
 use std::collections::HashMap;
-use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::cmp::max;
 use std::borrow::Cow;
@@ -833,14 +832,14 @@ impl<C> FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'static,
                 if let Err(ioerr) = fs::remove_dir(&*path.abs_fs_path()) {
                     warn!("Unable to remove overlay directory {} during cleanup: {}",
                           path.abs_fs_path().display(),
-                          ioerr.description());
+                          ioerr);
                 }
             } else if !self.overlay_files.contains_key(path.overlay_path()) {
                 debug!("Removing overlay file {}", path.abs_fs_path().display());
                 if let Err(ioerr) = fs::remove_file(&*path.abs_fs_path()) {
                     warn!("Unable to remove overlay file {} during cleanup: {}",
                           path.abs_fs_path().display(),
-                          ioerr.description());
+                          ioerr);
                 }
             }
 
