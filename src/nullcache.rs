@@ -1,20 +1,17 @@
 use std::{
     path::Path,
     iter::IntoIterator,
-    vec::IntoIter,
     io::{self, Read, Write, Seek, SeekFrom},
     fs::File,
     collections::HashMap,
-    borrow::Borrow,
-    ffi::OsStr,
     sync::Mutex,
     mem::MaybeUninit
 };
 
 use tiny_keccak::{Hasher, Keccak};
 
-use crate::cache::{self, CacheLayer, CacheError, CacheObject, CacheObjectMetadata, CacheRef,
-            DirectoryEntry, ReadonlyFile, Directory, Commit};
+use crate::cache::{self, CacheLayer, CacheError, CacheObject, CacheRef,
+            DirectoryEntry, ReadonlyFile, Commit};
 
 pub struct HashWriter {
     hasher: Keccak

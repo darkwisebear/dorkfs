@@ -1,11 +1,11 @@
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, RwLock},
     io,
-    net::Shutdown,
     borrow::Cow,
     fmt::Display,
-    pin::Pin
+    pin::Pin,
+    time::Duration,
 };
 
 use crate::{
@@ -14,23 +14,47 @@ use crate::{
     types::RepoRef
 };
 
-use futures::{
-    future::{self, AbortHandle},
-    Future, FutureExt, Stream, StreamExt, TryStreamExt,
-    task::Poll,
-    task::Context,
-    stream
-};
+use futures::{future::{self, AbortHandle}, Future, FutureExt, Stream, StreamExt, TryStreamExt, task::Poll, task::Context, stream};
 use failure::{self, Fallible, format_err};
 use serde::{Serialize, Deserialize};
 use serde_json;
 use glob::Pattern as GlobPattern;
-use log::{debug, info, warn, error};
+use log::{debug, info, warn, error, trace};
 use tokio::{
     self,
-    io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::spawn_blocking
 };
+
+mod json_chunk_reader;
+
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+mod stubs {
+    use std::io;
+
+    pub async fn find_command_stream() -> Result<tokio::fs::File, io::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "dorkfs only supports Linux. Bummer."))
+    }
+}
+
+#[cfg(target_os = "linux")]
+use linux as sys;
+
+#[cfg(target_os = "windows")]
+use windows as sys;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+use stubs::find_command_stream;
+
+const COMMAND_CHANNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 type InOutResult<T, E, U = T> = Result<U, (T, E)>;
 type InOutFallible<T, U = T> = Result<U, (T, failure::Error)>;
@@ -107,7 +131,7 @@ pub enum Command {
 }
 
 impl Command {
-    fn dry_run_default() -> bool {
+    const fn dry_run_default() -> bool {
         false
     }
 }
@@ -375,14 +399,21 @@ impl<R> CommandExecutor<R> where R: Overlay+for<'a> WorkspaceController<'a>+Send
 async fn execute_single_command<R: Send+Sync+'static, C>(channel: C, executor: CommandExecutor<R>) -> Fallible<()>
     where R: Overlay+for<'a> WorkspaceController<'a>+'static,
           C: AsyncRead+AsyncWrite+Send+Sync+'static {
-    let (mut input, output) = tokio::io::split(channel);
-    let mut command_string = Vec::new();
-    input.read_to_end(&mut command_string).await?;
-    let command = serde_json::from_slice(&command_string[..])?;
-    debug!("Received command {:?}", command);
-    executor.command(command, output).await
-        .map(|_| ())
-        .map_err(|(_, e)| e)
+    let (input, output) = tokio::io::split(channel);
+    trace!("Reading command from read half");
+    let command_string = json_chunk_reader::JsonChunkReader::new(input)
+        .try_next()
+        .await?;
+    if let Some(command_string) = command_string {
+        let command = serde_json::from_slice(&*command_string)?;
+        debug!("Received command {:?}", command);
+        executor.command(command, output).await
+            .map(|_| ())
+            .map_err(|(_, e)| e)
+    } else {
+        warn!("No command received from stream");
+        Err(failure::err_msg("No command received from stream"))
+    }
 }
 
 pub async fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
@@ -393,21 +424,43 @@ pub async fn execute_commands<R, C>(channel: C, executor: CommandExecutor<R>)
     }
 }
 
-#[cfg(target_os = "linux")]
-pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>)
-    -> (impl Future<Output=()>, AbortHandle)
-    where P: AsRef<Path>,
-          R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
-    debug!("Creating command socket at {}", path.as_ref().display());
+pub fn find_dork_dir() -> io::Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
 
-    let mut listener = tokio::net::UnixListener::bind(&path)
-        .unwrap_or_else(|_| panic!("Unable to bind UDS listener {}", path.as_ref().display()));
+    let mut dork_root = cwd.as_path();
+    if dork_root.ends_with(".dork") {
+        dork_root = dork_root.parent().unwrap();
+    }
 
-    let stream_future = async move {
-        let mut incoming = listener.incoming();
-        loop {
-            match incoming.next().await.unwrap() {
+    loop {
+        debug!("Looking for command socket in {}", dork_root.display());
+
+        let command_socket_path = dork_root.join(".dork");
+        if command_socket_path.exists() {
+            info!("Using {} as dork dir", command_socket_path.display());
+            break Ok(command_socket_path);
+        }
+
+        match dork_root.parent() {
+            Some(parent) => dork_root = parent,
+            None => break Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("Unable to find a mounted dork file system at {}",
+                        cwd.display())))
+        }
+    }
+}
+
+pub fn create_command_server<R>(command_executor: CommandExecutor<R>)
+    -> io::Result<(impl Future<Output=()>, AbortHandle, String)>
+    where R: Overlay+for<'a> WorkspaceController<'a>+Send+Sync {
+    let (mut incoming, path) = sys::create_communication_server()?;
+    let server_future = async move {
+        while let Some(next_conn) = incoming.next().await {
+            trace!("Connection received");
+            match next_conn {
                 Ok(connection) => {
+                    trace!("Spawning command handling task");
                     tokio::spawn(execute_commands(connection, command_executor.clone()));
                 }
                 Err(e) => {
@@ -421,60 +474,24 @@ pub fn create_command_socket<P, R>(path: P, command_executor: CommandExecutor<R>
         }
     };
 
-    let (abortable, abort_handle) = future::abortable(stream_future);
+    let (abortable, abort_handle) = future::abortable(server_future);
     let abortable = abortable.map(|_| ());
-    
-    (abortable, abort_handle)
-}
 
-#[cfg(target_os = "linux")]
-async fn find_command_stream() -> Result<tokio::net::UnixStream, io::Error> {
-    let cwd = std::env::current_dir()?;
-
-    let mut dork_root = cwd.as_path();
-    if dork_root.ends_with(".dork") {
-        dork_root = dork_root.parent().unwrap();
-    }
-
-    let path = loop {
-        debug!("Looking for command socket in {}", dork_root.display());
-
-        let command_socket_path = dork_root.join(".dork/cmd");
-        if command_socket_path.exists() {
-            info!("Using {} as command socket path", command_socket_path.display());
-            break command_socket_path;
-        }
-
-        match dork_root.parent() {
-            Some(parent) => dork_root = parent,
-            None => return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("Unable to find a mounted dork file system at {}",
-                            cwd.display())))
-        }
-    };
-
-    tokio::net::UnixStream::connect(path).await
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn find_command_stream() -> Result<tokio::fs::File, io::Error> {
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "dorkfs only supports Linux. Bummer."))
+    Ok((abortable, abort_handle, path))
 }
 
 async fn send_command_impl(command: Command) -> io::Result<()> {
+    let basedir = find_dork_dir()?;
+    let mut stream = sys::open_communication_channel(basedir).await?;
+
     let command_string = serde_json::to_string(&command)?;
-    let mut stream = find_command_stream().await?;
-    if let Err(e) = stream.write_all(command_string.as_bytes()).await {
-        error!("Unable to send command t daemon: {}", e);
-        return Ok(())
-    }
+    stream.write_all(command_string.as_bytes()).await?;
     #[cfg(target_os = "linux")] {
-        tokio::net::UnixStream::shutdown(&stream, Shutdown::Write)?;
+        // tokio::net::UnixStream::shutdown(&stream, Shutdown::Write)?;
     }
+    trace!("Starting to receive data");
     tokio::io::copy(&mut stream, &mut tokio::io::stdout()).await?;
+    trace!("Done receiving data");
     Ok(())
 }
 
@@ -491,21 +508,21 @@ pub async fn send_command(command: Command) {
 #[cfg(test)]
 mod test {
     use std::{
-        io::{Read, Write, Cursor, self},
+        io::{Read, Write},
         path::Path, fmt::Debug,
         sync::{Arc, RwLock}
     };
 
     use crate::{
         overlay::{Overlay, WorkspaceController},
-        overlay::testutil::{check_file_content, open_working_copy},
+        overlay::testutil::open_working_copy,
         cache::ReferencedCommit,
         types::RepoRef
     };
 
     use tempfile::tempdir;
     use futures::{
-        AsyncWrite, Future, FutureExt, TryFutureExt,
+        AsyncWrite, Future,
     };
     use tokio;
 

@@ -855,11 +855,10 @@ mod test {
     use std::fmt::Debug;
     use std::io::Write;
     use std::collections::HashMap;
-    use std::sync::{Arc, Weak, Mutex};
     use tempfile::NamedTempFile;
     use rand::{prelude::*, distributions::Alphanumeric};
     use chrono::{Local, FixedOffset};
-    use tokio::{self, runtime::Runtime};
+    use tokio;
     use super::*;
 
     fn setup_github() -> Github {
@@ -951,7 +950,7 @@ mod test {
         use std::io::Write;
 
         crate::init_logging();
-        let mut github = setup_github();
+        let github = setup_github();
         let head_commit_ref = github.get_head_commit("test")
             .expect("Unable to get the head commit ref of the test branch")
             .expect("No head commit in test branch");
@@ -1000,7 +999,7 @@ mod test {
             .expect("No new head commit"));
     }
 
-    fn create_test_commit<R: Rng>(mut rng: R, gh: &Github, parent_commit: CacheRef)
+    fn create_test_commit<R: Rng>(rng: R, gh: &Github, parent_commit: CacheRef)
         -> CacheRef {
         let ascii = rng.sample_iter(&Alphanumeric);
 
@@ -1080,7 +1079,7 @@ mod test {
         }
     }
 }"#;
-        let mut parsed_response =
+        let parsed_response =
             serde_json::from_str::<GraphQLQueryResponse>(testresponse).unwrap();
         if let Some(graphql::GitObject::Blob { text, .. }) = parsed_response.data.repository.object {
             let bytes = text.unwrap();

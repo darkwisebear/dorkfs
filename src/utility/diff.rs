@@ -214,7 +214,7 @@ impl<'a, R> Stream for WorkspaceDiffIter<'a, R> where R: WorkspaceController<'a>
 mod test {
     use super::FileDifference;
     use std::path::PathBuf;
-    use difference::{Difference, Changeset};
+    use difference::Changeset;
 
     fn check_file_difference(original_text: &str, modified_text: &str, file_name: &str,
                              file_difference: &str) {

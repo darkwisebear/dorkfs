@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "linux")]
 mod fuse;
+#[cfg(target_os = "windows")]
+mod dokan;
 #[cfg(feature = "gitcache")]
 mod gitcache;
 mod cache;
@@ -283,6 +285,17 @@ fn mount_fuse<O, P>(
         .expect("Unable to mount filesystem");
 }
 
+#[cfg(target_os = "windows")]
+fn mount_dokan<O>(mountpoint: impl AsRef<std::ffi::OsStr>,
+                  root_overlay: O, 
+                  ref_volume: &Path, 
+                  vol_name: impl AsRef<str>)
+    where O: Send+Sync+Overlay,
+          <O as Overlay>::File: Send {
+    let dokan = crate::dokan::DorkFs::with_overlay(root_overlay, ref_volume, vol_name).unwrap();
+    dokan.mount(mountpoint)
+}
+
 fn mount_submodules<R, P, Q, C>(rootrepo_url: &RepoUrl,
                                 gitmodules: R,
                                 cachedir: P,
@@ -432,8 +445,8 @@ fn new_overlay<P, Q>(overlaydir: P, cachedir: Q, rootrepo_url: &RepoUrl, branch:
 
             Ok(fs)
         })
-        .map(move |overlay| {
-            let control_dir = ControlDir::new(overlay, tempdir);
+        .and_then(move |overlay| ControlDir::new(overlay, tempdir))
+        .map(|control_dir| {
             Box::new(RepositoryWrapper::new(control_dir)) as BoxedRepository
         })
         .map_err(Into::into)
@@ -458,19 +471,21 @@ fn mount(args: MountArguments) {
     let branch = branch.as_ref().map(|s| RepoRef::Branch(s.as_str()));
 
     let cachedir = cachedir_base.join("cache");
+    let overlaydir = cachedir_base.join("overlay");
+    let branch = branch.as_ref();
 
-    let fs = new_overlay(cachedir_base.join("overlay"),
-                         &cachedir,
-                         &rootrepo_url,
-                         branch.as_ref())
+    let fs = new_overlay(&overlaydir, &cachedir, &rootrepo_url, branch)
         .expect("Unable to create workspace");
 
-    #[cfg(target_os = "linux")]
-    {
+    #[cfg(target_os = "linux")] {
         let uid = uid.unwrap_or_default();
         let gid = gid.unwrap_or_default();
 
         mount_fuse(mountpoint, fs, uid.get(), gid.get(), umask.get());
+    }
+
+    #[cfg(target_os = "windows")] {
+        mount_dokan(mountpoint.as_os_str(), fs, &overlaydir, rootrepo_url.shortname());
     }
 }
 

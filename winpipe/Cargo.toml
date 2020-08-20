@@ -1,0 +1,15 @@
+[package]
+name = "winpipe"
+version = "0.1.0"
+authors = ["Markus Hosch <markus.hosch@gmx.net>"]
+edition = "2018"
+
+[dependencies]
+tokio = { version = "0.2", features = ["stream", "io-driver", "io-util", "blocking"] }
+mio-named-pipes = "0.1"
+miow = "0.3"
+winapi = "0.3"
+log = "0.4"
+
+[dev-dependencies]
+simple_logger = "1.6"

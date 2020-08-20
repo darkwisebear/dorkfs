@@ -31,7 +31,8 @@ lazy_static! {
         OverlayDirEntry {
             name: String::from(DORK_DIR_ENTRY),
             size: 0,
-            object_type: ObjectType::Directory
+            object_type: ObjectType::Directory,
+            modified_date: chrono::Utc::now()
         }
     ];
 }
@@ -258,37 +259,55 @@ pub struct ControlDir<O> where for<'a> O: Overlay+WorkspaceController<'a> {
 }
 
 impl<O> ControlDir<O> where for<'a> O: Send+Sync+Overlay+WorkspaceController<'a>+'static {
-    pub fn new(overlay: O, tempdir: TempDir) -> Self {
+    pub fn new(overlay: O, tempdir: TempDir) -> overlay::Result<Self> {
         let mut special_files = SpecialFileRegistry::new();
 
         let overlay = Arc::new(RwLock::new(overlay));
 
         #[cfg(target_os = "linux")]
         let command_socket_finisher = {
-            use std::os::unix::ffi::OsStrExt;
-            use crate::commandstream::{create_command_socket, CommandExecutor};
-
-            let dorkcmd_path = tempdir.path().join("dorkcmd");
-            let link_file_factory = ConstantFileFactory::new(
-                dorkcmd_path.as_os_str().as_bytes(), true);
-            special_files.insert("cmd", link_file_factory);
-
+            use crate::commandstream::{create_command_server, CommandExecutor};
             let command_executor = CommandExecutor::new(Arc::clone(&overlay));
-            let (command_socket_future, command_socket_finisher) =
-                create_command_socket(dorkcmd_path, command_executor);
+
+            let (command_socket_future, command_socket_finisher, path) =
+                create_command_server(command_executor)?;
+
             tokio::spawn(command_socket_future);
+
+            let link_file_factory = ConstantFileFactory::new(
+                path.into_bytes(), true);
+            special_files.insert("cmd", link_file_factory);
 
             Some(command_socket_finisher)
         };
 
-        #[cfg(not(target_os = "linux"))] let command_socket_finisher = None;
+        #[cfg(target_os = "windows")]
+        let command_socket_finisher = {
+            use crate::commandstream::{create_command_server, CommandExecutor};
+            let command_executor = CommandExecutor::new(Arc::clone(&overlay));
 
-        ControlDir {
+            let (command_socket_future, command_socket_finisher, path) =
+                create_command_server(command_executor)?;
+
+            tokio::spawn(command_socket_future);
+
+            let link_file_factory = ConstantFileFactory::new(
+                path.into_bytes(), false);
+            special_files.insert("cmd", link_file_factory);
+
+            Some(command_socket_finisher)
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))] let command_socket_finisher = {
+            None
+        };
+
+        Ok(ControlDir {
             overlay,
             special_files,
             tempdir,
             command_socket_finisher
-        }
+        })
     }
 }
 
@@ -559,7 +578,7 @@ mod test {
 
         let dir = tempdir().expect("Unable to create temp test directory");
         let working_copy = open_working_copy(&dir);
-        let mut control_overlay = super::ControlDir::new(working_copy, dir);
+        let mut control_overlay = super::ControlDir::new(working_copy, dir).unwrap();
         control_overlay.delete_file(Path::new(".dork/dorkcmd")).unwrap_err();
 
         let mut file = control_overlay.open_file(Path::new("test.txt"), true)
@@ -571,4 +590,3 @@ mod test {
         control_overlay.delete_file(Path::new("test.txt")).unwrap();
     }
 }
-

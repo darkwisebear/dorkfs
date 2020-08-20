@@ -15,7 +15,7 @@ use std::vec;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 
-use chrono::{Utc, Offset};
+use chrono::{Utc, Offset, DateTime};
 use either::Either;
 use futures::{
     Future, FutureExt, Stream, task::{Poll, Context},
@@ -56,7 +56,7 @@ pub enum Error {
     #[fail(display = "Cache error: {}", _0)]
     CacheError(CacheError),
 
-    #[fail(display = "{}", _0)]
+    #[fail(display = "Generic error: {}", _0)]
     Generic(failure::Error)
 }
 
@@ -90,7 +90,8 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 pub struct OverlayDirEntry {
     pub name: String,
     pub size: u64,
-    pub object_type: ObjectType
+    pub object_type: ObjectType,
+    pub modified_date: DateTime<Utc>
 }
 
 impl PartialEq for OverlayDirEntry {
@@ -109,10 +110,12 @@ impl Hash for OverlayDirEntry {
 
 impl<'a> From<(&'a str, &'a Metadata)> for OverlayDirEntry {
     fn from(val: (&'a str, &'a Metadata)) -> OverlayDirEntry {
+        let (name, metadata) = val;
         OverlayDirEntry {
-            name: val.0.to_owned(),
-            object_type: val.1.object_type,
-            size: val.1.size
+            name: name.to_owned(),
+            object_type: metadata.object_type,
+            size: metadata.size,
+            modified_date: metadata.modified_date
         }
     }
 }
@@ -786,7 +789,8 @@ impl<C> FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'static,
         let entry = OverlayDirEntry {
             name,
             size: metadata.size,
-            object_type: metadata.object_type
+            object_type: metadata.object_type,
+            modified_date: metadata.modified_date
         };
 
         if fs_name.ends_with('f') {
@@ -802,7 +806,8 @@ impl<C> FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'static,
         Ok(OverlayDirEntry {
             name: dir_entry.name,
             object_type,
-            size: dir_entry.size
+            size: dir_entry.size,
+            modified_date: self.get_head_commit_date()?
         })
     }
 
@@ -949,6 +954,13 @@ impl<C> FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'static,
 
             Ok(differences)
         }
+    }
+
+    fn get_head_commit_date(&self) -> Result<DateTime<Utc>> {
+        let head_commit = self.get_head_commit()
+            .and_then(|commit|
+                commit.ok_or_else(|| Error::Generic(format_err!("Inexistent HEAD commit"))))?;
+        Ok(head_commit.committed_date.with_timezone(&Utc))
     }
 }
 
@@ -1472,18 +1484,12 @@ impl<C> Overlay for FilesystemOverlay<C> where C: CacheLayer+Debug+Send+Sync+'st
                     .map_err(Error::from))
                 .and_then(|dir|
                     dir.find_entry(&file_name).cloned()
-                        .ok_or_else(|| Error::Generic(
-                            format_err!(r#"File "{}" not found in directory"#,
-                            file_name.to_string_lossy()))))?;
-
-            let head_commit = self.get_head_commit()
-                .and_then(|commit|
-                    commit.ok_or_else(|| Error::Generic(format_err!("Inexistent HEAD commit"))))?;
+                        .ok_or_else(|| Error::FileNotFound))?;
 
             let metadata = Metadata {
                 object_type: ObjectType::from_cache_object_type(dir_entry.object_type)?,
                 size: dir_entry.size,
-                modified_date: head_commit.committed_date.with_timezone(&Utc)
+                modified_date: self.get_head_commit_date()?
             };
 
             Ok(metadata)
@@ -1650,13 +1656,10 @@ mod test {
         collections::HashSet,
         path::Path,
         iter::FromIterator,
-        borrow::Cow
     };
     use tempfile::tempdir;
-    use chrono::{Utc, Offset};
     use log::debug;
     use crate::overlay::{Overlay, OverlayFile, OverlayDirEntry, FileState, WorkspaceController};
-    use crate::types::RepoRef;
     use super::testutil::*;
 
     #[cfg(target_os = "windows")]
@@ -2251,7 +2254,6 @@ mod test {
 
     #[tokio::test]
     async fn check_thread_safety() {
-        use crate::nullcache::NullCache;
         use super::{RepositoryWrapper, BoxedRepository};
         use crate::control::ControlDir;
         use std::fmt::Debug;
@@ -2267,7 +2269,7 @@ mod test {
         let tempdir = tempdir().expect("Unable to create temporary dir!");
         let fs_overlay = open_working_copy(tempdir.path());
         let control_overlay =
-            ControlDir::new(fs_overlay, tempdir);
+            ControlDir::new(fs_overlay, tempdir).unwrap();
         let boxed_overlay = Box::new(RepositoryWrapper::new(control_overlay))
             as BoxedRepository;
         bounds_test(boxed_overlay);

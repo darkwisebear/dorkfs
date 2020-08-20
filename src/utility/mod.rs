@@ -2,94 +2,20 @@ pub mod gitmodules;
 pub mod diff;
 mod gitconfig;
 
-use std::ffi::{OsStr, OsString};
-use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt::Debug;
-use std::sync::Arc;
-use std::borrow::{Cow, Borrow};
+use std::borrow::Cow;
 use std::str::FromStr;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::env;
 
 use failure::{format_err, bail, Fallible};
-use log::info;
 
 pub fn os_string_to_string(s: OsString) -> Fallible<String> {
     s.into_string()
         .map_err(|s| {
             format_err!("Unable to convert {} into UTF-8", s.to_string_lossy())
         })
-}
-
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
-struct ObjectName(Arc<OsString>);
-
-impl Borrow<OsStr> for ObjectName {
-    fn borrow(&self) -> &OsStr {
-        self.0.as_os_str()
-    }
-}
-
-#[derive(Debug)]
-pub struct OpenHandleSet<T: Debug> {
-    next_handle: u64,
-    open_objects: HashMap<u64, (ObjectName, T)>,
-    object_names: HashMap<ObjectName, u64>
-}
-
-impl<T: Debug> OpenHandleSet<T> {
-    pub fn new() -> Self {
-        OpenHandleSet {
-            next_handle: 0,
-            open_objects: HashMap::new(),
-            object_names: HashMap::new()
-        }
-    }
-
-    pub fn push(&mut self, value: T, name: Cow<OsStr>) -> u64 {
-
-        let handle = self.next_handle;
-        self.next_handle += 1;
-
-        info!("Adding {} as #{} to open objects storage", name.to_string_lossy(), handle);
-
-        let identifier = ObjectName(Arc::new(name.into_owned()));
-        self.open_objects.insert(handle, (identifier.clone(), value));
-        self.object_names.insert(identifier, handle);
-
-        handle
-    }
-
-    pub fn get(&self, handle: u64) -> Option<&T> {
-        self.open_objects.get(&handle)
-            .map(|(_, ref obj) | obj)
-    }
-
-    pub fn get_mut(&mut self, handle: u64) -> Option<&mut T> {
-        self.open_objects.get_mut(&handle)
-            .map(|(_, ref mut obj)| obj)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_named<S: AsRef<OsStr>>(&self, name: S) -> Option<&T> {
-        self.object_names.get(name.as_ref())
-            .and_then(|handle| self.get(*handle))
-    }
-
-    pub fn get_named_mut<S: AsRef<OsStr>>(&mut self, name: S) -> Option<&mut T> {
-        match self.object_names.get(name.as_ref()).cloned() {
-            Some(handle) => self.get_mut(handle),
-            None => None
-        }
-    }
-
-    pub fn remove(&mut self, handle: u64) -> Option<T> {
-        self.open_objects.remove(&handle)
-            .map(|(name, obj)| {
-                self.object_names.remove(name.0.as_os_str());
-                obj
-            })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -177,138 +103,21 @@ impl<'a> RepoUrl<'a> {
                 .ok_or_else(|| format_err!("Incomplete repo URL"))
                 .map(|path| (&repo[..pos], path)))
     }
-}
 
-/*
-const BUF_PREFILL: usize = 2048;
+    pub fn shortname(&self) -> impl AsRef<str> {
+        match self {
+            RepoUrl::GithubHttps {
+                org, repo, ..
+            } => format!("GitHub {}/{}", org, repo),
 
-#[derive(Debug)]
-struct SyncedBufferContent {
-    buf: Vec<u8>,
-    task: Option<Task>,
-    finished: bool,
-    max_pos: usize
-}
-
-impl Default for SyncedBufferContent {
-    fn default() -> Self {
-        Self {
-            buf: Vec::default(),
-            task: None,
-            finished: false,
-            max_pos: 0
+            RepoUrl::GitFile { path } =>
+                format!("Git {}", path.components().next_back()
+                    .map(|c| <Component as AsRef<Path>>::as_ref(&c).display().to_string())
+                    .unwrap_or_default())
         }
     }
 }
 
-impl SyncedBufferContent {
-    fn set_max_read_pos(&mut self, read_pos: usize) {
-        self.max_pos = self.max_pos.max(read_pos);
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct SyncedBuffer(Mutex<SyncedBufferContent>, Condvar);
-
-#[derive(Default, Debug)]
-pub struct SharedBuffer {
-    buffer: Arc<SyncedBuffer>
-}
-
-impl SharedBuffer {
-    fn finish(&mut self) {
-        self.buffer.0.lock().unwrap().finished = true;
-        self.buffer.1.notify_all();
-    }
-}
-
-impl Write for SharedBuffer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.buffer.0.lock().unwrap();
-        if inner.buf.len() - inner.max_pos >= BUF_PREFILL && task::is_in_task() {
-            inner.task = Some(task::current());
-            Err(io::ErrorKind::WouldBlock.into())
-        } else {
-            inner.buf.extend_from_slice(buf);
-            self.buffer.1.notify_all();
-            Ok(buf.len())
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl AsyncWrite for SharedBuffer {
-    fn close(self: Pin<&mut Self>) -> Poll<Result<(), io::Error>> {
-        self.finish();
-        Ok(Async::Ready(()))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SharedBufferReader {
-    buffer: Arc<SyncedBuffer>,
-    pos: usize
-}
-
-impl Read for SharedBufferReader {
-    fn read(&mut self, dest_buf: &mut [u8]) -> io::Result<usize> {
-        let mut inner = self.buffer.0.lock().unwrap();
-        loop {
-            let buffer = inner.buf.as_slice();
-
-            let old_pos = self.pos;
-            let src_buf = &buffer[old_pos..];
-            let count = usize::min(dest_buf.len(), src_buf.len());
-
-            if count > 0 {
-                let src_chunk = &src_buf[..count];
-                let dest_chunk = &mut dest_buf[..count];
-
-                dest_chunk.copy_from_slice(src_chunk);
-                let new_pos = old_pos + count;
-
-                self.pos = new_pos;
-                inner.set_max_read_pos(new_pos);
-
-                break Ok(count);
-            } else if inner.finished {
-                break Ok(0);
-            } else {
-                if let Some(task) = inner.task.take() {
-                    task.notify();
-                }
-                inner = self.buffer.1.wait(inner).unwrap();
-            }
-        }
-    }
-}
-
-impl Seek for SharedBufferReader {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            SeekFrom::Start(pos) => {
-                self.pos = pos as usize;
-                Ok(pos)
-            }
-
-            SeekFrom::Current(offset) =>
-                if offset >= 0 {
-                    self.pos.checked_add(offset as usize)
-                } else {
-                    self.pos.checked_sub((-offset) as usize)
-                }.map(|val| val as u64).ok_or_else(|| io::ErrorKind::InvalidInput.into()),
-
-            SeekFrom::End(offset) =>
-                self.pos.checked_sub(offset as usize)
-                    .map(|val| val as u64)
-                    .ok_or_else(|| io::ErrorKind::InvalidInput.into())
-        }
-    }
-}
-*/
 #[cfg(test)]
 mod test {
     use std::{
