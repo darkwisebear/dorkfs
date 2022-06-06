@@ -21,7 +21,7 @@ rand = { version = "0.7", features = ["small_rng"] }
 lazy_static = "1.4"
 tempfile = "3.1"
 git2 = { version = "0.11", optional = true }
-hyper = { version = "0.13", features = ["tcp"] }
+hyper = { version = "0.14", features = ["tcp"] }
 hyper-tls = "0.4"
 http = "0.2"
 futures = { version = "0.3", features = [] }
